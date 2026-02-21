@@ -720,10 +720,24 @@ namespace WTelegram
 			await oldSemaphore.WaitAsync(); // prevent sends during reconnect
 			try
 			{
-				lock (_msgsToAck) _msgsToAck.Clear();
-				await ResetAsync(false, false);
-				await Task.Delay(2000); // brief pause before reconnecting
-				await ConnectAsync();
+				for (int attempt = 1; ; attempt++)
+				{
+					try
+					{
+						lock (_msgsToAck) _msgsToAck.Clear();
+						await ResetAsync(false, false);
+						await Task.Delay(Math.Min(attempt * 2000, 30000)); // backoff: 2s, 4s, 6s, ... up to 30s
+						if (_cts?.IsCancellationRequested == true) throw new ObjectDisposedException(nameof(Client));
+						await ConnectAsync();
+						break; // success
+					}
+					catch (ObjectDisposedException) { throw; }
+					catch (Exception ex)
+					{
+						Helpers.Log(4, $"{_dcSession?.DcID}>PerformFullReconnectAsync attempt {attempt} failed: {ex.Message}. Retrying...");
+						if (_cts?.IsCancellationRequested == true) throw new ObjectDisposedException(nameof(Client));
+					}
+				}
 				var reactorError = new ReactorError { Exception = new IOException("All paths dead — full reconnect") };
 				lock (_pendingRpcs)
 				{
@@ -1305,6 +1319,8 @@ namespace WTelegram
 			int dcId = _dcSession?.DcID ?? 0;
 			if (dcId == 0) dcId = 2;
 			bool usingPaths = false;
+			var localEPs = LocalEndPoints?.Count > 0 ? LocalEndPoints : null;
+			int primaryEPIndex = 0;
 			if (MTProxyUrl != null)
 			{
 #if OBFUSCATION
@@ -1339,9 +1355,6 @@ namespace WTelegram
 			else
 			{
 				endpoint = _dcSession?.EndPoint ?? GetDefaultEndpoint(out int defaultDc);
-				// Determine local endpoints for this connection
-				var localEPs = LocalEndPoints?.Count > 0 ? LocalEndPoints : null;
-				var firstLocalEP = localEPs?[0];
 
 				Helpers.Log(2, $"Connecting to {endpoint}{(localEPs != null ? $" (dual-path, {localEPs.Count} endpoints)" : "")}...");
 				TcpClient tcpClient = null;
@@ -1349,7 +1362,29 @@ namespace WTelegram
 				{
 					try
 					{
-						tcpClient = await TcpHandler(endpoint.Address.ToString(), endpoint.Port, firstLocalEP);
+						if (localEPs != null && localEPs.Count > 1)
+						{
+							// Try each local endpoint with a timeout — a dead interface
+							// shouldn't block the entire reconnect when others are available
+							for (int epIdx = 0; epIdx < localEPs.Count; epIdx++)
+							{
+								try
+								{
+									tcpClient = await TcpHandler(endpoint.Address.ToString(), endpoint.Port, localEPs[epIdx])
+										.WaitAsync(TimeSpan.FromSeconds(10));
+									primaryEPIndex = epIdx;
+									break;
+								}
+								catch when (epIdx < localEPs.Count - 1 && _cts?.IsCancellationRequested != true)
+								{
+									Helpers.Log(3, $"Primary connect via {localEPs[epIdx].Address} failed, trying next endpoint...");
+								}
+							}
+						}
+						else
+						{
+							tcpClient = await TcpHandler(endpoint.Address.ToString(), endpoint.Port, localEPs?[0]);
+						}
 					}
 					catch (SocketException ex) // cannot connect to target endpoint, try to find an alternate
 					{
@@ -1367,7 +1402,7 @@ namespace WTelegram
 								Helpers.Log(2, $"Connecting to {endpoint}...");
 								try
 								{
-									tcpClient = await TcpHandler(endpoint.Address.ToString(), endpoint.Port, firstLocalEP);
+									tcpClient = await TcpHandler(endpoint.Address.ToString(), endpoint.Port, localEPs?[primaryEPIndex]);
 									_dcSession.DataCenter = dcOption;
 									break;
 								}
@@ -1387,7 +1422,7 @@ namespace WTelegram
 							_dcSession.Client = this;
 							_dcSession.DataCenter = null;
 							Helpers.Log(2, $"Connecting to {endpoint}...");
-							tcpClient = await TcpHandler(endpoint.Address.ToString(), endpoint.Port, firstLocalEP);
+							tcpClient = await TcpHandler(endpoint.Address.ToString(), endpoint.Port, localEPs?[primaryEPIndex]);
 						}
 					}
 				}
@@ -1405,7 +1440,7 @@ namespace WTelegram
 					TcpClient = tcpClient,
 					NetworkStream = tcpClient.GetStream(),
 					PaddedMode = _paddedMode,
-					LocalEndPoint = firstLocalEP,
+					LocalEndPoint = localEPs?[primaryEPIndex],
 					PathIndex = 0,
 					Cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token)
 				};
@@ -1420,7 +1455,7 @@ namespace WTelegram
 				primaryPath.IsAlive = true;
 				primaryPath.LastRecvTicks = Environment.TickCount64;
 				lock (_pathsLock) _paths.Add(primaryPath);
-				Helpers.Log(2, $"{dcId}>Path 0 connected{(firstLocalEP != null ? $" from {firstLocalEP.Address}" : "")}.");
+				Helpers.Log(2, $"{dcId}>Path 0 connected{(localEPs != null ? $" from {localEPs[primaryEPIndex].Address}" : "")}.");
 			}
 
 			_dcSession.Salts?.Remove(DateTime.MaxValue);
@@ -1473,11 +1508,13 @@ namespace WTelegram
 			Helpers.Log(2, $"Connected to {(TLConfig.test_mode ? "Test DC" : "DC")} {TLConfig.this_dc}... {TLConfig.flags & (Config.Flags)~0x18E00U}");
 
 			// Connect additional paths (after primary is fully authenticated and initialized)
-			if (usingPaths && LocalEndPoints?.Count > 1)
+			if (usingPaths && localEPs?.Count > 1)
 			{
-				for (int i = 1; i < LocalEndPoints.Count; i++)
+				int pathIdx = 1;
+				for (int i = 0; i < localEPs.Count; i++)
 				{
-					var localEP = LocalEndPoints[i];
+					if (i == primaryEPIndex) continue; // already connected as primary
+					var localEP = localEPs[i];
 					try
 					{
 						var tcpClient2 = await TcpHandler(endpoint.Address.ToString(), endpoint.Port, localEP).WaitAsync(TimeSpan.FromSeconds(10));
@@ -1488,7 +1525,7 @@ namespace WTelegram
 							NetworkStream = tcpClient2.GetStream(),
 							PaddedMode = _paddedMode,
 							LocalEndPoint = localEP,
-							PathIndex = i,
+							PathIndex = pathIdx,
 							Cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token)
 						};
 						byte protocolId2 = (byte)(path.PaddedMode ? 0xDD : 0xEE);
@@ -1502,15 +1539,15 @@ namespace WTelegram
 						path.IsAlive = true;
 						path.LastRecvTicks = Environment.TickCount64;
 						lock (_pathsLock) _paths.Add(path);
-						Helpers.Log(2, $"{dcId}>Path {i} connected from {localEP.Address}.");
+						Helpers.Log(2, $"{dcId}>Path {pathIdx} connected from {localEP.Address}.");
 
 						// Send a ping through this path to register the connection with the server
 						try { await SendOnPathAsync(path, new TL.Methods.Ping { ping_id = _random.Next() }); }
-						catch (Exception ex) { Helpers.Log(3, $"{dcId}>Path {i} registration ping failed: {ex.Message}"); }
+						catch (Exception ex) { Helpers.Log(3, $"{dcId}>Path {pathIdx} registration ping failed: {ex.Message}"); }
 					}
 					catch (Exception ex)
 					{
-						Helpers.Log(4, $"{dcId}>Failed to connect path {i} from {localEP.Address}: {ex.Message}. Will retry in background.");
+						Helpers.Log(4, $"{dcId}>Failed to connect path {pathIdx} from {localEP.Address}: {ex.Message}. Will retry in background.");
 						// Create a dead placeholder path and start reconnecting in background.
 						// Without this, the path is permanently lost after a full reconnect
 						// where the secondary interface is temporarily unreachable.
@@ -1518,7 +1555,7 @@ namespace WTelegram
 						{
 							PaddedMode = _paddedMode,
 							LocalEndPoint = localEP,
-							PathIndex = i,
+							PathIndex = pathIdx,
 							IsAlive = false,
 							LastRecvTicks = 0,
 							LastProbeTicks = 0
@@ -1526,6 +1563,7 @@ namespace WTelegram
 						lock (_pathsLock) _paths.Add(deadPath);
 						_ = ReconnectPathAsync(deadPath);
 					}
+					pathIdx++;
 				}
 				Helpers.Log(2, $"{dcId}>Dual-path transport: {_paths.Count(p => p.IsAlive)}/{_paths.Count} paths alive.");
 				_ = PathHealthMonitor(_cts.Token);
