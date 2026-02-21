@@ -29,7 +29,11 @@ namespace WTelegram
 		/// <summary>Prefer paths in configured order. Always use the highest-priority alive path; fail over to lower-priority paths and return to higher-priority ones as they recover.</summary>
 		PreferredOrder,
 		/// <summary>Use current path until it dies. Fail over to next alive path and stay there, even if the original recovers.</summary>
-		StickyFailover
+		StickyFailover,
+		/// <summary>Always route sends through the alive path with the lowest measured round-trip latency.
+		/// Latency is tracked per path using an EWMA of PingDelayDisconnect response times.
+		/// Paths with no samples yet are used as fallback until measurements arrive.</summary>
+		LowestLatency,
 	}
 
 	public partial class Client : IDisposable
@@ -562,7 +566,27 @@ namespace WTelegram
 					}
 				}
 				if (obj != null)
+				{
+					// Update per-path latency EWMA when a Pong arrives matching our pending probe.
+					// The Reactor has path context here, making it the cleanest interception point.
+					if (path != null && obj is Pong latencyPong)
+					{
+						long pendingId = Volatile.Read(ref path.PendingPingId);
+						if (pendingId != -1 && latencyPong.ping_id == pendingId)
+						{
+							Volatile.Write(ref path.PendingPingId, -1L); // clear first to avoid double-counting
+							long rttMs = Environment.TickCount64 - path.PendingSentTicks;
+							if (rttMs >= 0 && rttMs < 30_000) // sanity-check: discard stale/wrapped measurements
+							{
+								long prev = Volatile.Read(ref path.LatencyEwmaMs);
+								long next = prev == long.MaxValue ? rttMs : (long)(0.8 * prev + 0.2 * rttMs);
+								Volatile.Write(ref path.LatencyEwmaMs, next);
+								Helpers.Log(1, $"{_dcSession.DcID}>Path {path.PathIndex} RTT {rttMs}ms (EWMA {next}ms)");
+							}
+						}
+					}
 					await HandleMessageAsync(obj);
+				}
 			}
 		}
 
@@ -627,7 +651,26 @@ namespace WTelegram
 						}
 						return null;
 
-					case PathSendMode.RoundRobin:
+					case PathSendMode.LowestLatency:
+					// Pick the alive path with the lowest EWMA round-trip latency.
+					// Paths with no samples yet (LatencyEwmaMs == long.MaxValue) are used as
+					// fallback if no measured paths are alive yet (e.g. right after startup).
+					TransportPath bestPath = null;
+					long bestMs = long.MaxValue;
+					for (int i = 0; i < count; i++)
+					{
+						if (!_paths[i].IsAlive) continue;
+						long lat = Volatile.Read(ref _paths[i].LatencyEwmaMs);
+						if (bestPath == null || lat < bestMs)
+						{
+							bestPath = _paths[i];
+							bestMs = lat;
+							_primaryPathIndex = i;
+						}
+					}
+					return bestPath;
+
+				case PathSendMode.RoundRobin:
 					default:
 						// Advance to next alive path each call (original behavior)
 						int start = (_primaryPathIndex + 1) % count;
@@ -699,6 +742,8 @@ namespace WTelegram
 						path.Cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
 						path.LastRecvTicks = Environment.TickCount64;
 						path.LastProbeTicks = 0;
+						path.LatencyEwmaMs = long.MaxValue; // stale RTT data — reset on reconnect
+						Volatile.Write(ref path.PendingPingId, -1);
 						// Start reactor BEFORE ping (it needs to receive the Pong),
 						// but do NOT set IsAlive until after registration ping succeeds.
 						path.ReactorTask = Reactor(path, path.NetworkStream, path.Cts.Token);
@@ -793,11 +838,16 @@ namespace WTelegram
 					else if ((now - path.LastProbeTicks) >= probeIntervalMs)
 					{
 						// Time for a per-path PingDelayDisconnect (liveness probe + server-side keepalive)
+						long thisPingId = ping_id++;
 						path.LastProbeTicks = now;
+						// Record probe timestamp BEFORE setting PendingPingId (memory ordering:
+						// the Volatile.Write below is the release barrier that makes PendingSentTicks visible)
+						path.PendingSentTicks = now;
+						Volatile.Write(ref path.PendingPingId, thisPingId);
 						try
 						{
 							await _sendSemaphore.WaitAsync(ct);
-							try { await SendOnPathAsync(path, new TL.Methods.PingDelayDisconnect { ping_id = ping_id++, disconnect_delay = disconnectDelay }); }
+							try { await SendOnPathAsync(path, new TL.Methods.PingDelayDisconnect { ping_id = thisPingId, disconnect_delay = disconnectDelay }); }
 							finally { _sendSemaphore.Release(); }
 						}
 						catch { /* path might already be dead, next cycle will catch it */ }
@@ -1211,6 +1261,10 @@ namespace WTelegram
 			public int PathIndex;
 			public long LastRecvTicks;
 			public long LastProbeTicks;
+			// Latency tracking for LowestLatency mode
+			public long PendingPingId = -1;    // ping_id of most recent probe sent on this path (-1 = none pending)
+			public long PendingSentTicks;       // TickCount64 when PendingPingId probe was sent
+			public long LatencyEwmaMs = long.MaxValue; // EWMA RTT in ms; MaxValue = no samples yet
 
 			public void Dispose()
 			{
