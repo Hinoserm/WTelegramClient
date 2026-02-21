@@ -21,6 +21,17 @@ using static WTelegram.Encryption;
 
 namespace WTelegram
 {
+	/// <summary>Controls how send traffic is distributed across multipath transport connections.</summary>
+	public enum PathSendMode
+	{
+		/// <summary>Cycle through alive paths on each send, distributing load evenly.</summary>
+		RoundRobin,
+		/// <summary>Prefer paths in configured order. Always use the highest-priority alive path; fail over to lower-priority paths and return to higher-priority ones as they recover.</summary>
+		PreferredOrder,
+		/// <summary>Use current path until it dies. Fail over to next alive path and stay there, even if the original recovers.</summary>
+		StickyFailover
+	}
+
 	public partial class Client : IDisposable
 #if NETCOREAPP2_1_OR_GREATER
 		, IAsyncDisposable
@@ -107,9 +118,22 @@ namespace WTelegram
 		private readonly List<TransportPath> _paths = new();
 		private readonly object _pathsLock = new();
 		private volatile int _primaryPathIndex;
+		private volatile int _lastConnectedEPIndex;
 		private bool _fullReconnectStarted;
-		/// <summary>Optional local endpoints for dual-path transport. Add two endpoints for redundant connections.</summary>
+		/// <summary>Optional local endpoints for multipath transport. Add two endpoints for redundant connections.</summary>
 		public List<IPEndPoint> LocalEndPoints { get; set; } = new();
+		/// <summary>Seconds between per-path liveness probes (PingDelayDisconnect). Lower values detect failures faster but increase traffic.</summary>
+		public int PathProbeInterval { get; set; } = 3;
+		/// <summary>Seconds of silence (after a probe) before a path is declared dead locally and force-closed.</summary>
+		public int PathDeadTimeout { get; set; } = 5;
+		/// <summary>Seconds the Telegram server waits before disconnecting a silent path. Server-side safety net; should be larger than PathDeadTimeout.</summary>
+		public int PathDisconnectDelay { get; set; } = 15;
+		/// <summary>Seconds to wait for a single endpoint connection attempt before timing out.</summary>
+		public int PathConnectTimeout { get; set; } = 10;
+		/// <summary>Maximum backoff delay in seconds between reconnect attempts (both per-path and full reconnect).</summary>
+		public int PathReconnectMaxBackoff { get; set; } = 30;
+		/// <summary>Controls how send traffic is distributed across alive paths. Default: PreferredOrder (prefer paths in configured address order).</summary>
+		public PathSendMode SendMode { get; set; } = PathSendMode.PreferredOrder;
 
 		public Client(int apiID, string apiHash, string sessionPathname = null, IEnumerable<string> localAddresses = null)
 			: this(what => what switch
@@ -127,7 +151,7 @@ namespace WTelegram
 		/// <summary>Welcome to WTelegramClient! 🙂</summary>
 		/// <param name="configProvider">Config callback, is queried for: <b>api_id</b>, <b>api_hash</b>, <b>session_pathname</b></param>
 		/// <param name="sessionStore">if specified, must support initial Length &amp; Read() of a session, then calls to Write() the updated session. Other calls can be ignored</param>
-		/// <param name="localAddresses">Optional list of local IP addresses to bind outgoing connections to. If two or more are provided, dual-path transport is used for redundancy.</param>
+		/// <param name="localAddresses">Optional list of local IP addresses to bind outgoing connections to. If two or more are provided, multipath transport is used for redundancy.</param>
 		public Client(Func<string, string> configProvider = null, Stream sessionStore = null, IEnumerable<string> localAddresses = null)
 		{
 			_config = configProvider ?? DefaultConfigOrAsk;
@@ -156,6 +180,12 @@ namespace WTelegram
 			MaxAutoReconnects = cloneOf.MaxAutoReconnects;
 			TLConfig = cloneOf.TLConfig;
 			LocalEndPoints = cloneOf.LocalEndPoints;
+			PathProbeInterval = cloneOf.PathProbeInterval;
+			PathDeadTimeout = cloneOf.PathDeadTimeout;
+			PathDisconnectDelay = cloneOf.PathDisconnectDelay;
+			PathConnectTimeout = cloneOf.PathConnectTimeout;
+			PathReconnectMaxBackoff = cloneOf.PathReconnectMaxBackoff;
+			SendMode = cloneOf.SendMode;
 			_dcSession = dcSession;
 		}
 
@@ -541,19 +571,77 @@ namespace WTelegram
 			lock (_pathsLock)
 			{
 				if (_paths.Count == 0) return null;
-				// Round-robin: start from the next path after the last one used
 				int count = _paths.Count;
-				int start = (_primaryPathIndex + 1) % count;
-				for (int i = 0; i < count; i++)
+
+				switch (SendMode)
 				{
-					int idx = (start + i) % count;
-					if (_paths[idx].IsAlive)
-					{
-						_primaryPathIndex = idx;
-						return _paths[idx];
-					}
+					case PathSendMode.PreferredOrder:
+						// Prefer paths in configured address order: LocalEndPoints[0] > [1] > [2] ...
+						// After a full reconnect, _paths order may differ from LocalEndPoints order,
+						// so we search by endpoint address rather than list index.
+						var orderedEPs = LocalEndPoints;
+						if (orderedEPs != null && orderedEPs.Count > 0)
+						{
+							for (int ep = 0; ep < orderedEPs.Count; ep++)
+							{
+								var targetAddr = orderedEPs[ep].Address;
+								for (int i = 0; i < count; i++)
+								{
+									if (_paths[i].LocalEndPoint?.Address?.Equals(targetAddr) == true && _paths[i].IsAlive)
+									{
+										_primaryPathIndex = i;
+										return _paths[i];
+									}
+								}
+							}
+						}
+						else if (_paths[0].IsAlive)
+						{
+							_primaryPathIndex = 0;
+							return _paths[0];
+						}
+						// No configured endpoint alive — fallback to any alive path
+						for (int i = 0; i < count; i++)
+						{
+							if (_paths[i].IsAlive)
+							{
+								_primaryPathIndex = i;
+								return _paths[i];
+							}
+						}
+						return null;
+
+					case PathSendMode.StickyFailover:
+						// Stay on current path if alive
+						if (_primaryPathIndex < count && _paths[_primaryPathIndex].IsAlive)
+							return _paths[_primaryPathIndex];
+						// Current path dead — find next alive one
+						for (int i = 1; i < count; i++)
+						{
+							int idx = (_primaryPathIndex + i) % count;
+							if (_paths[idx].IsAlive)
+							{
+								_primaryPathIndex = idx;
+								return _paths[idx];
+							}
+						}
+						return null;
+
+					case PathSendMode.RoundRobin:
+					default:
+						// Advance to next alive path each call (original behavior)
+						int start = (_primaryPathIndex + 1) % count;
+						for (int i = 0; i < count; i++)
+						{
+							int idx = (start + i) % count;
+							if (_paths[idx].IsAlive)
+							{
+								_primaryPathIndex = idx;
+								return _paths[idx];
+							}
+						}
+						return null;
 				}
-				return null; // all dead
 			}
 		}
 
@@ -569,7 +657,9 @@ namespace WTelegram
 				if (endpoint == null) return;
 				int dcId = _dcSession?.DcID ?? 0;
 
-				// Clean up old connection
+				// Clean up old connection (dispose crypto handles to avoid leaks)
+				path.Sha256Send?.Dispose();
+				path.Sha256Recv?.Dispose();
 				path.NetworkStream?.Close();
 				path.TcpClient?.Dispose();
 #if OBFUSCATION
@@ -616,7 +706,12 @@ namespace WTelegram
 						Helpers.Log(2, $"{_dcSession.DcID}>Path {path.PathIndex} reconnected successfully.");
 
 						// Send a ping through this path to register with server
-						try { await SendOnPathAsync(path, new TL.Methods.Ping { ping_id = _random.Next() }); }
+						try
+						{
+							await _sendSemaphore.WaitAsync();
+							try { await SendOnPathAsync(path, new TL.Methods.Ping { ping_id = _random.Next() }); }
+							finally { _sendSemaphore.Release(); }
+						}
 						catch { } // best effort
 						return;
 					}
@@ -624,7 +719,7 @@ namespace WTelegram
 					{
 						Helpers.Log(3, $"{_dcSession.DcID}>Path {path.PathIndex} reconnect attempt {attempt} failed: {ex.Message}");
 						if (_cts?.IsCancellationRequested == true) return;
-						await Task.Delay(Math.Min(attempt * 2000, 30000)); // backoff up to 30s
+						await Task.Delay(Math.Min(attempt * 2000, PathReconnectMaxBackoff * 1000)); // backoff up to 30s
 					}
 				}
 			}
@@ -636,15 +731,14 @@ namespace WTelegram
 
 		private async Task PathHealthMonitor(CancellationToken ct)
 		{
-			const int checkIntervalMs = 1000;     // Check every 1 second
-			const int probeIntervalMs = 3000;     // Send PingDelayDisconnect every 3s per path
-			const int disconnectDelay = 7;        // Telegram disconnects path after 7s of silence
-			const int deadAfterMs = 5000;         // Local: declare dead after 5s with no response to probe
+			int probeIntervalMs = PathProbeInterval * 1000;
+			int disconnectDelay = PathDisconnectDelay;
+			int deadAfterMs = PathDeadTimeout * 1000;
 			int ping_id = _random.Next();
 
 			while (!ct.IsCancellationRequested)
 			{
-				await Task.Delay(checkIntervalMs, ct);
+				await Task.Delay(1000, ct); // internal polling rate
 				if (_paths.Count <= 1) continue;
 
 				var now = Environment.TickCount64;
@@ -661,6 +755,8 @@ namespace WTelegram
 				if (alivePaths.Length > 0 && !alivePaths.Any(p =>
 					(now - p.LastRecvTicks) <= deadAfterMs || p.LastProbeTicks <= p.LastRecvTicks))
 				{
+					// Check if the Reactor is already handling a full reconnect
+					lock (_pathsLock) { if (_fullReconnectStarted) continue; _fullReconnectStarted = true; }
 					Helpers.Log(4, $"{_dcSession.DcID}>All {alivePaths.Length} path(s) globally unresponsive. Triggering full reconnect.");
 					// Fire-and-forget because ResetAsync will cancel our ct
 					_ = Task.Run(async () =>
@@ -669,6 +765,7 @@ namespace WTelegram
 						{
 							await PerformFullReconnectAsync();
 						}
+						catch (ObjectDisposedException) { } // client shutting down, expected
 						catch (Exception ex)
 						{
 							Helpers.Log(5, $"{_dcSession.DcID}>Full reconnect from health monitor failed: {ex.Message}");
@@ -713,63 +810,54 @@ namespace WTelegram
 		/// monitor when all paths are globally dead, bypassing the Reactor error handler
 		/// to avoid races with per-path reconnects.
 		/// </summary>
-		private async Task PerformFullReconnectAsync()
+	private async Task PerformFullReconnectAsync()
 		{
 			Helpers.Log(2, $"{_dcSession?.DcID}>PerformFullReconnectAsync: starting...");
-			var oldSemaphore = _sendSemaphore;
-			await oldSemaphore.WaitAsync(); // prevent sends during reconnect
-			try
+
+			for (int attempt = 1; ; attempt++)
 			{
-				for (int attempt = 1; ; attempt++)
+				try
 				{
-					try
+					lock (_msgsToAck) _msgsToAck.Clear();
+					await ResetAsync(false, false);
+					// ResetAsync creates _sendSemaphore = new(0), blocking all external sends.
+					// DoConnectAsync releases it on success (line 1475).
+					// We do NOT acquire the semaphore here — that would deadlock because it starts at 0.
+
+					await Task.Delay(Math.Min(attempt * 2000, PathReconnectMaxBackoff * 1000)); // backoff: 2s, 4s, 6s, ... up to 30s
+					await ConnectAsync();
+
+					// Success — retry all pending RPCs so callers re-send on the new connection
+					var reactorError = new ReactorError { Exception = new IOException("All paths dead — full reconnect") };
+					lock (_pendingRpcs)
 					{
-						lock (_msgsToAck) _msgsToAck.Clear();
-						await ResetAsync(false, false);
-						await Task.Delay(Math.Min(attempt * 2000, 30000)); // backoff: 2s, 4s, 6s, ... up to 30s
-						if (_cts?.IsCancellationRequested == true) throw new ObjectDisposedException(nameof(Client));
-						await ConnectAsync();
-						break; // success
+						foreach (var rpc in _pendingRpcs.Values)
+							rpc.tcs.TrySetResult(reactorError);
+						_pendingRpcs.Clear();
+						_bareRpc = null;
 					}
-					catch (ObjectDisposedException) { throw; }
-					catch (Exception ex)
+					if (IsMainDC)
 					{
-						Helpers.Log(4, $"{_dcSession?.DcID}>PerformFullReconnectAsync attempt {attempt} failed: {ex.Message}. Retrying...");
-						if (_cts?.IsCancellationRequested == true) throw new ObjectDisposedException(nameof(Client));
+						var updatesState = await this.Updates_GetState();
+						RaiseUpdates(updatesState);
 					}
+					Helpers.Log(2, $"{_dcSession?.DcID}>PerformFullReconnectAsync: completed successfully.");
+					_fullReconnectStarted = false;
+					return; // done — DoConnectAsync already released _sendSemaphore
 				}
-				var reactorError = new ReactorError { Exception = new IOException("All paths dead — full reconnect") };
-				lock (_pendingRpcs)
+				catch (ObjectDisposedException)
 				{
-					foreach (var rpc in _pendingRpcs.Values)
-						rpc.tcs.TrySetResult(reactorError);
-					_pendingRpcs.Clear();
-					_bareRpc = null;
+					// Client was genuinely disposed — propagate
+					_fullReconnectStarted = false;
+					throw;
 				}
-				if (IsMainDC)
+				catch (Exception ex)
 				{
-					var updatesState = await this.Updates_GetState();
-					RaiseUpdates(updatesState);
+					Helpers.Log(4, $"{_dcSession?.DcID}>PerformFullReconnectAsync attempt {attempt} failed: {ex.Message}. Retrying...");
+					// ConnectAsync failed, so _sendSemaphore is still at 0 (locked).
+					// Release it so external callers don't hang forever between retries.
+					try { _sendSemaphore.Release(); } catch { }
 				}
-				Helpers.Log(2, $"{_dcSession?.DcID}>PerformFullReconnectAsync: completed successfully.");
-			}
-			catch (Exception ex) when (ex is not ObjectDisposedException)
-			{
-				Helpers.Log(5, $"{_dcSession?.DcID}>PerformFullReconnectAsync failed: {ex}");
-				if (IsMainDC)
-					RaiseUpdates(new ReactorError { Exception = ex });
-				lock (_pendingRpcs)
-				{
-					foreach (var rpc in _pendingRpcs.Values)
-						rpc.tcs.TrySetException(ex);
-					_pendingRpcs.Clear();
-					_bareRpc = null;
-				}
-			}
-			finally
-			{
-				_fullReconnectStarted = false;
-				oldSemaphore.Release();
 			}
 		}
 
@@ -1297,9 +1385,21 @@ namespace WTelegram
 		/// <returns>Most methods of this class are async (Task), so please use <see langword="await"/></returns>
 		public async Task ConnectAsync(bool quickResume = false)
 		{
+			Task task;
 			lock (this)
-				_connecting ??= DoConnectAsync(quickResume);
-			await _connecting;
+				task = _connecting ??= DoConnectAsync(quickResume);
+			try
+			{
+				await task;
+			}
+			catch
+			{
+				// Clear cached failure so subsequent calls retry instead of replaying the same error
+				lock (this)
+					if (_connecting == task)
+						_connecting = null;
+				throw;
+			}
 		}
 
 		private IEnumerable<DcOption> GetDcOptions(int dcId, DcOption.Flags flags) => !flags.HasFlag(DcOption.Flags.media_only)
@@ -1356,30 +1456,71 @@ namespace WTelegram
 			{
 				endpoint = _dcSession?.EndPoint ?? GetDefaultEndpoint(out int defaultDc);
 
-				Helpers.Log(2, $"Connecting to {endpoint}{(localEPs != null ? $" (dual-path, {localEPs.Count} endpoints)" : "")}...");
+				Helpers.Log(2, $"Connecting to {endpoint}{(localEPs != null ? $" (multipath, {localEPs.Count} endpoints)" : "")}...");
 				TcpClient tcpClient = null;
 				try
 				{
 					try
 					{
-						if (localEPs != null && localEPs.Count > 1)
+						if (localEPs != null && localEPs.Count > 1 && SendMode == PathSendMode.PreferredOrder)
 						{
-							// Try each local endpoint with a timeout — a dead interface
-							// shouldn't block the entire reconnect when others are available
-							for (int epIdx = 0; epIdx < localEPs.Count; epIdx++)
+							// PreferredOrder: connect sequentially so address[0] is always Path 0.
+							// This ensures the preferred path matches the first address in the config.
+							for (int i = 0; i < localEPs.Count; i++)
 							{
 								try
 								{
-									tcpClient = await TcpHandler(endpoint.Address.ToString(), endpoint.Port, localEPs[epIdx])
-										.WaitAsync(TimeSpan.FromSeconds(10));
-									primaryEPIndex = epIdx;
+									tcpClient = await TcpHandler(endpoint.Address.ToString(), endpoint.Port, localEPs[i])
+										.WaitAsync(TimeSpan.FromSeconds(PathConnectTimeout));
+									primaryEPIndex = i;
+									_lastConnectedEPIndex = i;
+									Helpers.Log(2, $"Primary connected via {localEPs[i].Address}{(i == 0 ? " (preferred)" : " (fallback)")}.");
 									break;
 								}
-								catch when (epIdx < localEPs.Count - 1 && _cts?.IsCancellationRequested != true)
+								catch (Exception ex)
 								{
-									Helpers.Log(3, $"Primary connect via {localEPs[epIdx].Address} failed, trying next endpoint...");
+									Helpers.Log(3, $"Connect via {localEPs[i].Address} failed: {ex.Message}");
 								}
 							}
+							if (tcpClient == null) throw new SocketException(10060); // all endpoints failed
+						}
+						else if (localEPs != null && localEPs.Count > 1)
+						{
+							// RoundRobin/StickyFailover: race ALL endpoints in parallel — first one wins.
+							// This avoids wasting 10s per dead interface in sequential attempts.
+							var connectTasks = new List<(Task<TcpClient> task, int epIdx)>();
+							for (int i = 0; i < localEPs.Count; i++)
+							{
+								int idx = i;
+								connectTasks.Add((TcpHandler(endpoint.Address.ToString(), endpoint.Port, localEPs[idx])
+									.WaitAsync(TimeSpan.FromSeconds(PathConnectTimeout)), idx));
+							}
+
+							Exception lastEx = null;
+							while (connectTasks.Count > 0 && tcpClient == null)
+							{
+								var completedTask = await Task.WhenAny(connectTasks.Select(x => x.task));
+								var entry = connectTasks.First(x => x.task == completedTask);
+								connectTasks.Remove(entry);
+								try
+								{
+									tcpClient = await entry.task;
+									primaryEPIndex = entry.epIdx;
+									_lastConnectedEPIndex = entry.epIdx;
+									Helpers.Log(2, $"Primary connected via {localEPs[entry.epIdx].Address}.");
+								}
+								catch (Exception ex)
+								{
+									Helpers.Log(3, $"Connect via {localEPs[entry.epIdx].Address} failed: {ex.Message}");
+									lastEx = ex;
+								}
+							}
+
+							// Dispose any late-arriving connections we don't need
+							foreach (var remaining in connectTasks)
+								_ = remaining.task.ContinueWith(t => { if (t.IsCompletedSuccessfully) t.Result?.Dispose(); }, TaskScheduler.Default);
+
+							if (tcpClient == null && lastEx != null) throw lastEx;
 						}
 						else
 						{
@@ -1517,7 +1658,7 @@ namespace WTelegram
 					var localEP = localEPs[i];
 					try
 					{
-						var tcpClient2 = await TcpHandler(endpoint.Address.ToString(), endpoint.Port, localEP).WaitAsync(TimeSpan.FromSeconds(10));
+						var tcpClient2 = await TcpHandler(endpoint.Address.ToString(), endpoint.Port, localEP).WaitAsync(TimeSpan.FromSeconds(PathConnectTimeout));
 						ConfigureKeepalive(tcpClient2);
 						var path = new TransportPath
 						{
@@ -1542,7 +1683,12 @@ namespace WTelegram
 						Helpers.Log(2, $"{dcId}>Path {pathIdx} connected from {localEP.Address}.");
 
 						// Send a ping through this path to register the connection with the server
-						try { await SendOnPathAsync(path, new TL.Methods.Ping { ping_id = _random.Next() }); }
+						try
+						{
+							await _sendSemaphore.WaitAsync();
+							try { await SendOnPathAsync(path, new TL.Methods.Ping { ping_id = _random.Next() }); }
+							finally { _sendSemaphore.Release(); }
+						}
 						catch (Exception ex) { Helpers.Log(3, $"{dcId}>Path {pathIdx} registration ping failed: {ex.Message}"); }
 					}
 					catch (Exception ex)
@@ -1565,7 +1711,7 @@ namespace WTelegram
 					}
 					pathIdx++;
 				}
-				Helpers.Log(2, $"{dcId}>Dual-path transport: {_paths.Count(p => p.IsAlive)}/{_paths.Count} paths alive.");
+				Helpers.Log(2, $"{dcId}>Multipath transport: {_paths.Count(p => p.IsAlive)}/{_paths.Count} paths alive.");
 				_ = PathHealthMonitor(_cts.Token);
 			}
 		}
@@ -2104,23 +2250,12 @@ namespace WTelegram
 					}
 					catch (IOException) when (_paths.Count > 1)
 					{
-						// Primary path write failed — try failover to another alive path
+						// Path write failed — mark dead and start reconnect.
+						// The Reactor error handler will retry pending RPCs on surviving paths.
+						// We can't re-encrypt for a different path (each has its own AES-CTR state),
+						// so propagate the exception and let Invoke's retry logic handle it.
 						path.IsAlive = false;
 						_ = ReconnectPathAsync(path);
-						var failoverPath = GetPrimaryAlivePath();
-						if (failoverPath != null)
-						{
-							Helpers.Log(3, $"{_dcSession.DcID}>Send failed on path {path.PathIndex}, failing over to path {failoverPath.PathIndex}");
-							// Re-encrypt the frame for the failover path's obfuscation state
-							// We need to rebuild the obfuscation since each path has its own AES-CTR
-							BinaryPrimitives.WriteInt32LittleEndian(buffer, frameLength - 4);
-							// Re-build the unobfuscated frame
-							memStream.Position = 0;
-							var buffer2 = memStream.GetBuffer();
-							// The buffer was already obfuscated by the failed path's SendCtr, so we can't reuse it.
-							// Instead, resend the message via a fresh SendAsync call (recursive, with failover path now primary)
-							throw; // let the outer catch handle retry via Invoke
-						}
 						throw;
 					}
 				}
