@@ -899,8 +899,8 @@ namespace WTelegram
 					var mc = await this.Channels_GetChannels(new InputChannel(chatId, 0));
 					if (!mc.chats.TryGetValue(chatId, out chat))
 						throw new WTException($"Channel {chatId} not found");
-					else
-						chats?[chatId] = chat;
+					else if (chats != null)
+						chats[chatId] = chat;
 				}
 			}
 			else
