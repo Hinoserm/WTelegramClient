@@ -647,9 +647,8 @@ namespace WTelegram
 
 		private async Task ReconnectPathAsync(TransportPath path)
 		{
-			// Prevent multiple concurrent reconnect loops for the same path
-			if (path.Reconnecting) return;
-			path.Reconnecting = true;
+			// Prevent multiple concurrent reconnect loops for the same path (atomic guard)
+			if (Interlocked.CompareExchange(ref path._reconnecting, 1, 0) != 0) return;
 
 			try
 			{
@@ -698,12 +697,11 @@ namespace WTelegram
 						path.Sha256Send = SHA256.Create();
 						path.Sha256Recv = SHA256.Create();
 						path.Cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
-						path.IsAlive = true;
 						path.LastRecvTicks = Environment.TickCount64;
 						path.LastProbeTicks = 0;
+						// Start reactor BEFORE ping (it needs to receive the Pong),
+						// but do NOT set IsAlive until after registration ping succeeds.
 						path.ReactorTask = Reactor(path, path.NetworkStream, path.Cts.Token);
-
-						Helpers.Log(2, $"{_dcSession.DcID}>Path {path.PathIndex} reconnected successfully.");
 
 						// Send a ping through this path to register with server
 						try
@@ -713,19 +711,23 @@ namespace WTelegram
 							finally { _sendSemaphore.Release(); }
 						}
 						catch { } // best effort
+
+						// Now mark alive — server has acknowledged this path
+						path.IsAlive = true;
+						Helpers.Log(2, $"{_dcSession.DcID}>Path {path.PathIndex} reconnected and registered successfully.");
 						return;
 					}
 					catch (Exception ex)
 					{
 						Helpers.Log(3, $"{_dcSession.DcID}>Path {path.PathIndex} reconnect attempt {attempt} failed: {ex.Message}");
 						if (_cts?.IsCancellationRequested == true) return;
-						await Task.Delay(Math.Min(attempt * 2000, PathReconnectMaxBackoff * 1000)); // backoff up to 30s
+						await Task.Delay(Math.Max(1000, Math.Min(attempt * 2000, PathReconnectMaxBackoff * 1000))); // backoff up to 30s (min 1s)
 					}
 				}
 			}
 			finally
 			{
-				path.Reconnecting = false;
+				Volatile.Write(ref path._reconnecting, 0);
 			}
 		}
 
@@ -810,7 +812,7 @@ namespace WTelegram
 		/// monitor when all paths are globally dead, bypassing the Reactor error handler
 		/// to avoid races with per-path reconnects.
 		/// </summary>
-	private async Task PerformFullReconnectAsync()
+		private async Task PerformFullReconnectAsync()
 		{
 			Helpers.Log(2, $"{_dcSession?.DcID}>PerformFullReconnectAsync: starting...");
 
@@ -820,11 +822,15 @@ namespace WTelegram
 				{
 					lock (_msgsToAck) _msgsToAck.Clear();
 					await ResetAsync(false, false);
+					// ResetAsync resets _fullReconnectStarted = false (under _pathsLock).
+					// Re-claim ownership immediately so no other thread can launch a second
+					// PerformFullReconnectAsync between here and ConnectAsync completing.
+					lock (_pathsLock) { _fullReconnectStarted = true; }
 					// ResetAsync creates _sendSemaphore = new(0), blocking all external sends.
 					// DoConnectAsync releases it on success (line 1475).
 					// We do NOT acquire the semaphore here — that would deadlock because it starts at 0.
 
-					await Task.Delay(Math.Min(attempt * 2000, PathReconnectMaxBackoff * 1000)); // backoff: 2s, 4s, 6s, ... up to 30s
+					await Task.Delay(Math.Max(1000, Math.Min(attempt * 2000, PathReconnectMaxBackoff * 1000))); // backoff: 2s, 4s, 6s, ... up to 30s (min 1s)
 					await ConnectAsync();
 
 					// Success — retry all pending RPCs so callers re-send on the new connection
@@ -842,21 +848,23 @@ namespace WTelegram
 						RaiseUpdates(updatesState);
 					}
 					Helpers.Log(2, $"{_dcSession?.DcID}>PerformFullReconnectAsync: completed successfully.");
-					_fullReconnectStarted = false;
+					lock (_pathsLock) { _fullReconnectStarted = false; }
 					return; // done — DoConnectAsync already released _sendSemaphore
 				}
 				catch (ObjectDisposedException)
 				{
 					// Client was genuinely disposed — propagate
-					_fullReconnectStarted = false;
+					lock (_pathsLock) { _fullReconnectStarted = false; }
 					throw;
 				}
 				catch (Exception ex)
 				{
 					Helpers.Log(4, $"{_dcSession?.DcID}>PerformFullReconnectAsync attempt {attempt} failed: {ex.Message}. Retrying...");
 					// ConnectAsync failed, so _sendSemaphore is still at 0 (locked).
-					// Release it so external callers don't hang forever between retries.
-					try { _sendSemaphore.Release(); } catch { }
+					// After ResetAsync, any callers waiting on the old semaphore are already unblocked
+					// (it was a different instance). New callers block on the new semaphore until
+					// ConnectAsync succeeds. No release needed here — releasing would let callers
+					// through on a broken connection.
 				}
 			}
 		}
@@ -1198,7 +1206,7 @@ namespace WTelegram
 			public bool PaddedMode;
 			public IPEndPoint LocalEndPoint;
 			public volatile bool IsAlive;
-			public volatile bool Reconnecting; // true while ReconnectPathAsync is running
+			public int _reconnecting; // 1 while ReconnectPathAsync is running (uses Interlocked for atomicity)
 			public CancellationTokenSource Cts;
 			public int PathIndex;
 			public long LastRecvTicks;
