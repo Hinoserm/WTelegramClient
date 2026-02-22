@@ -136,8 +136,8 @@ namespace WTelegram
 		public int PathConnectTimeout { get; set; } = 10;
 		/// <summary>Maximum backoff delay in seconds between reconnect attempts (both per-path and full reconnect).</summary>
 		public int PathReconnectMaxBackoff { get; set; } = 30;
-		/// <summary>Controls how send traffic is distributed across alive paths. Default: PreferredOrder (prefer paths in configured address order).</summary>
-		public PathSendMode SendMode { get; set; } = PathSendMode.PreferredOrder;
+		/// <summary>Controls how send traffic is distributed across alive paths. Default: LowestLatency (use path with lowest measured RTT).</summary>
+		public PathSendMode SendMode { get; set; } = PathSendMode.LowestLatency;
 
 		public Client(int apiID, string apiHash, string sessionPathname = null, IEnumerable<string> localAddresses = null)
 			: this(what => what switch
