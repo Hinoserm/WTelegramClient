@@ -423,26 +423,29 @@ namespace WTelegram
 					}
 				if (new_messages?.Length > 0)
 				{
-					var update = state == null ? new UpdateNewChannelMessage() : new UpdateNewMessage() { pts = state.pts, pts_count = 1 };
 					foreach (var msg in new_messages)
 					{
 						if (_pending.Any(p => p is { own: true, update: UpdateNewMessage { message: { Peer.ID: var peer_id, ID: var msg_id } } }
 							&& peer_id == msg.Peer.ID && msg_id == msg.ID))
 							continue;
-						update.message = msg;
+						// Create a new update object per message to avoid mutation when reentrant handlers
+						// haven't completed yet (each async handler holds a reference to the update object).
+						UpdateNewMessage update = state == null
+							? new UpdateNewChannelMessage { message = msg }
+							: new UpdateNewMessage { message = msg, pts = state.pts, pts_count = 1 };
 						await RaiseUpdate(update);
 					}
 				}
 				if (enc_messages?.Length > 0)
 				{
-					var update = new UpdateNewEncryptedMessage();
-					if (state != null) update.qts = state.qts;
 					foreach (var msg in enc_messages)
 					{
 						if (_pending.Any(p => p is { own: true, update: UpdateNewEncryptedMessage { message: { ChatId: var chat_id, RandomId: var random_id } } }
 							&& chat_id == msg.ChatId && random_id == msg.RandomId))
 							continue;
-						update.message = msg;
+						// Create a new update object per message (same reentrant mutation issue as above).
+						var update = new UpdateNewEncryptedMessage { message = msg };
+						if (state != null) update.qts = state.qts;
 						await RaiseUpdate(update);
 					}
 				}
@@ -522,6 +525,8 @@ namespace WTelegram
 			{
 				var task = _onUpdate(update);
 				if (!_reentrant) await task;
+				else _ = task.ContinueWith(t => Log?.Invoke(4, $"onUpdate({update?.GetType().Name}) raised {t.Exception}"),
+					TaskContinuationOptions.OnlyOnFaulted);
 			}
 			catch (Exception ex)
 			{
