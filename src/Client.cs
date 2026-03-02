@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Globalization;
@@ -256,6 +257,7 @@ namespace WTelegram
 		private volatile int _primaryPathIndex;
 		private volatile int _lastConnectedEPIndex;
 		private bool _fullReconnectStarted;
+		private readonly ConcurrentDictionary<long, (int PathIndex, long SentTicks)> _pendingPings = new();
 		/// <summary>Optional local endpoints for multipath transport. Add two endpoints for redundant connections.</summary>
 		public List<IPEndPoint> LocalEndPoints { get; set; } = new();
 		/// <summary>Seconds between per-path liveness probes (PingDelayDisconnect). Lower values detect failures faster but increase traffic.</summary>
@@ -457,6 +459,7 @@ namespace WTelegram
 				_primaryPathIndex = 0;
 				_fullReconnectStarted = false;
 			}
+			_pendingPings.Clear();
 			_networkStream?.Close();
 			_tcpClient?.Dispose();
 #if OBFUSCATION
@@ -620,19 +623,32 @@ namespace WTelegram
 						{
 							Helpers.Log(3, $"{_dcSession.DcID}>Path {path.PathIndex} error ({ex.Message}), other paths alive. Reconnecting path in background.");
 
-							// Retry ALL pending RPCs — we can't reliably track which path each
-							// RPC was sent on (MsgContainer wrapping bypasses path tracking).
-							// RPCs on the surviving path may get sent twice, but that's harmless
-							// compared to hanging forever waiting for a response from a dead path.
+							// Only retry RPCs that were sent on the dead path (or whose path is unknown).
+							// RPCs on surviving paths stay in _pendingRpcs so their responses are processed
+							// normally — clearing them would cause orphaned responses to leak through
+							// CheckRaiseOwnUpdates and trigger double delivery.
+							HashSet<int> alivePathIndices;
+							lock (_pathsLock) alivePathIndices = _paths.Where(p => p.IsAlive).Select(p => p.PathIndex).ToHashSet();
 							var retryError = new ReactorError { Exception = ex };
 							lock (_pendingRpcs)
 							{
 								if (_pendingRpcs.Count > 0)
 								{
-									Helpers.Log(2, $"{_dcSession.DcID}>Retrying {_pendingRpcs.Count} pending RPC(s) after path {path.PathIndex} died.");
-									foreach (var rpc in _pendingRpcs.Values)
-										rpc.tcs.TrySetResult(retryError);
-									_pendingRpcs.Clear();
+									var toRetry = new List<long>();
+									foreach (var kvp in _pendingRpcs)
+									{
+										// Keep RPCs that we know are on an alive path
+										if (kvp.Value.sentPathIndex >= 0 && alivePathIndices.Contains(kvp.Value.sentPathIndex))
+											continue;
+										toRetry.Add(kvp.Key);
+									}
+									if (toRetry.Count > 0)
+									{
+										Helpers.Log(2, $"{_dcSession.DcID}>Retrying {toRetry.Count} RPC(s) from dead path {path.PathIndex} ({_pendingRpcs.Count - toRetry.Count} kept on alive paths).");
+										foreach (var msgId in toRetry)
+											if (_pendingRpcs.Remove(msgId, out var rpc))
+												rpc.tcs.TrySetResult(retryError);
+									}
 								}
 							}
 
@@ -705,21 +721,27 @@ namespace WTelegram
 				}
 				if (obj != null)
 				{
-					// Update per-path latency EWMA when a Pong arrives matching our pending probe.
-					// The Reactor has path context here, making it the cleanest interception point.
-					if (path != null && obj is Pong latencyPong)
+					// Update per-path latency EWMA when a Pong arrives matching a pending probe.
+					// Telegram's MTProto routes responses to ANY connection in the session,
+					// so the Pong may arrive on a DIFFERENT path than the one that sent the Ping.
+					// Use the global _pendingPings dictionary to find the SENDING path and update
+					// its latency, regardless of which path's Reactor receives the Pong.
+					if (obj is Pong latencyPong && _pendingPings.TryRemove(latencyPong.ping_id, out var probe))
 					{
-						long pendingId = Volatile.Read(ref path.PendingPingId);
-						if (pendingId != -1 && latencyPong.ping_id == pendingId)
+						long rttMs = Environment.TickCount64 - probe.SentTicks;
+						if (rttMs >= 0 && rttMs < 30_000) // sanity-check: discard stale/wrapped measurements
 						{
-							Volatile.Write(ref path.PendingPingId, -1L); // clear first to avoid double-counting
-							long rttMs = Environment.TickCount64 - path.PendingSentTicks;
-							if (rttMs >= 0 && rttMs < 30_000) // sanity-check: discard stale/wrapped measurements
+							TransportPath senderPath;
+							lock (_pathsLock) senderPath = _paths.FirstOrDefault(p => p.PathIndex == probe.PathIndex);
+							if (senderPath != null)
 							{
-								long prev = Volatile.Read(ref path.LatencyEwmaMs);
+								long prev = Volatile.Read(ref senderPath.LatencyEwmaMs);
 								long next = prev == long.MaxValue ? rttMs : (long)(0.8 * prev + 0.2 * rttMs);
-								Volatile.Write(ref path.LatencyEwmaMs, next);
-								Helpers.Log(1, $"{_dcSession.DcID}>Path {path.PathIndex} RTT {rttMs}ms (EWMA {next}ms)");
+								Volatile.Write(ref senderPath.LatencyEwmaMs, next);
+								// Update sender's LastRecvTicks so the health monitor knows it's reachable
+								// (even though the Pong arrived on a different path's TCP connection).
+								Volatile.Write(ref senderPath.LastRecvTicks, Environment.TickCount64);
+								Helpers.Log(1, $"{_dcSession.DcID}>Path {probe.PathIndex} RTT {rttMs}ms (EWMA {next}ms){(path?.PathIndex != probe.PathIndex ? $" [via P{path?.PathIndex}]" : "")}");
 							}
 						}
 					}
@@ -892,7 +914,10 @@ namespace WTelegram
 						path.LastRecvTicks = Environment.TickCount64;
 						path.LastProbeTicks = 0;
 						path.LatencyEwmaMs = long.MaxValue; // stale RTT data — reset on reconnect
-						Volatile.Write(ref path.PendingPingId, -1);
+						// Clear any stale pending pings for this path from the global dictionary
+						foreach (var kvp in _pendingPings)
+							if (kvp.Value.PathIndex == path.PathIndex)
+								_pendingPings.TryRemove(kvp.Key, out _);
 						// Start reactor BEFORE ping (it needs to receive the Pong),
 						// but do NOT set IsAlive until after registration ping succeeds.
 						path.ReactorTask = Reactor(path, path.NetworkStream, path.Cts.Token);
@@ -1007,13 +1032,12 @@ namespace WTelegram
 					}
 					else if ((now - path.LastProbeTicks) >= probeIntervalMs)
 					{
-						// Time for a per-path PingDelayDisconnect (liveness probe + server-side keepalive)
+						// Time for a per-path PingDelayDisconnect (liveness probe + server-side keepalive).
+						// Track the probe in the global _pendingPings dict so the Reactor can attribute
+						// the Pong to the correct SENDING path even if Telegram routes it elsewhere.
 						long thisPingId = ping_id++;
 						path.LastProbeTicks = now;
-						// Record probe timestamp BEFORE setting PendingPingId (memory ordering:
-						// the Volatile.Write below is the release barrier that makes PendingSentTicks visible)
-						path.PendingSentTicks = now;
-						Volatile.Write(ref path.PendingPingId, thisPingId);
+						_pendingPings[thisPingId] = (path.PathIndex, now);
 						try
 						{
 							await _sendSemaphore.WaitAsync(ct);
@@ -1026,7 +1050,7 @@ namespace WTelegram
 								_sendSemaphore.Release();
 							}
 						}
-						catch { /* path might already be dead, next cycle will catch it */ }
+						catch { _pendingPings.TryRemove(thisPingId, out _); /* path might already be dead, next cycle will catch it */ }
 					}
 				}
 			}
@@ -1438,9 +1462,7 @@ namespace WTelegram
 			public int PathIndex;
 			public long LastRecvTicks;
 			public long LastProbeTicks;
-			// Latency tracking for LowestLatency mode
-			public long PendingPingId = -1;    // ping_id of most recent probe sent on this path (-1 = none pending)
-			public long PendingSentTicks;       // TickCount64 when PendingPingId probe was sent
+			// Latency tracking for LowestLatency mode (RTT measured via Client._pendingPings)
 			public long LatencyEwmaMs = long.MaxValue; // EWMA RTT in ms; MaxValue = no samples yet
 			// I/O counters (updated via Interlocked.Add for thread safety)
 			public long BytesSent;
@@ -2511,10 +2533,14 @@ namespace WTelegram
 					catch (IOException) when (_paths.Count > 1)
 					{
 						// Path write failed — mark dead and start reconnect.
-						// The Reactor error handler will retry pending RPCs on surviving paths.
 						// We can't re-encrypt for a different path (each has its own AES-CTR state),
 						// so propagate the exception and let Invoke's retry logic handle it.
 						path.IsAlive = false;
+						// Clean up the RPC that was registered but never sent successfully.
+						// Without this, it stays orphaned in _pendingRpcs until the Reactor error
+						// handler fires, causing races with Invoke's own IOException retry.
+						if (rpc != null)
+							lock (_pendingRpcs) _pendingRpcs.Remove(rpc.msgId);
 						// Task.Run so ReconnectPathAsync (and its RaisePathChanged) starts on a
 						// ThreadPool thread — calling it inline would fire the event while
 						// _sendSemaphore is still held, risking deadlock if a subscriber sends.
@@ -2525,7 +2551,9 @@ namespace WTelegram
 				else if (_paths.Count > 0)
 				{
 					// Multipath mode but all paths are dead — don't fall through to HTTP.
-					// Throw so the caller can retry once paths reconnect.
+					// Clean up the RPC since we can't send it.
+					if (rpc != null)
+						lock (_pendingRpcs) _pendingRpcs.Remove(rpc.msgId);
 					throw new IOException("All transport paths are currently dead");
 				}
 				else if (_networkStream != null)
