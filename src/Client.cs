@@ -36,6 +36,37 @@ namespace WTelegram
 		LowestLatency,
 	}
 
+	/// <summary>Snapshot of per-path transport statistics.</summary>
+	public sealed class PathStats
+	{
+		/// <summary>Index of this path (matches LocalEndPoints order).</summary>
+		public int PathIndex { get; init; }
+		/// <summary>Local endpoint this path is bound to (null for legacy single-path).</summary>
+		public IPEndPoint LocalEndPoint { get; init; }
+		/// <summary>True if this path currently has an active connection.</summary>
+		public bool IsAlive { get; init; }
+		/// <summary>True if a reconnect is currently in progress for this path.</summary>
+		public bool IsReconnecting { get; init; }
+		/// <summary>Exponentially-weighted moving average round-trip time in milliseconds. -1 if no samples yet.</summary>
+		public long LatencyEwmaMs { get; init; }
+		/// <summary>Total bytes sent on this path since last (re)connect.</summary>
+		public long BytesSent { get; init; }
+		/// <summary>Total bytes received on this path since last (re)connect.</summary>
+		public long BytesRecv { get; init; }
+		/// <summary>Number of times this path has reconnected.</summary>
+		public int ReconnectCount { get; init; }
+		/// <summary>When this path's current connection was established (UTC). MinValue if never connected.</summary>
+		public DateTime ConnectedSince { get; init; }
+		/// <summary>How long this path has been connected. Zero if not alive or never connected.</summary>
+		public TimeSpan Uptime => IsAlive && ConnectedSince != DateTime.MinValue ? DateTime.UtcNow - ConnectedSince : TimeSpan.Zero;
+		/// <summary>Average send throughput in bytes per second since last (re)connect. 0 if uptime is zero.</summary>
+		public double SendBytesPerSec { get { var s = Uptime.TotalSeconds; return s > 0 ? BytesSent / s : 0; } }
+		/// <summary>Average receive throughput in bytes per second since last (re)connect. 0 if uptime is zero.</summary>
+		public double RecvBytesPerSec { get { var s = Uptime.TotalSeconds; return s > 0 ? BytesRecv / s : 0; } }
+		/// <summary>Average total throughput (send + receive) in bytes per second since last (re)connect.</summary>
+		public double TotalBytesPerSec { get { var s = Uptime.TotalSeconds; return s > 0 ? (BytesSent + BytesRecv) / s : 0; } }
+	}
+
 	public partial class Client : IDisposable
 #if NETCOREAPP2_1_OR_GREATER
 		, IAsyncDisposable
@@ -72,6 +103,35 @@ namespace WTelegram
 		public bool Disconnected => _paths.Count > 0
 			? !_paths.Any(p => p.IsAlive)
 			: (_tcpClient != null && !(_tcpClient.Client?.Connected ?? false));
+		/// <summary>Returns a snapshot of per-path transport statistics. Empty array if not using multipath.</summary>
+		public PathStats[] GetPathStatistics()
+		{
+			TransportPath[] snapshot;
+			lock (_pathsLock) snapshot = _paths.ToArray();
+			if (snapshot.Length == 0) return Array.Empty<PathStats>();
+			var result = new PathStats[snapshot.Length];
+			for (int i = 0; i < snapshot.Length; i++)
+			{
+				var p = snapshot[i];
+				var connTicks = Volatile.Read(ref p.ConnectedSinceTicks);
+				result[i] = new PathStats
+				{
+					PathIndex = p.PathIndex,
+					LocalEndPoint = p.LocalEndPoint,
+					IsAlive = p.IsAlive,
+					IsReconnecting = Volatile.Read(ref p._reconnecting) != 0,
+					LatencyEwmaMs = p.LatencyEwmaMs == long.MaxValue ? -1 : Volatile.Read(ref p.LatencyEwmaMs),
+					BytesSent = Interlocked.Read(ref p.BytesSent),
+					BytesRecv = Interlocked.Read(ref p.BytesRecv),
+					ReconnectCount = Volatile.Read(ref p.ReconnectCount),
+					ConnectedSince = connTicks > 0
+						? DateTime.UtcNow - TimeSpan.FromMilliseconds(Environment.TickCount64 - connTicks)
+						: DateTime.MinValue,
+				};
+			}
+			return result;
+		}
+
 		/// <summary>ID of the current logged-in user or 0</summary>
 		public long UserId => _session.UserId;
 		/// <summary>Info about the current logged-in user. This is only filled after a successful (re)login, not updated later</summary>
@@ -455,7 +515,11 @@ namespace WTelegram
 					recvCtr.EncryptDecrypt(data.AsSpan(0, payloadLen));
 #endif
 					obj = ReadFrame(data, payloadLen, sha256Recv, paddedMode, path?.PathIndex ?? -1);
-					if (path != null) path.LastRecvTicks = Environment.TickCount64;
+					if (path != null)
+					{
+						path.LastRecvTicks = Environment.TickCount64;
+						Interlocked.Add(ref path.BytesRecv, 4 + payloadLen);
+					}
 				}
 				catch (Exception ex) // an exception in RecvAsync is always fatal
 				{
@@ -759,6 +823,10 @@ namespace WTelegram
 
 						// Now mark alive — server has acknowledged this path
 						path.IsAlive = true;
+						path.ConnectedSinceTicks = Environment.TickCount64;
+						Interlocked.Exchange(ref path.BytesSent, 0);
+						Interlocked.Exchange(ref path.BytesRecv, 0);
+						Interlocked.Increment(ref path.ReconnectCount);
 						Helpers.Log(2, $"{_dcSession.DcID}>Path {path.PathIndex} reconnected and registered successfully.");
 						return;
 					}
@@ -975,6 +1043,7 @@ namespace WTelegram
 			path.SendCtr?.EncryptDecrypt(buffer.AsSpan(0, frameLength));
 #endif
 			await path.NetworkStream.WriteAsync(buffer, 0, frameLength);
+			Interlocked.Add(ref path.BytesSent, frameLength);
 		}
 
 		internal DateTime MsgIdToStamp(long serverMsgId)
@@ -1265,6 +1334,11 @@ namespace WTelegram
 			public long PendingPingId = -1;    // ping_id of most recent probe sent on this path (-1 = none pending)
 			public long PendingSentTicks;       // TickCount64 when PendingPingId probe was sent
 			public long LatencyEwmaMs = long.MaxValue; // EWMA RTT in ms; MaxValue = no samples yet
+			// I/O counters (updated via Interlocked.Add for thread safety)
+			public long BytesSent;
+			public long BytesRecv;
+			public int ReconnectCount;
+			public long ConnectedSinceTicks; // Environment.TickCount64 when this path last became alive
 
 			public void Dispose()
 			{
@@ -1656,7 +1730,8 @@ namespace WTelegram
 				await primaryPath.NetworkStream.WriteAsync(preamble, 0, preamble.Length, _cts.Token);
 				primaryPath.ReactorTask = Reactor(primaryPath, primaryPath.NetworkStream, primaryPath.Cts.Token);
 				primaryPath.IsAlive = true;
-				primaryPath.LastRecvTicks = Environment.TickCount64;
+				primaryPath.ConnectedSinceTicks = Environment.TickCount64;
+				primaryPath.LastRecvTicks = primaryPath.ConnectedSinceTicks;
 				lock (_pathsLock) _paths.Add(primaryPath);
 				Helpers.Log(2, $"{dcId}>Path 0 connected{(localEPs != null ? $" from {localEPs[primaryEPIndex].Address}" : "")}.");
 			}
@@ -1740,7 +1815,8 @@ namespace WTelegram
 						await path.NetworkStream.WriteAsync(preamble, 0, preamble.Length, _cts.Token);
 						path.ReactorTask = Reactor(path, path.NetworkStream, path.Cts.Token);
 						path.IsAlive = true;
-						path.LastRecvTicks = Environment.TickCount64;
+						path.ConnectedSinceTicks = Environment.TickCount64;
+						path.LastRecvTicks = path.ConnectedSinceTicks;
 						lock (_pathsLock) _paths.Add(path);
 						Helpers.Log(2, $"{dcId}>Path {pathIdx} connected from {localEP.Address}.");
 
@@ -2309,6 +2385,7 @@ namespace WTelegram
 					try
 					{
 						await path.NetworkStream.WriteAsync(buffer, 0, frameLength);
+						Interlocked.Add(ref path.BytesSent, frameLength);
 					}
 					catch (IOException) when (_paths.Count > 1)
 					{
