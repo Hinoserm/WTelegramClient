@@ -2589,9 +2589,22 @@ namespace WTelegram
 			if (_dcSession.withoutUpdates && query is not IMethod<Pong> and not IMethod<FutureSalts>)
 				query = new TL.Methods.InvokeWithoutUpdates<T> { query = query };
 			bool got503 = false;
+			int ioRetries = 0;
 		retry:
 			var rpc = new Rpc { type = typeof(T) };
-			await SendAsync(query, true, rpc);
+			try
+			{
+				await SendAsync(query, true, rpc);
+			}
+			catch (IOException) when (_paths.Count > 0 && !Disconnected && ++ioRetries <= 5)
+			{
+				// Multipath: transport write failed on a dead path but other paths
+				// may be alive (or reconnecting). Wait briefly for path recovery,
+				// then retry the RPC from scratch on whatever path is available.
+				Helpers.Log(3, $"{_dcSession.DcID}>Invoke: transport IOException, retrying ({ioRetries}/5)...");
+				await Task.Delay(500 * ioRetries);
+				goto retry;
+			}
 			while (_httpClient != null && !rpc.Task.IsCompleted)
 				await HttpWait(_httpWait); // need to wait a bit more in some case
 
