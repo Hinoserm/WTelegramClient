@@ -983,16 +983,24 @@ namespace WTelegram
 				}
 
 				// PER-PATH CHECKS: individual path failures while others are alive
+				// NOTE: Telegram's MTProto can route responses (including Pong) to ANY
+				// connection in the session, not necessarily the one that sent the request.
+				// So a "silent" path isn't necessarily dead — the server may just be routing
+				// all responses through another path. Only kill a path if the DC as a whole
+				// has no recent receive activity, OR if this path has been silent significantly
+				// longer than the dead timeout while other paths are still active.
+				bool anyPathReceiving = alivePaths.Any(p => (now - p.LastRecvTicks) <= deadAfterMs);
+
 				foreach (var path in snapshot)
 				{
 					if (!path.IsAlive || path.LastRecvTicks == 0) continue;
 					var silentMs = now - path.LastRecvTicks;
 
-					if (silentMs > deadAfterMs && path.LastProbeTicks > path.LastRecvTicks)
+					if (silentMs > deadAfterMs && path.LastProbeTicks > path.LastRecvTicks && !anyPathReceiving)
 					{
-						// This individual path is dead but others are still alive.
-						// Close the stream; the Reactor will start a per-path reconnect.
-						Helpers.Log(3, $"{_dcSession.DcID}>Path {path.PathIndex} unresponsive ({silentMs / 1000}s silent, probe unanswered). Force-closing.");
+						// This individual path is unresponsive AND no other paths are receiving
+						// data either — the DC may be genuinely unreachable from this address.
+						Helpers.Log(3, $"{_dcSession.DcID}>Path {path.PathIndex} unresponsive ({silentMs / 1000}s silent, probe unanswered, no other paths receiving). Force-closing.");
 						path.IsAlive = false;
 						RaisePathChanged(path);
 						path.NetworkStream?.Close();
