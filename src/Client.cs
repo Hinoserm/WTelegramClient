@@ -150,16 +150,20 @@ namespace WTelegram
 		/// Call on the main client to see every connected DC including media transfer sessions.</summary>
 		public PathStats[] GetAllPathStatistics()
 		{
-			var all = new List<PathStats>();
+			// Snapshot the session list under lock, then iterate outside to avoid
+			// nested lock ordering (_session → _pathsLock) which could deadlock
+			// if future code ever acquires them in the opposite order.
+			Session.DCSession[] sessions;
 			lock (_session)
+				sessions = _session.DCSessions.Values.ToArray();
+
+			var all = new List<PathStats>();
+			foreach (var dcSession in sessions)
 			{
-				foreach (var dcSession in _session.DCSessions.Values)
-				{
-					var client = dcSession.Client;
-					if (client == null || client.Disconnected)
-						continue;
-					all.AddRange(client.GetPathStatistics());
-				}
+				var client = dcSession.Client;
+				if (client == null || client.Disconnected)
+					continue;
+				all.AddRange(client.GetPathStatistics());
 			}
 			return all.ToArray();
 		}
@@ -184,10 +188,19 @@ namespace WTelegram
 					? DateTime.UtcNow - TimeSpan.FromMilliseconds(Environment.TickCount64 - connTicks)
 					: DateTime.MinValue,
 			};
-			try { OnPathChanged?.Invoke(stats); }
-			catch { }
-			try { _parentClient?.OnPathChanged?.Invoke(stats); }
-			catch { }
+			// Alt DC clients propagate to the parent (main) client only.
+			// Main clients fire locally. This avoids double-delivery if someone
+			// subscribes to both a child and parent client's OnPathChanged.
+			if (_parentClient != null)
+			{
+				try { _parentClient.OnPathChanged?.Invoke(stats); }
+				catch { }
+			}
+			else
+			{
+				try { OnPathChanged?.Invoke(stats); }
+				catch { }
+			}
 		}
 
 		/// <summary>ID of the current logged-in user or 0</summary>
@@ -816,13 +829,18 @@ namespace WTelegram
 		private async Task ReconnectPathAsync(TransportPath path)
 		{
 			// Prevent multiple concurrent reconnect loops for the same path (atomic guard)
-			if (Interlocked.CompareExchange(ref path._reconnecting, 1, 0) != 0) return;
-			RaisePathChanged(path); // notify: IsReconnecting is now true
+			if (Interlocked.CompareExchange(ref path._reconnecting, 1, 0) != 0)
+				return;
+			// Notify subscribers that reconnect is now in progress (IsAlive=false, IsReconnecting=true).
+			// The IsAlive=false transition was already reported by whichever code path set it
+			// (Reactor error, health monitor, or send failure).
+			RaisePathChanged(path);
 
 			try
 			{
 				var endpoint = _dcSession?.EndPoint;
-				if (endpoint == null) return;
+				if (endpoint == null)
+					return;
 				int dcId = _dcSession?.DcID ?? 0;
 
 				// Clean up old connection (dispose crypto handles to avoid leaks)
@@ -837,10 +855,15 @@ namespace WTelegram
 
 				for (int attempt = 1; ; attempt++)
 				{
-					if (_cts?.IsCancellationRequested == true) return;
+					if (_cts?.IsCancellationRequested == true)
+						return;
 					// Abort if a full reconnect has removed this path from _paths
 					// (ResetAsync clears _paths before ConnectAsync creates new ones)
-					lock (_pathsLock) { if (!_paths.Contains(path)) return; }
+					lock (_pathsLock)
+					{
+						if (!_paths.Contains(path))
+							return;
+					}
 					try
 					{
 						Helpers.Log(2, $"{_dcSession.DcID}>Reconnecting path {path.PathIndex} (attempt {attempt})...");
@@ -878,8 +901,14 @@ namespace WTelegram
 						try
 						{
 							await _sendSemaphore.WaitAsync();
-							try { await SendOnPathAsync(path, new TL.Methods.Ping { ping_id = _random.Next() }); }
-							finally { _sendSemaphore.Release(); }
+							try
+							{
+								await SendOnPathAsync(path, new TL.Methods.Ping { ping_id = _random.Next() });
+							}
+							finally
+							{
+								_sendSemaphore.Release();
+							}
 						}
 						catch { } // best effort
 
@@ -896,8 +925,9 @@ namespace WTelegram
 					catch (Exception ex)
 					{
 						Helpers.Log(3, $"{_dcSession.DcID}>Path {path.PathIndex} reconnect attempt {attempt} failed: {ex.Message}");
-						if (_cts?.IsCancellationRequested == true) return;
-						await Task.Delay(Math.Max(1000, Math.Min(attempt * 2000, PathReconnectMaxBackoff * 1000))); // backoff up to 30s (min 1s)
+						if (_cts?.IsCancellationRequested == true)
+						return;
+					await Task.Delay(Math.Max(1000, Math.Min(attempt * 2000, PathReconnectMaxBackoff * 1000))); // backoff up to 30s (min 1s)
 					}
 				}
 			}
@@ -979,8 +1009,14 @@ namespace WTelegram
 						try
 						{
 							await _sendSemaphore.WaitAsync(ct);
-							try { await SendOnPathAsync(path, new TL.Methods.PingDelayDisconnect { ping_id = thisPingId, disconnect_delay = disconnectDelay }); }
-							finally { _sendSemaphore.Release(); }
+							try
+							{
+								await SendOnPathAsync(path, new TL.Methods.PingDelayDisconnect { ping_id = thisPingId, disconnect_delay = disconnectDelay });
+							}
+							finally
+							{
+								_sendSemaphore.Release();
+							}
 						}
 						catch { /* path might already be dead, next cycle will catch it */ }
 					}
@@ -1892,10 +1928,19 @@ namespace WTelegram
 						try
 						{
 							await _sendSemaphore.WaitAsync();
-							try { await SendOnPathAsync(path, new TL.Methods.Ping { ping_id = _random.Next() }); }
-							finally { _sendSemaphore.Release(); }
+							try
+							{
+								await SendOnPathAsync(path, new TL.Methods.Ping { ping_id = _random.Next() });
+							}
+							finally
+							{
+								_sendSemaphore.Release();
+							}
 						}
-						catch (Exception ex) { Helpers.Log(3, $"{dcId}>Path {pathIdx} registration ping failed: {ex.Message}"); }
+						catch (Exception ex)
+						{
+							Helpers.Log(3, $"{dcId}>Path {pathIdx} registration ping failed: {ex.Message}");
+						}
 					}
 					catch (Exception ex)
 					{
@@ -2462,8 +2507,10 @@ namespace WTelegram
 						// We can't re-encrypt for a different path (each has its own AES-CTR state),
 						// so propagate the exception and let Invoke's retry logic handle it.
 						path.IsAlive = false;
-						RaisePathChanged(path);
-						_ = ReconnectPathAsync(path);
+						// Task.Run so ReconnectPathAsync (and its RaisePathChanged) starts on a
+						// ThreadPool thread — calling it inline would fire the event while
+						// _sendSemaphore is still held, risking deadlock if a subscriber sends.
+						_ = Task.Run(() => ReconnectPathAsync(path));
 						throw;
 					}
 				}
