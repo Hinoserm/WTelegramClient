@@ -198,12 +198,18 @@ namespace WTelegram
 			// subscribes to both a child and parent client's OnPathChanged.
 			if (_parentClient != null)
 			{
-				try { _parentClient.OnPathChanged?.Invoke(stats); }
+				try
+				{
+					_parentClient.OnPathChanged?.Invoke(stats);
+				}
 				catch { }
 			}
 			else
 			{
-				try { OnPathChanged?.Invoke(stats); }
+				try
+				{
+					OnPathChanged?.Invoke(stats);
+				}
 				catch { }
 			}
 		}
@@ -220,8 +226,10 @@ namespace WTelegram
 			set
 			{
 				int delta = value - _parallelTransfers.CurrentCount;
-				for (; delta < 0; delta++) _parallelTransfers.Wait();
-				if (delta > 0) _parallelTransfers.Release(delta);
+				for (; delta < 0; delta++)
+					_parallelTransfers.Wait();
+				if (delta > 0)
+					_parallelTransfers.Release(delta);
 			}
 		}
 
@@ -277,7 +285,7 @@ namespace WTelegram
 		public int PathReconnectMaxBackoff { get; set; } = 30;
 		/// <summary>Seconds before an RPC on a specific path is considered stalled. The path is force-closed to trigger failover.
 		/// Set to 0 to disable stall detection. Only applies when multiple paths exist.</summary>
-		public int PathRpcStallTimeout { get; set; } = 10;
+		public int PathRpcStallTimeout { get; set; } = 3;
 		/// <summary>Controls how send traffic is distributed across alive paths. Default: LowestLatency (use path with lowest measured RTT).</summary>
 		public PathSendMode SendMode { get; set; } = PathSendMode.LowestLatency;
 
@@ -304,8 +312,10 @@ namespace WTelegram
 			var session_key = _config("session_key") ?? (_apiHash = Config("api_hash"));
 			sessionStore ??= new SessionStore(Config("session_pathname"));
 			_session = Session.LoadOrCreate(sessionStore, Convert.FromHexString(session_key));
-			if (_session.ApiId == 0) _session.ApiId = int.Parse(Config("api_id"));
-			if (_session.MainDC != 0) _session.DCSessions.TryGetValue(_session.MainDC, out _dcSession);
+			if (_session.ApiId == 0)
+				_session.ApiId = int.Parse(Config("api_id"));
+			if (_session.MainDC != 0)
+				_session.DCSessions.TryGetValue(_session.MainDC, out _dcSession);
 			_dcSession ??= new();
 			_dcSession.Client = this;
 			if (localAddresses != null)
@@ -403,7 +413,8 @@ namespace WTelegram
 				_paths.Clear();
 			}
 			_networkStream = null;
-			if (IsMainDC) _session.Dispose();
+			if (IsMainDC)
+				_session.Dispose();
 			GC.SuppressFinalize(this);
 		}
 
@@ -414,7 +425,8 @@ namespace WTelegram
 		/// <param name="defaultHttpWait">Default HttpWait parameters for requests.<para>⚠️ Telegram servers don't support this correctly at the moment.</para>So leave <see langword="null"/> for the default 25 seconds long poll</param>
 		public void HttpMode(HttpClient httpClient = null, HttpWait defaultHttpWait = null)
 		{
-			if (_tcpClient != null) throw new InvalidOperationException("Cannot switch to HTTP after TCP connection");
+			if (_tcpClient != null)
+				throw new InvalidOperationException("Cannot switch to HTTP after TCP connection");
 			_httpClient = httpClient ?? new();
 			_httpWait = defaultHttpWait;
 			ParallelTransfers = 1;
@@ -449,16 +461,22 @@ namespace WTelegram
 			}
 			// Wait for all path reactors to finish
 			TransportPath[] pathsCopy;
-			lock (_pathsLock) pathsCopy = [.. _paths];
+			lock (_pathsLock)
+				pathsCopy = [.. _paths];
 			foreach (var path in pathsCopy)
 			{
-				try { if (path.ReactorTask != null) await path.ReactorTask.WaitAsync(1000).ConfigureAwait(false); }
+				try
+				{
+					if (path.ReactorTask != null)
+						await path.ReactorTask.WaitAsync(1000).ConfigureAwait(false);
+				}
 				catch { }
 			}
 			// Also wait for legacy reactor if present
 			try
 			{
-				if (_reactorTask != null) await _reactorTask.WaitAsync(1000).ConfigureAwait(false);
+				if (_reactorTask != null)
+					await _reactorTask.WaitAsync(1000).ConfigureAwait(false);
 			}
 			catch { }
 			_reactorTask = resetSessions ? null : Task.CompletedTask;
@@ -518,8 +536,10 @@ namespace WTelegram
 			var dcOptions = GetDcOptions(Math.Abs(dcId), flags);
 			var dcOption = dcOptions.FirstOrDefault();
 			dcSession ??= new(); // create new session only if not already existing
-			if (dcOption != null) dcSession.DataCenter = dcOption; 
-			else if (dcSession.DataCenter == null) throw new WTException($"Could not find adequate dc_option for DC {dcId}");
+			if (dcOption != null)
+				dcSession.DataCenter = dcOption;
+			else if (dcSession.DataCenter == null)
+				throw new WTException($"Could not find adequate dc_option for DC {dcId}");
 			return _session.DCSessions[dcId] = dcSession;
 		}
 
@@ -530,12 +550,14 @@ namespace WTelegram
 		/// <remarks>⚠️ You shouldn't have to use this method unless you know what you're doing</remarks>
 		public async Task<Client> GetClientForDC(int dcId, bool connect = true)
 		{
-			if (_dcSession.DataCenter?.id == dcId) return this;
+			if (_dcSession.DataCenter?.id == dcId)
+				return this;
 			Session.DCSession altSession;
 			lock (_session)
 			{
 				var flags = _dcSession.DataCenter.flags;
-				if (dcId < 0) flags = (flags & DcOption.Flags.ipv6) | DcOption.Flags.media_only;
+				if (dcId < 0)
+					flags = (flags & DcOption.Flags.ipv6) | DcOption.Flags.media_only;
 				altSession = GetOrCreateDCSession(dcId, flags);
 				_session.Save();
 				if (altSession.Client?.Disconnected ?? false) { altSession.Client.Dispose(); altSession.Client = null; }
@@ -610,8 +632,10 @@ namespace WTelegram
 				}
 				catch (Exception ex) // an exception in RecvAsync is always fatal
 				{
-					if (ct.IsCancellationRequested) return;
-					if (path?.Cts?.IsCancellationRequested == true) return;
+					if (ct.IsCancellationRequested)
+						return;
+					if (path?.Cts?.IsCancellationRequested == true)
+						return;
 
 					// Multi-path error handling
 					if (path != null && _paths.Count > 1)
@@ -850,7 +874,8 @@ namespace WTelegram
 					long bestScore = long.MaxValue;
 					for (int i = 0; i < count; i++)
 					{
-						if (!_paths[i].IsAlive) continue;
+						if (!_paths[i].IsAlive)
+						continue;
 						long lat = Volatile.Read(ref _paths[i].LatencyEwmaMs);
 						long penalty = Volatile.Read(ref _paths[i].PenaltyMs);
 						if (lat == long.MaxValue && parentLatencyByAddr != null
@@ -915,7 +940,8 @@ namespace WTelegram
 			while (!ct.IsCancellationRequested)
 			{
 				await Task.Delay(1000, ct);
-				if (_paths.Count <= 1) continue;
+				if (_paths.Count <= 1)
+					continue;
 
 				var now = Environment.TickCount64;
 				var stalledPathIndices = new HashSet<int>();
@@ -939,9 +965,11 @@ namespace WTelegram
 					{
 						foreach (var stalledIdx in stalledPathIndices)
 						{
-							if (stalledIdx >= _paths.Count) continue;
+							if (stalledIdx >= _paths.Count)
+								continue;
 							var stalledPath = _paths[stalledIdx];
-							if (!stalledPath.IsAlive) continue;
+							if (!stalledPath.IsAlive)
+								continue;
 							if (_paths.Any(p => p.IsAlive && p.PathIndex != stalledIdx))
 							{
 								Helpers.Log(3, $"{_dcSession?.DcID}>Child: Path {stalledIdx} stalled (>{PathRpcStallTimeout}s). Force-closing for failover.");
@@ -1014,8 +1042,19 @@ namespace WTelegram
 						var tcpClient = await TcpHandler(endpoint.Address.ToString(), endpoint.Port, path.LocalEndPoint);
 
 						// TcpHandler doesn't check CTS — re-check after it returns
-						if (_cts?.IsCancellationRequested == true) { tcpClient.Dispose(); return; }
-						lock (_pathsLock) { if (!_paths.Contains(path)) { tcpClient.Dispose(); return; } }
+						if (_cts?.IsCancellationRequested == true)
+						{
+							tcpClient.Dispose();
+							return;
+						}
+						lock (_pathsLock)
+						{
+							if (!_paths.Contains(path))
+							{
+								tcpClient.Dispose();
+								return;
+							}
+						}
 
 						ConfigureKeepalive(tcpClient);
 						var networkStream = (Stream)tcpClient.GetStream();
@@ -1076,8 +1115,8 @@ namespace WTelegram
 					{
 						Helpers.Log(3, $"{_dcSession.DcID}>Path {path.PathIndex} reconnect attempt {attempt} failed: {ex.Message}");
 						if (_cts?.IsCancellationRequested == true)
-						return;
-					await Task.Delay(Math.Max(1000, Math.Min(attempt * 2000, PathReconnectMaxBackoff * 1000))); // backoff up to 30s (min 1s)
+							return;
+						await Task.Delay(Math.Max(1000, Math.Min(attempt * 2000, PathReconnectMaxBackoff * 1000))); // backoff up to 30s (min 1s)
 					}
 				}
 			}
@@ -1097,11 +1136,13 @@ namespace WTelegram
 			while (!ct.IsCancellationRequested)
 			{
 				await Task.Delay(1000, ct); // internal polling rate
-				if (_paths.Count <= 1) continue;
+				if (_paths.Count <= 1)
+					continue;
 
 				var now = Environment.TickCount64;
 				TransportPath[] snapshot;
-				lock (_pathsLock) snapshot = _paths.ToArray();
+				lock (_pathsLock)
+					snapshot = _paths.ToArray();
 
 				// Collect alive paths that have been probed
 				var alivePaths = snapshot.Where(p => p.IsAlive && p.LastRecvTicks > 0).ToArray();
@@ -1148,7 +1189,8 @@ namespace WTelegram
 
 				foreach (var path in snapshot)
 				{
-					if (!path.IsAlive || path.LastRecvTicks == 0) continue;
+					if (!path.IsAlive || path.LastRecvTicks == 0)
+						continue;
 					var silentMs = now - path.LastRecvTicks;
 
 					if (silentMs > deadAfterMs && path.LastProbeTicks > path.LastRecvTicks && !anyPathReceiving)
@@ -1180,8 +1222,57 @@ namespace WTelegram
 								_sendSemaphore.Release();
 							}
 						}
-						catch { _pendingPings.TryRemove(thisPingId, out _); /* path might already be dead, next cycle will catch it */ }
+						catch
+					{
+						_pendingPings.TryRemove(thisPingId, out _); /* path might already be dead, next cycle will catch it */
 					}
+					}
+				}
+
+				// INDIVIDUAL PATH DEATH from missed probes: Count unanswered pings per path.
+				// If a path has 3+ unanswered probes while other paths ARE receiving, the path
+				// is genuinely dead (not just "server routing responses elsewhere" — the Pong
+				// handler already updates the SENDER path's LastRecvTicks regardless of which
+				// physical connection receives the Pong, so stale pings = truly lost probes).
+				if (anyPathReceiving)
+				{
+					var missedByPath = new Dictionary<int, int>();
+					var staleKeys = new List<long>();
+					foreach (var kvp in _pendingPings)
+					{
+						var (pathIdx, sentAt) = kvp.Value;
+						if ((now - sentAt) > 60_000) // 60s >> default probe interval (3s); safe unless PathDisconnectDelay > 60s
+							staleKeys.Add(kvp.Key);
+						else
+							missedByPath[pathIdx] = missedByPath.GetValueOrDefault(pathIdx) + 1;
+					}
+					foreach (var key in staleKeys)
+						_pendingPings.TryRemove(key, out _);
+
+					var toNotifyMissed = new List<TransportPath>();
+					lock (_pathsLock)
+					{
+						foreach (var (pathIdx, missed) in missedByPath)
+						{
+							if (missed < 3)
+								continue;
+							if (pathIdx >= _paths.Count)
+								continue;
+							var deadPath = _paths[pathIdx];
+							if (!deadPath.IsAlive)
+								continue;
+							if (_paths.Any(p => p.IsAlive && p.PathIndex != pathIdx))
+							{
+								Helpers.Log(3, $"{_dcSession.DcID}>Path {pathIdx} has {missed} unanswered probes while other paths are active. Force-closing.");
+								deadPath.IsAlive = false;
+								AddPenalty(deadPath, 500);
+								toNotifyMissed.Add(deadPath);
+								deadPath.NetworkStream?.Close();
+							}
+						}
+					}
+					foreach (var path in toNotifyMissed)
+						RaisePathChanged(path);
 				}
 
 				// RPC STALL DETECTION: Check pending RPCs for any that have been waiting too long
@@ -1211,9 +1302,11 @@ namespace WTelegram
 						{
 							foreach (var stalledIdx in stalledPathIndices)
 							{
-								if (stalledIdx >= _paths.Count) continue;
+								if (stalledIdx >= _paths.Count)
+									continue;
 								var stalledPath = _paths[stalledIdx];
-								if (!stalledPath.IsAlive) continue;
+								if (!stalledPath.IsAlive)
+									continue;
 								// Only kill if other paths are alive (don't kill the last path)
 								if (_paths.Any(p => p.IsAlive && p.PathIndex != stalledIdx))
 								{
@@ -1236,13 +1329,15 @@ namespace WTelegram
 				// A path with 5000ms penalty (10 reconnects) recovers to <50ms in ~46 seconds.
 				foreach (var path in snapshot)
 				{
-					if (!path.IsAlive) continue;
+					if (!path.IsAlive)
+						continue;
 					long penalty = Volatile.Read(ref path.PenaltyMs);
 					if (penalty > 0)
 					{
 						// EWMA-style decay: new = old * 0.9 (drop ~10% per second)
 						long decayed = penalty * 9 / 10;
-						if (decayed < 10) decayed = 0; // snap to zero when negligible
+						if (decayed < 10)
+						decayed = 0; // snap to zero when negligible
 						Volatile.Write(ref path.PenaltyMs, decayed);
 					}
 				}
@@ -1263,12 +1358,14 @@ namespace WTelegram
 			{
 				try
 				{
-					lock (_msgsToAck) _msgsToAck.Clear();
+					lock (_msgsToAck)
+						_msgsToAck.Clear();
 					await ResetAsync(false, false);
 					// ResetAsync resets _fullReconnectStarted = false (under _pathsLock).
 					// Re-claim ownership immediately so no other thread can launch a second
 					// PerformFullReconnectAsync between here and ConnectAsync completing.
-					lock (_pathsLock) { _fullReconnectStarted = true; }
+					lock (_pathsLock)
+						_fullReconnectStarted = true;
 					// ResetAsync creates _sendSemaphore = new(0), blocking all external sends.
 					// DoConnectAsync releases it on success (line 1475).
 					// We do NOT acquire the semaphore here — that would deadlock because it starts at 0.
@@ -1291,13 +1388,15 @@ namespace WTelegram
 						RaiseUpdates(updatesState);
 					}
 					Helpers.Log(2, $"{_dcSession?.DcID}>PerformFullReconnectAsync: completed successfully.");
-					lock (_pathsLock) { _fullReconnectStarted = false; }
+					lock (_pathsLock)
+						_fullReconnectStarted = false;
 					return; // done — DoConnectAsync already released _sendSemaphore
 				}
 				catch (ObjectDisposedException)
 				{
 					// Client was genuinely disposed — propagate
-					lock (_pathsLock) { _fullReconnectStarted = false; }
+					lock (_pathsLock)
+						_fullReconnectStarted = false;
 					throw;
 				}
 				catch (Exception ex)
@@ -1323,7 +1422,8 @@ namespace WTelegram
 		/// <summary>Send a raw message directly on a specific transport path (bypassing primary path selection)</summary>
 		private async Task SendOnPathAsync(TransportPath path, IObject msg)
 		{
-			if (!path.IsAlive || path.NetworkStream == null) return;
+			if (!path.IsAlive || path.NetworkStream == null)
+				return;
 			var (msgId, seqno) = NewMsgId(false);
 			using var memStream = new MemoryStream(1024);
 			using var writer = new BinaryWriter(memStream);
@@ -1394,7 +1494,8 @@ namespace WTelegram
 			{
 				using var reader = new BinaryReader(new MemoryStream(data, 8, dataLen - 8));
 				long msgId = _lastRecvMsgId = reader.ReadInt64();
-				if ((msgId & 1) == 0) throw new WTException($"Invalid server msgId {msgId}");
+				if ((msgId & 1) == 0)
+					throw new WTException($"Invalid server msgId {msgId}");
 				int length = reader.ReadInt32();
 				dataLen -= 20;
 				if (length > dataLen || dataLen - length > (paddedMode ? 256 : 0))
@@ -1402,7 +1503,8 @@ namespace WTelegram
 
 				var obj = reader.ReadTLObject();
 				Helpers.Log(1, $"{_dcSession.DcID}>Receiving {obj.GetType().Name,-40} {MsgIdToStamp(msgId):u} clear{((msgId & 2) == 0 ? "" : " NAR")}{pathTag}");
-				if (_bareRpc == null) throw new WTException("Shouldn't receive unencrypted packet at this point");
+				if (_bareRpc == null)
+					throw new WTException("Shouldn't receive unencrypted packet at this point");
 				return obj;
 			}
 			else
@@ -1422,10 +1524,14 @@ namespace WTelegram
 				var seqno = reader.ReadInt32();         // int32 msg_seqno
 				var length = reader.ReadInt32();        // int32 message_data_length
 
-				if (length < 0 || length % 4 != 0) throw new WTException($"Invalid message_data_length: {length}");
-				if (decrypted_data.Length - 32 - length is < 12 or > 1024) throw new WTException($"Invalid message padding length: {decrypted_data.Length - 32}-{length}");
-				if (sessionId != _dcSession.id) throw new WTException($"Unexpected session ID: {sessionId} != {_dcSession.id}");
-				if ((msgId & 1) == 0) throw new WTException($"msg_id is not odd: {msgId}");
+				if (length < 0 || length % 4 != 0)
+					throw new WTException($"Invalid message_data_length: {length}");
+				if (decrypted_data.Length - 32 - length is < 12 or > 1024)
+					throw new WTException($"Invalid message padding length: {decrypted_data.Length - 32}-{length}");
+				if (sessionId != _dcSession.id)
+					throw new WTException($"Unexpected session ID: {sessionId} != {_dcSession.id}");
+				if ((msgId & 1) == 0)
+					throw new WTException($"msg_id is not odd: {msgId}");
 				bool newMsg;
 				lock (_dcSession) newMsg = _dcSession.CheckNewMsgId(msgId);
 				if (!newMsg)
@@ -1453,7 +1559,9 @@ namespace WTelegram
 						throw new WTException("Server salt changed too often! Security issue?");
 					CheckSalt();
 				}
-				if ((seqno & 1) != 0) lock (_msgsToAck) _msgsToAck.Add(msgId);
+				if ((seqno & 1) != 0)
+					lock (_msgsToAck)
+						_msgsToAck.Add(msgId);
 
 				var ctorNb = reader.ReadUInt32();
 				if (ctorNb != Layer.BadMsgCtor && deltaTicks / TimeSpan.TicksPerSecond is > 30 or < -300)
@@ -1504,13 +1612,16 @@ namespace WTelegram
 				if (_dcSession.Salts.Count != 0)
 				{
 					var keys = _dcSession.Salts.Keys;
-					if (keys[^1] == DateTime.MaxValue) return; // GetFutureSalts ongoing
+					if (keys[^1] == DateTime.MaxValue)
+						return; // GetFutureSalts ongoing
 					var now = DateTime.UtcNow.AddTicks(_dcSession.serverTicksOffset - TimeSpan.TicksPerMinute);
 					bool removed = false;
 					for (; keys.Count > 1 && keys[1] < now; _dcSession.OldSalt = _dcSession.Salt, _dcSession.Salt = _dcSession.Salts.Values[0], removed = true)
 						_dcSession.Salts.RemoveAt(0);
-					if (removed) _session.Save();
-					if (_dcSession.Salts.Count > 48) return;
+					if (removed)
+						_session.Save();
+					if (_dcSession.Salts.Count > 48)
+						return;
 				}
 				_dcSession.Salts[DateTime.MaxValue] = 0;
 			}
@@ -1536,7 +1647,9 @@ namespace WTelegram
 			{
 				var msg = new _Message(reader.ReadInt64(), reader.ReadInt32(), null) { bytes = reader.ReadInt32() };
 				messages.Add(msg);
-				if ((msg.seqno & 1) != 0) lock (_msgsToAck) _msgsToAck.Add(msg.msg_id);
+				if ((msg.seqno & 1) != 0)
+					lock (_msgsToAck)
+						_msgsToAck.Add(msg.msg_id);
 				var pos = reader.BaseStream.Position;
 				try
 				{
@@ -1571,23 +1684,30 @@ namespace WTelegram
 				try
 				{
 					if (!rpc.type.IsArray)
+					{
 						result = reader.ReadTLValue(rpc.type);
+					}
 					else
 					{
 						var peek = reader.ReadUInt32();
 						if (peek == Layer.RpcErrorCtor)
 							result = reader.ReadTLObject(Layer.RpcErrorCtor);
 						else if (peek == Layer.GZipedCtor)
+						{
 							result = reader.ReadTLGzipped(rpc.type);
+						}
 						else
 						{
 							reader.BaseStream.Position -= 4;
 							result = reader.ReadTLVector(rpc.type);
 						}
 					}
-					if (rpc.type.IsEnum) result = Enum.ToObject(rpc.type, result);
+					if (rpc.type.IsEnum)
+						result = Enum.ToObject(rpc.type, result);
 					if (result is RpcError rpcError)
+					{
 						Helpers.Log(4, $"             → RpcError {rpcError.error_code,3} {rpcError.error_message,-24} #{(short)msgId.GetHashCode():X4}");
+					}
 					else
 					{
 						Helpers.Log(1, $"             → {result?.GetType().Name,-37} #{(short)msgId.GetHashCode():X4}");
@@ -1610,8 +1730,14 @@ namespace WTelegram
 					reader.BaseStream.Position -= 4;
 					result = reader.ReadTLVector(typeof(IObject[]));
 				}
-				else if (ctorNb == (uint)Bool.False) result = false;
-				else if (ctorNb == (uint)Bool.True) result = true;
+				else if (ctorNb == (uint)Bool.False)
+				{
+					result = false;
+				}
+				else if (ctorNb == (uint)Bool.True)
+				{
+					result = true;
+				}
 				else
 				{
 					result = reader.ReadTLObject(ctorNb);
@@ -1749,7 +1875,9 @@ namespace WTelegram
 						case 32: // msg_seqno too low (the server has already received a message with a lower msg_id but with either a higher or an equal and odd seqno)
 						case 33: // msg_seqno too high (similarly, there is a message with a higher msg_id but with either a lower or an equal and odd seqno)
 							if (_dcSession.seqno <= 1)
+							{
 								retryRpcs = false;
+							}
 							else
 							{
 								await ResetAsync(false, false);
@@ -1760,7 +1888,8 @@ namespace WTelegram
 						case 48: // incorrect server salt (in this case, the bad_server_salt response is received with the correct salt, and the message is to be re-sent with it)
 							_dcSession.OldSalt = _dcSession.Salt;
 							_dcSession.Salt = ((BadServerSalt)badMsgNotification).new_server_salt;
-							lock (_session) _session.Save();
+							lock (_session)
+								_session.Save();
 							CheckSalt();
 							break;
 						default:
@@ -1798,7 +1927,8 @@ namespace WTelegram
 			try
 			{
 				var task = obj is UpdatesBase updates ? OnUpdates?.Invoke(updates) : OnOther?.Invoke(obj);
-				if (task != null) await task;
+				if (task != null)
+				await task;
 			}
 			catch (Exception ex)
 			{
@@ -1808,7 +1938,8 @@ namespace WTelegram
 
 		private void CheckRaiseOwnUpdates(object result)
 		{
-			if (OnOwnUpdates == null) return;
+			if (OnOwnUpdates == null)
+				return;
 			if (result is UpdatesBase updates)
 				RaiseOwnUpdates(updates);
 			else if (result is Payments_PaymentResult ppr)
@@ -1881,14 +2012,16 @@ namespace WTelegram
 			bool needMigrate = false;
 			byte[] preamble, secret = null;
 			int dcId = _dcSession?.DcID ?? 0;
-			if (dcId == 0) dcId = 2;
+			if (dcId == 0)
+				dcId = 2;
 			bool usingPaths = false;
 			var localEPs = LocalEndPoints?.Count > 0 ? LocalEndPoints : null;
 			int primaryEPIndex = 0;
 			if (MTProxyUrl != null)
 			{
 #if OBFUSCATION
-				if (TLConfig?.test_mode == true) dcId += dcId < 0 ? -10000 : 10000;
+				if (TLConfig?.test_mode == true)
+					dcId += dcId < 0 ? -10000 : 10000;
 				var parms = HttpUtility.ParseQueryString(MTProxyUrl[MTProxyUrl.IndexOf('?')..]);
 				var server = parms["server"];
 				int port = int.Parse(parms["port"]);
@@ -1901,7 +2034,8 @@ namespace WTelegram
 					_paddedMode = true;
 					secret = secret[1..17];
 				}
-				else if (secret.Length != 16) throw new ArgumentException("Invalid/unsupported secret");
+				else if (secret.Length != 16)
+					throw new ArgumentException("Invalid/unsupported secret");
 				Helpers.Log(2, $"Connecting to DC {dcId} via MTProxy {server}:{port}...");
 				_tcpClient = await TcpHandler(server, port);
 				_networkStream = _tcpClient.GetStream();
@@ -1946,7 +2080,8 @@ namespace WTelegram
 									Helpers.Log(3, $"Connect via {localEPs[i].Address} failed: {ex.Message}");
 								}
 							}
-							if (tcpClient == null) throw new SocketException(10060); // all endpoints failed
+							if (tcpClient == null)
+							throw new SocketException(10060); // all endpoints failed
 						}
 						else if (localEPs != null && localEPs.Count > 1)
 						{
@@ -1984,7 +2119,8 @@ namespace WTelegram
 							foreach (var remaining in connectTasks)
 								_ = remaining.task.ContinueWith(t => { if (t.IsCompletedSuccessfully) t.Result?.Dispose(); }, TaskScheduler.Default);
 
-							if (tcpClient == null && lastEx != null) throw lastEx;
+							if (tcpClient == null && lastEx != null)
+							throw lastEx;
 						}
 						else
 						{
@@ -1994,7 +2130,8 @@ namespace WTelegram
 					catch (SocketException ex) // cannot connect to target endpoint, try to find an alternate
 					{
 						Helpers.Log(4, $"SocketException {ex.SocketErrorCode} ({ex.ErrorCode}): {ex.Message}");
-						if (_dcSession?.DataCenter == null) throw;
+						if (_dcSession?.DataCenter == null)
+						throw;
 						var triedEndpoints = new HashSet<IPEndPoint> { endpoint };
 						if (_session.DcOptions != null)
 						{
@@ -2003,7 +2140,8 @@ namespace WTelegram
 							foreach (var dcOption in altOptions)
 							{
 								endpoint = new(IPAddress.Parse(dcOption.ip_address), dcOption.port);
-								if (!triedEndpoints.Add(endpoint)) continue;
+								if (!triedEndpoints.Add(endpoint))
+							continue;
 								Helpers.Log(2, $"Connecting to {endpoint}...");
 								try
 								{
@@ -2017,12 +2155,14 @@ namespace WTelegram
 						if (tcpClient == null)
 						{
 							endpoint = GetDefaultEndpoint(out defaultDc); // re-ask callback for an address
-							if (!triedEndpoints.Add(endpoint)) throw;
+							if (!triedEndpoints.Add(endpoint))
+						throw;
 							needMigrate = _dcSession.DataCenter.id == _session.MainDC && defaultDc != _session.MainDC;
 							_dcSession.Client = null;
 							// is it address for a known DCSession?
 							_dcSession = _session.DCSessions.Values.FirstOrDefault(dcs => dcs.EndPoint.Equals(endpoint));
-							if (defaultDc != 0) _dcSession ??= _session.DCSessions.GetValueOrDefault(defaultDc);
+							if (defaultDc != 0)
+						_dcSession ??= _session.DCSessions.GetValueOrDefault(defaultDc);
 							_dcSession ??= new();
 							_dcSession.Client = this;
 							_dcSession.DataCenter = null;
@@ -2097,12 +2237,16 @@ namespace WTelegram
 					await CreateAuthorizationKey(this, _dcSession);
 
 				bool hasConnection = _networkStream != null || _paths.Count > 0;
-				if (hasConnection) _ = KeepAlive(_cts.Token);
+				if (hasConnection)
+					_ = KeepAlive(_cts.Token);
 				if (quickResume && _dcSession.Layer == Layer.Version && _dcSession.DataCenter != null && _session.MainDC != 0)
+				{
 					TLConfig = new Config { this_dc = _session.MainDC, dc_options = _session.DcOptions };
+				}
 				else
 				{
-					if (_dcSession.Layer != 0 && _dcSession.Layer != Layer.Version) _dcSession.Renew();
+					if (_dcSession.Layer != 0 && _dcSession.Layer != Layer.Version)
+						_dcSession.Renew();
 					await InitConnection();
 					if (_dcSession.DataCenter == null)
 					{
@@ -2113,8 +2257,10 @@ namespace WTelegram
 							.First();
 						_session.DCSessions[TLConfig.this_dc] = _dcSession;
 					}
-					if (_session.MainDC == 0) _session.MainDC = TLConfig.this_dc;
-					else if (needMigrate) await MigrateToDC(_session.MainDC);
+					if (_session.MainDC == 0)
+						_session.MainDC = TLConfig.this_dc;
+					else if (needMigrate)
+						await MigrateToDC(_session.MainDC);
 				}
 			}
 			catch
@@ -2128,7 +2274,8 @@ namespace WTelegram
 			finally
 			{
 				if (_reactorTask != null || _paths.Count > 0) // client not disposed
-					lock (_session) _session.Save();
+					lock (_session)
+						_session.Save();
 			}
 			Helpers.Log(2, $"Connected to {(TLConfig.test_mode ? "Test DC" : "DC")} {TLConfig.this_dc}... {TLConfig.flags & (Config.Flags)~0x18E00U}");
 
@@ -2168,7 +2315,8 @@ namespace WTelegram
 			int pathIdx = 1;
 			for (int i = 0; i < localEPs.Count; i++)
 			{
-				if (i == primaryEPIndex) continue;
+				if (i == primaryEPIndex)
+					continue;
 				var localEP = localEPs[i];
 				try
 				{
@@ -2267,7 +2415,8 @@ namespace WTelegram
 				// On the main client, multi-path keepalive is handled by PathHealthMonitor
 				// (PingDelayDisconnect every 3s per path). Child clients (media DCs) have
 				// no health monitor, so they still need KeepAlive pings for liveness.
-				if (_paths.Count > 1 && _parentClient == null) continue;
+				if (_paths.Count > 1 && _parentClient == null)
+					continue;
 
 				if (PingInterval <= 0)
 					await this.Ping(ping_id++);
@@ -2287,10 +2436,14 @@ namespace WTelegram
 		/// <exception cref="WTException"/><exception cref="RpcException"/>
 		public async Task<string> Login(string loginInfo)
 		{
-			if (_loginCfg.request == default) RunLoginAsync(loginInfo);
+			if (_loginCfg.request == default)
+			{
+				RunLoginAsync(loginInfo);
+			}
 			else
 			{
-				if (await _loginCfg.request.Task == null) return null;
+				if (await _loginCfg.request.Task == null)
+					return null;
 				loginInfo ??= AskConfig(await _loginCfg.request.Task);
 				_loginCfg.request = new();
 				_loginCfg.response.SetResult(loginInfo);
@@ -2304,7 +2457,8 @@ namespace WTelegram
 			var prevConfig = _config;
 			_config = what =>
 			{
-				if (prevConfig(what) is string value) return value;
+				if (prevConfig(what) is string value)
+					return value;
 				switch (what)
 				{
 					case "phone_number": return phone;
@@ -2318,7 +2472,8 @@ namespace WTelegram
 				if (what == "name" && value != null)
 				{
 					var lf = value.IndexOf('\n');
-					if (lf < 0) lf = value.IndexOf(' ');
+					if (lf < 0)
+					lf = value.IndexOf(' ');
 					_loginCfg.response = new();
 					_loginCfg.response.SetResult(lf < 0 ? "" : value[(lf + 1)..]);
 					value = lf < 0 ? value : value[0..lf];
@@ -2407,7 +2562,8 @@ namespace WTelegram
 					}
 					var mismatch = $"Current logged user {self.id} mismatched user_id or phone_number";
 					Helpers.Log(3, mismatch);
-					if (!reloginOnFailedResume) throw new WTException(mismatch);
+					if (!reloginOnFailedResume)
+					throw new WTException(mismatch);
 				}
 				catch (RpcException ex) when (reloginOnFailedResume)
 				{
@@ -2440,7 +2596,9 @@ namespace WTelegram
 					RaiseUpdates(sentCodeBase);
 					email = _config("email");
 					if (string.IsNullOrEmpty(email))
+					{
 						sentCodeBase = await this.Auth_ResendCode(phone_number, phone_code_hash);
+					}
 					else
 					{
 						var purpose = new EmailVerifyPurposeLoginSetup { phone_number = phone_number, phone_code_hash = phone_code_hash };
@@ -2460,7 +2618,8 @@ namespace WTelegram
 							catch (RpcException e) when (e.Code == 400 && e.Message is "CODE_INVALID" or "EMAIL_TOKEN_INVALID")
 							{
 								Helpers.Log(4, "Wrong email verification code!");
-								if (retry >= MaxCodePwdAttempts) throw;
+								if (retry >= MaxCodePwdAttempts)
+									throw;
 							}
 						if (verified is Account_EmailVerifiedLogin verifiedLogin) // (it should always be)
 							sentCodeBase = verifiedLogin.sent_code;
@@ -2469,9 +2628,13 @@ namespace WTelegram
 				}
 			resent:
 				if (sentCodeBase is Auth_SentCodeSuccess success)
+				{
 					authorization = success.authorization;
+				}
 				else if (sentCodeBase is Auth_SentCodePaymentRequired paymentRequired)
+				{
 					throw new WTException("Auth_SentCodePaymentRequired unsupported");
+				}
 				else if (sentCodeBase is Auth_SentCode sentCode)
 				{
 					phone_code_hash = sentCode.phone_code_hash;
@@ -2516,7 +2679,8 @@ namespace WTelegram
 						catch (RpcException e) when (e.Code == 400 && e.Message == "PHONE_CODE_INVALID")
 						{
 							Helpers.Log(4, "Wrong verification code!");
-							if (retry >= MaxCodePwdAttempts) throw;
+							if (retry >= MaxCodePwdAttempts)
+								throw;
 						}
 						catch (RpcException e) when (e.Code == 401 && e.Message == "SESSION_PASSWORD_NEEDED")
 						{
@@ -2533,7 +2697,11 @@ namespace WTelegram
 			}
 			catch (Exception ex) when (ex is not RpcException { Message: "FLOOD_WAIT_X" })
 			{
-				try { await this.Auth_CancelCode(phone_number, phone_code_hash); } catch { }
+				try
+			{
+				await this.Auth_CancelCode(phone_number, phone_code_hash);
+			}
+			catch { }
 				throw;
 			}
 			if (authorization is Auth_AuthorizationSignUpRequired signUpRequired)
@@ -2543,7 +2711,8 @@ namespace WTelegram
 				var first_name = Config("first_name");
 				var last_name = Config("last_name");
 				var wait = waitUntil - DateTime.UtcNow;
-				if (wait > TimeSpan.Zero) await Task.Delay(wait); // we get a FLOOD_WAIT_3 if we SignUp too fast
+				if (wait > TimeSpan.Zero)
+				await Task.Delay(wait); // we get a FLOOD_WAIT_3 if we SignUp too fast
 				authorization = await this.Auth_SignUp(phone_number, phone_code_hash, first_name, last_name);
 			}
 #pragma warning restore CS0618
@@ -2626,7 +2795,8 @@ namespace WTelegram
 				catch (RpcException pe) when (pe.Code == 400 && pe.Message == "PASSWORD_HASH_INVALID")
 				{
 					Helpers.Log(4, "Wrong password!");
-					if (pwdRetry >= MaxCodePwdAttempts) throw;
+					if (pwdRetry >= MaxCodePwdAttempts)
+					throw;
 				}
 		}
 
@@ -2651,7 +2821,8 @@ namespace WTelegram
 		{
 			lock (_msgsToAck)
 			{
-				if (_msgsToAck.Count == 0) return null;
+				if (_msgsToAck.Count == 0)
+					return null;
 				var msgsAck = new MsgsAck { msg_ids = [.. _msgsToAck] };
 				_msgsToAck.Clear();
 				return msgsAck;
@@ -2665,7 +2836,10 @@ namespace WTelegram
 			msgId = msgId * 428 + (msgId >> 24) * 25110956; // approximately unixtime*2^32 and divisible by 4
 			lock (_session)
 			{
-				if (msgId <= _dcSession.lastSentMsgId) msgId = _dcSession.lastSentMsgId += 4; else _dcSession.lastSentMsgId = msgId;
+				if (msgId <= _dcSession.lastSentMsgId)
+					msgId = _dcSession.lastSentMsgId += 4;
+				else
+					_dcSession.lastSentMsgId = msgId;
 				seqno = isContent ? _dcSession.seqno++ * 2 + 1 : _dcSession.seqno * 2;
 			}
 			return (msgId, seqno);
@@ -2673,12 +2847,16 @@ namespace WTelegram
 
 		private async Task SendAsync(IObject msg, bool isContent, Rpc rpc = null)
 		{
-			if (_reactorTask == null && _paths.Count == 0) throw new WTException("You must connect to Telegram first");
+			if (_reactorTask == null && _paths.Count == 0)
+				throw new WTException("You must connect to Telegram first");
 			isContent &= _dcSession.authKeyID != 0;
 			var (msgId, seqno) = NewMsgId(isContent);
 			if (rpc != null)
+			{
+				rpc.sentTicks = Environment.TickCount64;
 				lock (_pendingRpcs)
 					_pendingRpcs[rpc.msgId = msgId] = rpc;
+			}
 			if (isContent)
 			{
 				List<_Message> messages = null;
@@ -2700,10 +2878,25 @@ namespace WTelegram
 			{
 				// Select transport path for sending
 				var path = GetPrimaryAlivePath();
+				// For containers: update sentPathIndex on all contained RPCs.
+				// These RPCs were registered in _pendingRpcs before container batching
+				// (with sentTicks already set) but sentPathIndex was left at -1 since
+				// the actual sending path wasn't known yet.
+				if (msg is MsgContainer msgContainer && path != null)
+				{
+					lock (_pendingRpcs)
+					{
+						foreach (var m in msgContainer.messages)
+							if (_pendingRpcs.TryGetValue(m.msg_id, out var crpc))
+								crpc.sentPathIndex = path.PathIndex;
+					}
+				}
 				if (rpc != null && path != null)
 				{
 					rpc.sentPathIndex = path.PathIndex;
-					rpc.sentTicks = Environment.TickCount64;
+					// sentTicks already set at registration (before container batching).
+					// Don't overwrite here — stall timeout should measure from submission,
+					// not from after semaphore acquisition (which can block during uploads).
 				}
 				var sha256Send = path?.Sha256Send ?? _sha256;
 				var paddedMode = path?.PaddedMode ?? _paddedMode;
@@ -2714,7 +2907,8 @@ namespace WTelegram
 
 				if (_dcSession.authKeyID == 0) // send unencrypted message
 				{
-					if (_bareRpc == null) throw new WTException($"Shouldn't send a {msg.GetType().Name} unencrypted");
+					if (_bareRpc == null)
+					throw new WTException($"Shouldn't send a {msg.GetType().Name} unencrypted");
 					writer.Write(0L);                       // int64 auth_key_id = 0 (Unencrypted)
 					writer.Write(msgId);                    // int64 message_id
 					writer.Write(0);                        // int32 message_data_length (to be patched)
@@ -2820,7 +3014,8 @@ namespace WTelegram
 			{
 				sem.Release();
 			}
-			if (receiveTask != null) await receiveTask;
+			if (receiveTask != null)
+				await receiveTask;
 		}
 
 		private async Task SendReceiveHttp(byte[] buffer, int frameLength)
@@ -2841,7 +3036,8 @@ namespace WTelegram
 		/// <remarks>⚠️ Telegram servers don't seem to support other parameter than <see langword="null"/> correctly</remarks>
 		public async Task HttpWait(HttpWait httpWait = null)
 		{
-			if (_networkStream != null) throw new InvalidOperationException("Can't use HttpWait over TCP connection");
+			if (_networkStream != null)
+				throw new InvalidOperationException("Can't use HttpWait over TCP connection");
 			var container = new MsgContainer { messages = [] };
 			if (httpWait != null && NewMsgId(false) is var (hwId, hwSeqno))
 				container.messages.Add(new(hwId, hwSeqno, httpWait));
@@ -2852,12 +3048,14 @@ namespace WTelegram
 
 		internal async Task<T> InvokeBare<T>(IMethod<T> request)
 		{
-			if (_bareRpc != null) throw new WTException("A bare request is already undergoing");
+			if (_bareRpc != null)
+				throw new WTException("A bare request is already undergoing");
 		retry:
 			var bareRpc = _bareRpc = new Rpc { type = typeof(T) };
 			await SendAsync(request, false, _bareRpc);
 			var result = await bareRpc.Task;
-			if (result is ReactorError) goto retry;
+			if (result is ReactorError)
+				goto retry;
 			return (T)result;
 		}
 
@@ -2918,7 +3116,8 @@ namespace WTelegram
 					{
 						if (x <= FloodRetryThreshold)
 						{
-							if (x == 0) x = 1;
+							if (x == 0)
+						x = 1;
 							await Task.Delay(x * 1000);
 							goto retry;
 						}
@@ -2933,7 +3132,8 @@ namespace WTelegram
 						lock (_session)
 						{
 							_session.DCSessions.Remove(_dcSession.DcID);
-							if (_session.MainDC != -_dcSession.DcID) _session.DCSessions.Remove(-_dcSession.DcID);
+							if (_session.MainDC != -_dcSession.DcID)
+						_session.DCSessions.Remove(-_dcSession.DcID);
 							_session.Save();
 						}
 						await DisposeAsync();
