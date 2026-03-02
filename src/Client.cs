@@ -2968,11 +2968,13 @@ namespace WTelegram
 						await path.NetworkStream.WriteAsync(buffer, 0, frameLength);
 						Interlocked.Add(ref path.BytesSent, frameLength);
 					}
-					catch (IOException) when (_paths.Count > 1)
+					catch (IOException) when (_paths.Count > 0)
 					{
 						// Path write failed — mark dead and start reconnect.
 						// We can't re-encrypt for a different path (each has its own AES-CTR state),
 						// so propagate the exception and let Invoke's retry logic handle it.
+						// This also fires for single-path children (media DCs) — reconnect runs
+						// in background and Invoke's retry logic waits for path recovery.
 						path.IsAlive = false;
 						AddPenalty(path, 500);
 						// Clean up the RPC that was registered but never sent successfully.
@@ -3075,13 +3077,14 @@ namespace WTelegram
 			{
 				await SendAsync(query, true, rpc);
 			}
-			catch (IOException) when (_paths.Count > 0 && !Disconnected && ++ioRetries <= 5)
+			catch (IOException) when (_paths.Count > 0 && ++ioRetries <= 5)
 			{
 				// Multipath: transport write failed on a dead path but other paths
-				// may be alive (or reconnecting). Wait briefly for path recovery,
-				// then retry the RPC from scratch on whatever path is available.
+				// may be alive (or reconnecting). Wait for path recovery, then retry.
+				// Don't check Disconnected — even if all paths are currently dead,
+				// ReconnectPathAsync is running in background and may restore them.
 				Helpers.Log(3, $"{_dcSession.DcID}>Invoke: transport IOException, retrying ({ioRetries}/5)...");
-				await Task.Delay(500 * ioRetries);
+				await Task.Delay(1000 * ioRetries);
 				goto retry;
 			}
 			while (_httpClient != null && !rpc.Task.IsCompleted)
