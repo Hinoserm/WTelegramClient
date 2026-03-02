@@ -60,6 +60,8 @@ namespace WTelegram
 		public long BytesRecv { get; init; }
 		/// <summary>Number of times this path has reconnected.</summary>
 		public int ReconnectCount { get; init; }
+		/// <summary>Reliability penalty added to latency score (ms). Higher = path is less preferred. 0 = no penalty.</summary>
+		public long PenaltyMs { get; init; }
 		/// <summary>When this path's current connection was established (UTC). MinValue if never connected.</summary>
 		public DateTime ConnectedSince { get; init; }
 		/// <summary>How long this path has been connected. Zero if not alive or never connected.</summary>
@@ -139,6 +141,7 @@ namespace WTelegram
 					BytesSent = Interlocked.Read(ref p.BytesSent),
 					BytesRecv = Interlocked.Read(ref p.BytesRecv),
 					ReconnectCount = Volatile.Read(ref p.ReconnectCount),
+					PenaltyMs = Volatile.Read(ref p.PenaltyMs),
 					ConnectedSince = connTicks > 0
 						? DateTime.UtcNow - TimeSpan.FromMilliseconds(Environment.TickCount64 - connTicks)
 						: DateTime.MinValue,
@@ -185,6 +188,7 @@ namespace WTelegram
 				BytesSent = Interlocked.Read(ref path.BytesSent),
 				BytesRecv = Interlocked.Read(ref path.BytesRecv),
 				ReconnectCount = Volatile.Read(ref path.ReconnectCount),
+				PenaltyMs = Volatile.Read(ref path.PenaltyMs),
 				ConnectedSince = connTicks > 0
 					? DateTime.UtcNow - TimeSpan.FromMilliseconds(Environment.TickCount64 - connTicks)
 					: DateTime.MinValue,
@@ -257,6 +261,7 @@ namespace WTelegram
 		private volatile int _primaryPathIndex;
 		private volatile int _lastConnectedEPIndex;
 		private bool _fullReconnectStarted;
+		private Task _secondaryPathsTask;
 		private readonly ConcurrentDictionary<long, (int PathIndex, long SentTicks)> _pendingPings = new();
 		/// <summary>Optional local endpoints for multipath transport. Add two endpoints for redundant connections.</summary>
 		public List<IPEndPoint> LocalEndPoints { get; set; } = new();
@@ -270,6 +275,9 @@ namespace WTelegram
 		public int PathConnectTimeout { get; set; } = 10;
 		/// <summary>Maximum backoff delay in seconds between reconnect attempts (both per-path and full reconnect).</summary>
 		public int PathReconnectMaxBackoff { get; set; } = 30;
+		/// <summary>Seconds before an RPC on a specific path is considered stalled. The path is force-closed to trigger failover.
+		/// Set to 0 to disable stall detection. Only applies when multiple paths exist.</summary>
+		public int PathRpcStallTimeout { get; set; } = 10;
 		/// <summary>Controls how send traffic is distributed across alive paths. Default: LowestLatency (use path with lowest measured RTT).</summary>
 		public PathSendMode SendMode { get; set; } = PathSendMode.LowestLatency;
 
@@ -326,6 +334,7 @@ namespace WTelegram
 			PathDisconnectDelay = cloneOf.PathDisconnectDelay;
 			PathConnectTimeout = cloneOf.PathConnectTimeout;
 			PathReconnectMaxBackoff = cloneOf.PathReconnectMaxBackoff;
+			PathRpcStallTimeout = cloneOf.PathRpcStallTimeout;
 			SendMode = cloneOf.SendMode;
 			_dcSession = dcSession;
 		}
@@ -754,9 +763,9 @@ namespace WTelegram
 
 		private TransportPath GetPrimaryAlivePath()
 		{
-			// Pre-snapshot parent latencies by local address BEFORE acquiring our own lock
-			// to avoid lock-ordering inversion (child._pathsLock → parent._pathsLock).
-			Dictionary<System.Net.IPAddress, long> parentLatencyByAddr = null;
+			// Pre-snapshot parent latency AND penalty by local address BEFORE acquiring our
+			// own lock to avoid lock-ordering inversion (child._pathsLock → parent._pathsLock).
+			Dictionary<System.Net.IPAddress, (long Latency, long Penalty)> parentLatencyByAddr = null;
 			if (_parentClient != null && SendMode == PathSendMode.LowestLatency)
 			{
 				parentLatencyByAddr = new();
@@ -764,13 +773,14 @@ namespace WTelegram
 				{
 					foreach (var p in _parentClient._paths)
 						if (p.IsAlive && p.LocalEndPoint != null)
-							parentLatencyByAddr[p.LocalEndPoint.Address] = Volatile.Read(ref p.LatencyEwmaMs);
+							parentLatencyByAddr[p.LocalEndPoint.Address] = (Volatile.Read(ref p.LatencyEwmaMs), Volatile.Read(ref p.PenaltyMs));
 				}
 			}
 
 			lock (_pathsLock)
 			{
-				if (_paths.Count == 0) return null;
+				if (_paths.Count == 0)
+					return null;
 				int count = _paths.Count;
 
 				switch (SendMode)
@@ -828,28 +838,35 @@ namespace WTelegram
 						return null;
 
 					case PathSendMode.LowestLatency:
-					// Pick the alive path with the lowest EWMA round-trip latency.
+					// Pick the alive path with the lowest EFFECTIVE score = latency + penalty.
+					// Latency alone doesn't capture reliability — a fast but unstable path
+					// (e.g. 51ms but reconnecting every 20s) would always win over a slower
+					// but rock-solid path (72ms, 0 reconnects). The penalty adds virtual
+					// latency based on reconnect history and stall events.
 					// Paths with no samples yet (LatencyEwmaMs == long.MaxValue) are used as
 					// fallback if no measured paths are alive yet (e.g. right after startup).
-					// Child clients (media DCs) have no health monitor and thus no local latency
-					// data. They consult the parent's measurements for the same local interface
-					// so each transfer dynamically picks the current best path.
+					// Child clients (media DCs) consult the parent's measurements + penalty.
 					TransportPath bestPath = null;
-					long bestMs = long.MaxValue;
+					long bestScore = long.MaxValue;
 					for (int i = 0; i < count; i++)
 					{
 						if (!_paths[i].IsAlive) continue;
 						long lat = Volatile.Read(ref _paths[i].LatencyEwmaMs);
+						long penalty = Volatile.Read(ref _paths[i].PenaltyMs);
 						if (lat == long.MaxValue && parentLatencyByAddr != null
 							&& _paths[i].LocalEndPoint != null
-							&& parentLatencyByAddr.TryGetValue(_paths[i].LocalEndPoint.Address, out var parentLat))
+							&& parentLatencyByAddr.TryGetValue(_paths[i].LocalEndPoint.Address, out var parentData))
 						{
-							lat = parentLat;
+							lat = parentData.Latency;
+							// Use the worse of local vs parent penalty
+							if (penalty < parentData.Penalty)
+								penalty = parentData.Penalty;
 						}
-						if (bestPath == null || lat < bestMs)
+						long score = (lat == long.MaxValue) ? long.MaxValue : lat + penalty;
+						if (bestPath == null || score < bestScore)
 						{
 							bestPath = _paths[i];
-							bestMs = lat;
+							bestScore = score;
 							_primaryPathIndex = i;
 						}
 					}
@@ -869,6 +886,86 @@ namespace WTelegram
 							}
 						}
 						return null;
+				}
+			}
+		}
+
+		/// <summary>Adds penalty (in virtual milliseconds) to a path's reliability score.
+		/// Uses additive increase — each event (reconnect, stall, error) adds to the penalty.
+		/// Penalty is capped at 10000ms and decayed by the health monitor over time.</summary>
+		private static void AddPenalty(TransportPath path, long penaltyMs)
+		{
+			long current, newVal;
+			do
+			{
+				current = Volatile.Read(ref path.PenaltyMs);
+				newVal = Math.Min(current + penaltyMs, 10000);
+			} while (Interlocked.CompareExchange(ref path.PenaltyMs, newVal, current) != current);
+		}
+
+		/// <summary>Lightweight stall watcher for child (media DC) clients.
+		/// Checks pending RPCs for stalls and force-closes stalled paths.
+		/// Does NOT send probes (Telegram delays Pong during file uploads).</summary>
+		private async Task ChildStallWatcher(CancellationToken ct)
+		{
+			long stallMs = (long)PathRpcStallTimeout * 1000;
+			if (stallMs <= 0)
+				return;
+
+			while (!ct.IsCancellationRequested)
+			{
+				await Task.Delay(1000, ct);
+				if (_paths.Count <= 1) continue;
+
+				var now = Environment.TickCount64;
+				var stalledPathIndices = new HashSet<int>();
+				lock (_pendingRpcs)
+				{
+					foreach (var kvp in _pendingRpcs)
+					{
+						var rpc = kvp.Value;
+						if (rpc.sentPathIndex >= 0 && rpc.sentTicks > 0
+							&& (now - rpc.sentTicks) > stallMs)
+						{
+							stalledPathIndices.Add(rpc.sentPathIndex);
+						}
+					}
+				}
+				if (stalledPathIndices.Count > 0)
+				{
+					// Collect paths to notify/penalize, then act outside lock
+					var toNotify = new List<(TransportPath path, IPAddress addr)>();
+					lock (_pathsLock)
+					{
+						foreach (var stalledIdx in stalledPathIndices)
+						{
+							if (stalledIdx >= _paths.Count) continue;
+							var stalledPath = _paths[stalledIdx];
+							if (!stalledPath.IsAlive) continue;
+							if (_paths.Any(p => p.IsAlive && p.PathIndex != stalledIdx))
+							{
+								Helpers.Log(3, $"{_dcSession?.DcID}>Child: Path {stalledIdx} stalled (>{PathRpcStallTimeout}s). Force-closing for failover.");
+								stalledPath.IsAlive = false;
+								AddPenalty(stalledPath, 1000);
+								toNotify.Add((stalledPath, stalledPath.LocalEndPoint?.Address));
+								stalledPath.NetworkStream?.Close();
+							}
+						}
+					}
+					// Notify and penalize parent OUTSIDE child._pathsLock to avoid lock ordering inversion
+					foreach (var (path, addr) in toNotify)
+					{
+						RaisePathChanged(path);
+						if (_parentClient != null && addr != null)
+						{
+							lock (_parentClient._pathsLock)
+							{
+								foreach (var pp in _parentClient._paths)
+									if (pp.LocalEndPoint?.Address?.Equals(addr) == true)
+										AddPenalty(pp, 1000);
+							}
+						}
+					}
 				}
 			}
 		}
@@ -968,6 +1065,9 @@ namespace WTelegram
 						Interlocked.Exchange(ref path.BytesSent, 0);
 						Interlocked.Exchange(ref path.BytesRecv, 0);
 						Interlocked.Increment(ref path.ReconnectCount);
+						// Add reliability penalty: each reconnect adds 500ms effective latency.
+						// This ensures LowestLatency mode steers away from frequently-failing paths.
+						AddPenalty(path, 500);
 						Helpers.Log(2, $"{_dcSession.DcID}>Path {path.PathIndex} reconnected and registered successfully.");
 						RaisePathChanged(path);
 						return;
@@ -1014,7 +1114,12 @@ namespace WTelegram
 					(now - p.LastRecvTicks) <= deadAfterMs || p.LastProbeTicks <= p.LastRecvTicks))
 				{
 					// Check if the Reactor is already handling a full reconnect
-					lock (_pathsLock) { if (_fullReconnectStarted) continue; _fullReconnectStarted = true; }
+					lock (_pathsLock)
+					{
+						if (_fullReconnectStarted)
+							continue;
+						_fullReconnectStarted = true;
+					}
 					Helpers.Log(4, $"{_dcSession.DcID}>All {alivePaths.Length} path(s) globally unresponsive. Triggering full reconnect.");
 					// Fire-and-forget because ResetAsync will cancel our ct
 					_ = Task.Run(async () =>
@@ -1076,6 +1181,69 @@ namespace WTelegram
 							}
 						}
 						catch { _pendingPings.TryRemove(thisPingId, out _); /* path might already be dead, next cycle will catch it */ }
+					}
+				}
+
+				// RPC STALL DETECTION: Check pending RPCs for any that have been waiting too long
+				// on a specific path. If found, force-close that path's network stream to trigger
+				// IOException → Reactor error → RPC retry on another path. This is MUCH faster
+				// than waiting for TCP timeout (~19s on Linux) and prevents transfer stalls.
+				long stallMs = (long)PathRpcStallTimeout * 1000;
+				if (stallMs > 0)
+				{
+					var stalledPathIndices = new HashSet<int>();
+					lock (_pendingRpcs)
+					{
+						foreach (var kvp in _pendingRpcs)
+						{
+							var rpc = kvp.Value;
+							if (rpc.sentPathIndex >= 0 && rpc.sentTicks > 0
+								&& (now - rpc.sentTicks) > stallMs)
+							{
+								stalledPathIndices.Add(rpc.sentPathIndex);
+							}
+						}
+					}
+					if (stalledPathIndices.Count > 0)
+					{
+						var toNotify = new List<TransportPath>();
+						lock (_pathsLock)
+						{
+							foreach (var stalledIdx in stalledPathIndices)
+							{
+								if (stalledIdx >= _paths.Count) continue;
+								var stalledPath = _paths[stalledIdx];
+								if (!stalledPath.IsAlive) continue;
+								// Only kill if other paths are alive (don't kill the last path)
+								if (_paths.Any(p => p.IsAlive && p.PathIndex != stalledIdx))
+								{
+									Helpers.Log(3, $"{_dcSession.DcID}>Path {stalledIdx} has stalled RPC(s) (>{PathRpcStallTimeout}s). Force-closing to trigger failover.");
+									stalledPath.IsAlive = false;
+									AddPenalty(stalledPath, 1000); // heavier penalty for stalls
+									toNotify.Add(stalledPath);
+									stalledPath.NetworkStream?.Close();
+								}
+							}
+						}
+						foreach (var path in toNotify)
+							RaisePathChanged(path);
+					}
+				}
+
+				// Decay penalty for alive healthy paths — each 1s cycle reduces penalty by ~10%.
+				// This allows rehabilitated paths to regain trust after sustained stability.
+				// A path with 500ms penalty (1 reconnect) recovers to <50ms in ~23 seconds.
+				// A path with 5000ms penalty (10 reconnects) recovers to <50ms in ~46 seconds.
+				foreach (var path in snapshot)
+				{
+					if (!path.IsAlive) continue;
+					long penalty = Volatile.Read(ref path.PenaltyMs);
+					if (penalty > 0)
+					{
+						// EWMA-style decay: new = old * 0.9 (drop ~10% per second)
+						long decayed = penalty * 9 / 10;
+						if (decayed < 10) decayed = 0; // snap to zero when negligible
+						Volatile.Write(ref path.PenaltyMs, decayed);
 					}
 				}
 			}
@@ -1465,6 +1633,7 @@ namespace WTelegram
 			internal TaskCompletionSource<object> tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
 			internal long msgId;
 			internal int sentPathIndex = -1; // which TransportPath this was sent on (-1 = legacy/unknown)
+			internal long sentTicks; // Environment.TickCount64 when sent, for stall detection
 			public Task<object> Task => tcs.Task;
 		}
 
@@ -1489,6 +1658,10 @@ namespace WTelegram
 			public long LastProbeTicks;
 			// Latency tracking for LowestLatency mode (RTT measured via Client._pendingPings)
 			public long LatencyEwmaMs = long.MaxValue; // EWMA RTT in ms; MaxValue = no samples yet
+			// Reliability penalty: added to effective latency for path scoring.
+			// Increased on reconnects/errors, decays naturally via EWMA.
+			// Unit: milliseconds of virtual latency added. 0 = no penalty.
+			public long PenaltyMs;
 			// I/O counters (updated via Interlocked.Add for thread safety)
 			public long BytesSent;
 			public long BytesRecv;
@@ -1909,6 +2082,15 @@ namespace WTelegram
 			}
 			_sendSemaphore.Release();
 
+			// Start connecting secondary paths in the background BEFORE auth/InitConnection.
+			// Secondary connections only need TCP + obfuscation + registration ping — they share
+			// the session and don't need their own auth. This runs concurrently with auth so the
+			// bot starts operating on the first available path immediately.
+			if (usingPaths && localEPs?.Count > 1)
+			{
+				_secondaryPathsTask = ConnectSecondaryPathsAsync(endpoint, localEPs, primaryEPIndex, dcId);
+			}
+
 			try
 			{
 				if (_dcSession.authKeyID == 0)
@@ -1935,6 +2117,14 @@ namespace WTelegram
 					else if (needMigrate) await MigrateToDC(_session.MainDC);
 				}
 			}
+			catch
+			{
+				// Auth/InitConnection failed — clean up the secondary paths task reference.
+				// The secondary Reactors will self-terminate when _cts is cancelled by the
+				// next ResetAsync call; we just prevent stale task reference reuse.
+				_secondaryPathsTask = null;
+				throw;
+			}
 			finally
 			{
 				if (_reactorTask != null || _paths.Count > 0) // client not disposed
@@ -1942,90 +2132,108 @@ namespace WTelegram
 			}
 			Helpers.Log(2, $"Connected to {(TLConfig.test_mode ? "Test DC" : "DC")} {TLConfig.this_dc}... {TLConfig.flags & (Config.Flags)~0x18E00U}");
 
-			// Connect additional paths (after primary is fully authenticated and initialized)
+			// Secondary path connection was already started in the background (see below).
+			// Wait for it to complete now that auth is done, so the caller knows all paths
+			// are established (or at least attempted).
+			if (_secondaryPathsTask != null)
+			{
+				await _secondaryPathsTask;
+				_secondaryPathsTask = null;
+			}
+
+			// Start health/stall monitors now that all paths have been attempted
 			if (usingPaths && localEPs?.Count > 1)
 			{
-				int pathIdx = 1;
-				for (int i = 0; i < localEPs.Count; i++)
+				if (_parentClient == null)
 				{
-					if (i == primaryEPIndex) continue; // already connected as primary
-					var localEP = localEPs[i];
+					// Main client: full health monitor with liveness probing, stall detection, penalty decay.
+					_ = PathHealthMonitor(_cts.Token);
+				}
+				else
+				{
+					// Child client (media DC): lightweight stall watcher only.
+					// No liveness probing (Telegram delays Pong while processing file parts),
+					// but we DO need stall detection because file transfers are the primary
+					// use case and stalls are the most impactful failure mode.
+					_ = ChildStallWatcher(_cts.Token);
+				}
+			}
+		}
+
+		/// <summary>Connect secondary paths (all local endpoints except the primary).
+		/// Runs in the background during DoConnectAsync so auth/InitConnection proceeds in parallel.</summary>
+		private async Task ConnectSecondaryPathsAsync(IPEndPoint endpoint, List<IPEndPoint> localEPs, int primaryEPIndex, int dcId)
+		{
+			byte[] preamble;
+			int pathIdx = 1;
+			for (int i = 0; i < localEPs.Count; i++)
+			{
+				if (i == primaryEPIndex) continue;
+				var localEP = localEPs[i];
+				try
+				{
+					var tcpClient2 = await TcpHandler(endpoint.Address.ToString(), endpoint.Port, localEP).WaitAsync(TimeSpan.FromSeconds(PathConnectTimeout));
+					ConfigureKeepalive(tcpClient2);
+					var path = new TransportPath
+					{
+						TcpClient = tcpClient2,
+						NetworkStream = tcpClient2.GetStream(),
+						PaddedMode = _paddedMode,
+						LocalEndPoint = localEP,
+						PathIndex = pathIdx,
+						Cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token)
+					};
+					byte protocolId2 = (byte)(path.PaddedMode ? 0xDD : 0xEE);
+#if OBFUSCATION
+					(path.SendCtr, path.RecvCtr, preamble) = InitObfuscation(null, protocolId2, dcId);
+#else
+					preamble = new byte[] { protocolId2, protocolId2, protocolId2, protocolId2 };
+#endif
+					await path.NetworkStream.WriteAsync(preamble, 0, preamble.Length, _cts.Token);
+					path.ReactorTask = Reactor(path, path.NetworkStream, path.Cts.Token);
+					path.IsAlive = true;
+					path.ConnectedSinceTicks = Environment.TickCount64;
+					path.LastRecvTicks = path.ConnectedSinceTicks;
+					lock (_pathsLock)
+						_paths.Add(path);
+					Helpers.Log(2, $"{dcId}>Path {pathIdx} connected from {localEP.Address}.");
+					RaisePathChanged(path);
+
 					try
 					{
-						var tcpClient2 = await TcpHandler(endpoint.Address.ToString(), endpoint.Port, localEP).WaitAsync(TimeSpan.FromSeconds(PathConnectTimeout));
-						ConfigureKeepalive(tcpClient2);
-						var path = new TransportPath
-						{
-							TcpClient = tcpClient2,
-							NetworkStream = tcpClient2.GetStream(),
-							PaddedMode = _paddedMode,
-							LocalEndPoint = localEP,
-							PathIndex = pathIdx,
-							Cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token)
-						};
-						byte protocolId2 = (byte)(path.PaddedMode ? 0xDD : 0xEE);
-#if OBFUSCATION
-						(path.SendCtr, path.RecvCtr, preamble) = InitObfuscation(null, protocolId2, dcId);
-#else
-						preamble = new byte[] { protocolId2, protocolId2, protocolId2, protocolId2 };
-#endif
-						await path.NetworkStream.WriteAsync(preamble, 0, preamble.Length, _cts.Token);
-						path.ReactorTask = Reactor(path, path.NetworkStream, path.Cts.Token);
-						path.IsAlive = true;
-						path.ConnectedSinceTicks = Environment.TickCount64;
-						path.LastRecvTicks = path.ConnectedSinceTicks;
-						lock (_pathsLock)
-							_paths.Add(path);
-						Helpers.Log(2, $"{dcId}>Path {pathIdx} connected from {localEP.Address}.");
-						RaisePathChanged(path);
-
-						// Send a ping through this path to register the connection with the server
+						await _sendSemaphore.WaitAsync();
 						try
 						{
-							await _sendSemaphore.WaitAsync();
-							try
-							{
-								await SendOnPathAsync(path, new TL.Methods.Ping { ping_id = _random.Next() });
-							}
-							finally
-							{
-								_sendSemaphore.Release();
-							}
+							await SendOnPathAsync(path, new TL.Methods.Ping { ping_id = _random.Next() });
 						}
-						catch (Exception ex)
+						finally
 						{
-							Helpers.Log(3, $"{dcId}>Path {pathIdx} registration ping failed: {ex.Message}");
+							_sendSemaphore.Release();
 						}
 					}
 					catch (Exception ex)
 					{
-						Helpers.Log(4, $"{dcId}>Failed to connect path {pathIdx} from {localEP.Address}: {ex.Message}. Will retry in background.");
-						// Create a dead placeholder path and start reconnecting in background.
-						// Without this, the path is permanently lost after a full reconnect
-						// where the secondary interface is temporarily unreachable.
-						var deadPath = new TransportPath
-						{
-							PaddedMode = _paddedMode,
-							LocalEndPoint = localEP,
-							PathIndex = pathIdx,
-							IsAlive = false,
-							LastRecvTicks = 0,
-							LastProbeTicks = 0
-						};
-						lock (_pathsLock) _paths.Add(deadPath);
-						_ = ReconnectPathAsync(deadPath);
+						Helpers.Log(3, $"{dcId}>Path {pathIdx} registration ping failed: {ex.Message}");
 					}
-					pathIdx++;
 				}
-				Helpers.Log(2, $"{dcId}>Multipath transport: {_paths.Count(p => p.IsAlive)}/{_paths.Count} paths alive.");
-				// Only run the health monitor on the main client. Child clients (media DCs)
-				// are short-lived file transfer sessions where liveness probing interferes
-				// with uploads — Telegram delays Pong responses while processing file parts,
-				// inflating latency and causing false path kills. Child clients rely on the
-				// parent's latency data for path selection (see GetPrimaryAlivePath).
-				if (_parentClient == null)
-					_ = PathHealthMonitor(_cts.Token);
+				catch (Exception ex)
+				{
+					Helpers.Log(4, $"{dcId}>Failed to connect path {pathIdx} from {localEP.Address}: {ex.Message}. Will retry in background.");
+					var deadPath = new TransportPath
+					{
+						PaddedMode = _paddedMode,
+						LocalEndPoint = localEP,
+						PathIndex = pathIdx,
+						IsAlive = false,
+						LastRecvTicks = 0,
+						LastProbeTicks = 0
+					};
+					lock (_pathsLock) _paths.Add(deadPath);
+					_ = ReconnectPathAsync(deadPath);
+				}
+				pathIdx++;
 			}
+			Helpers.Log(2, $"{dcId}>Multipath transport: {_paths.Count(p => p.IsAlive)}/{_paths.Count} paths alive.");
 		}
 
 		private async Task InitConnection()
@@ -2492,7 +2700,11 @@ namespace WTelegram
 			{
 				// Select transport path for sending
 				var path = GetPrimaryAlivePath();
-				if (rpc != null && path != null) rpc.sentPathIndex = path.PathIndex;
+				if (rpc != null && path != null)
+				{
+					rpc.sentPathIndex = path.PathIndex;
+					rpc.sentTicks = Environment.TickCount64;
+				}
 				var sha256Send = path?.Sha256Send ?? _sha256;
 				var paddedMode = path?.PaddedMode ?? _paddedMode;
 
@@ -2568,6 +2780,7 @@ namespace WTelegram
 						// We can't re-encrypt for a different path (each has its own AES-CTR state),
 						// so propagate the exception and let Invoke's retry logic handle it.
 						path.IsAlive = false;
+						AddPenalty(path, 500);
 						// Clean up the RPC that was registered but never sent successfully.
 						// Without this, it stays orphaned in _pendingRpcs until the Reactor error
 						// handler fires, causing races with Invoke's own IOException retry.
