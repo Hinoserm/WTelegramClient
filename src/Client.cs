@@ -754,6 +754,20 @@ namespace WTelegram
 
 		private TransportPath GetPrimaryAlivePath()
 		{
+			// Pre-snapshot parent latencies by local address BEFORE acquiring our own lock
+			// to avoid lock-ordering inversion (child._pathsLock → parent._pathsLock).
+			Dictionary<System.Net.IPAddress, long> parentLatencyByAddr = null;
+			if (_parentClient != null && SendMode == PathSendMode.LowestLatency)
+			{
+				parentLatencyByAddr = new();
+				lock (_parentClient._pathsLock)
+				{
+					foreach (var p in _parentClient._paths)
+						if (p.IsAlive && p.LocalEndPoint != null)
+							parentLatencyByAddr[p.LocalEndPoint.Address] = Volatile.Read(ref p.LatencyEwmaMs);
+				}
+			}
+
 			lock (_pathsLock)
 			{
 				if (_paths.Count == 0) return null;
@@ -826,16 +840,11 @@ namespace WTelegram
 					{
 						if (!_paths[i].IsAlive) continue;
 						long lat = Volatile.Read(ref _paths[i].LatencyEwmaMs);
-						if (lat == long.MaxValue && _parentClient != null)
+						if (lat == long.MaxValue && parentLatencyByAddr != null
+							&& _paths[i].LocalEndPoint != null
+							&& parentLatencyByAddr.TryGetValue(_paths[i].LocalEndPoint.Address, out var parentLat))
 						{
-							// No local measurement — look up the parent's latency for this interface
-							lock (_parentClient._pathsLock)
-							{
-								var parentPath = _parentClient._paths.FirstOrDefault(p =>
-									p.IsAlive && p.LocalEndPoint?.Address.Equals(_paths[i].LocalEndPoint?.Address) == true);
-								if (parentPath != null)
-									lat = Volatile.Read(ref parentPath.LatencyEwmaMs);
-							}
+							lat = parentLat;
 						}
 						if (bestPath == null || lat < bestMs)
 						{
@@ -2047,9 +2056,10 @@ namespace WTelegram
 			{
 				await Task.Delay(Math.Abs(PingInterval) * 1000, ct);
 
-				// Multi-path keepalive is handled entirely by PathHealthMonitor
-				// (PingDelayDisconnect every 3s per path with tight disconnect timeout).
-				if (_paths.Count > 1) continue;
+				// On the main client, multi-path keepalive is handled by PathHealthMonitor
+				// (PingDelayDisconnect every 3s per path). Child clients (media DCs) have
+				// no health monitor, so they still need KeepAlive pings for liveness.
+				if (_paths.Count > 1 && _parentClient == null) continue;
 
 				if (PingInterval <= 0)
 					await this.Ping(ping_id++);
