@@ -39,6 +39,10 @@ namespace WTelegram
 	/// <summary>Snapshot of per-path transport statistics.</summary>
 	public sealed class PathStats
 	{
+		/// <summary>Telegram DC ID this path is connected to.</summary>
+		public int DcId { get; init; }
+		/// <summary>True if this is a media-only DC (used for file transfers).</summary>
+		public bool IsMediaDc { get; init; }
 		/// <summary>Index of this path (matches LocalEndPoints order).</summary>
 		public int PathIndex { get; init; }
 		/// <summary>Local endpoint this path is bound to (null for legacy single-path).</summary>
@@ -103,12 +107,14 @@ namespace WTelegram
 		public bool Disconnected => _paths.Count > 0
 			? !_paths.Any(p => p.IsAlive)
 			: (_tcpClient != null && !(_tcpClient.Client?.Connected ?? false));
-		/// <summary>Returns a snapshot of per-path transport statistics. Empty array if not using multipath.</summary>
+		/// <summary>Returns a snapshot of per-path transport statistics for THIS client's DC. Empty array if not using multipath.</summary>
 		public PathStats[] GetPathStatistics()
 		{
 			TransportPath[] snapshot;
 			lock (_pathsLock) snapshot = _paths.ToArray();
 			if (snapshot.Length == 0) return Array.Empty<PathStats>();
+			var dcId = _dcSession?.DcID ?? 0;
+			var isMedia = _dcSession?.DataCenter?.flags.HasFlag(DcOption.Flags.media_only) ?? false;
 			var result = new PathStats[snapshot.Length];
 			for (int i = 0; i < snapshot.Length; i++)
 			{
@@ -116,6 +122,8 @@ namespace WTelegram
 				var connTicks = Volatile.Read(ref p.ConnectedSinceTicks);
 				result[i] = new PathStats
 				{
+					DcId = dcId,
+					IsMediaDc = isMedia,
 					PathIndex = p.PathIndex,
 					LocalEndPoint = p.LocalEndPoint,
 					IsAlive = p.IsAlive,
@@ -130,6 +138,24 @@ namespace WTelegram
 				};
 			}
 			return result;
+		}
+
+		/// <summary>Returns path statistics across ALL active DC sessions (main + media DCs).
+		/// Call on the main client to see every connected DC including media transfer sessions.</summary>
+		public PathStats[] GetAllPathStatistics()
+		{
+			var all = new List<PathStats>();
+			lock (_session)
+			{
+				foreach (var dcSession in _session.DCSessions.Values)
+				{
+					var client = dcSession.Client;
+					if (client == null || client.Disconnected)
+						continue;
+					all.AddRange(client.GetPathStatistics());
+				}
+			}
+			return all.ToArray();
 		}
 
 		/// <summary>ID of the current logged-in user or 0</summary>
