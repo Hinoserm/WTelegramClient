@@ -83,6 +83,10 @@ namespace WTelegram
 		public event Func<IObject, Task> OnOther;
 		/// <summary>Use this handler to intercept Updates that resulted from your own API calls</summary>
 		public event Func<UpdatesBase, Task> OnOwnUpdates;
+		/// <summary>Fired when any transport path changes state (alive, dead, reconnecting).
+		/// On the main client, this also receives changes from alt DC sessions (media transfers).
+		/// The handler receives a <see cref="PathStats"/> snapshot of the changed path.</summary>
+		public event Action<PathStats> OnPathChanged;
 		/// <summary>Used to create a TcpClient connected to the given address/port, or throw an exception on failure</summary>
 		public TcpFactory TcpHandler { get; set; } = DefaultTcpHandler;
 		public delegate Task<TcpClient> TcpFactory(string host, int port, IPEndPoint localEndPoint = null);
@@ -111,8 +115,10 @@ namespace WTelegram
 		public PathStats[] GetPathStatistics()
 		{
 			TransportPath[] snapshot;
-			lock (_pathsLock) snapshot = _paths.ToArray();
-			if (snapshot.Length == 0) return Array.Empty<PathStats>();
+			lock (_pathsLock)
+				snapshot = _paths.ToArray();
+			if (snapshot.Length == 0)
+				return Array.Empty<PathStats>();
 			var dcId = _dcSession?.DcID ?? 0;
 			var isMedia = _dcSession?.DataCenter?.flags.HasFlag(DcOption.Flags.media_only) ?? false;
 			var result = new PathStats[snapshot.Length];
@@ -158,6 +164,32 @@ namespace WTelegram
 			return all.ToArray();
 		}
 
+		/// <summary>Fires <see cref="OnPathChanged"/> for the given path, propagating to the parent client if this is an alt DC session.</summary>
+		private void RaisePathChanged(TransportPath path)
+		{
+			var connTicks = Volatile.Read(ref path.ConnectedSinceTicks);
+			var stats = new PathStats
+			{
+				DcId = _dcSession?.DcID ?? 0,
+				IsMediaDc = _dcSession?.DataCenter?.flags.HasFlag(DcOption.Flags.media_only) ?? false,
+				PathIndex = path.PathIndex,
+				LocalEndPoint = path.LocalEndPoint,
+				IsAlive = path.IsAlive,
+				IsReconnecting = Volatile.Read(ref path._reconnecting) != 0,
+				LatencyEwmaMs = path.LatencyEwmaMs == long.MaxValue ? -1 : Volatile.Read(ref path.LatencyEwmaMs),
+				BytesSent = Interlocked.Read(ref path.BytesSent),
+				BytesRecv = Interlocked.Read(ref path.BytesRecv),
+				ReconnectCount = Volatile.Read(ref path.ReconnectCount),
+				ConnectedSince = connTicks > 0
+					? DateTime.UtcNow - TimeSpan.FromMilliseconds(Environment.TickCount64 - connTicks)
+					: DateTime.MinValue,
+			};
+			try { OnPathChanged?.Invoke(stats); }
+			catch { }
+			try { _parentClient?.OnPathChanged?.Invoke(stats); }
+			catch { }
+		}
+
 		/// <summary>ID of the current logged-in user or 0</summary>
 		public long UserId => _session.UserId;
 		/// <summary>Info about the current logged-in user. This is only filled after a successful (re)login, not updated later</summary>
@@ -177,6 +209,7 @@ namespace WTelegram
 
 		private Func<string, string> _config;
 		private readonly Session _session;
+		private readonly Client _parentClient; // non-null for alt DC clients; used to propagate OnPathChanged to main client
 		private string _apiHash;
 		private Session.DCSession _dcSession;
 		private TcpClient _tcpClient;
@@ -262,6 +295,7 @@ namespace WTelegram
 
 		private Client(Client cloneOf, Session.DCSession dcSession)
 		{
+			_parentClient = cloneOf;
 			_config = cloneOf._config;
 			_session = cloneOf._session;
 			TcpHandler = cloneOf.TcpHandler;
@@ -567,6 +601,7 @@ namespace WTelegram
 								shouldFullReconnect = true;
 							}
 						}
+						RaisePathChanged(path);
 
 						if (otherPathsAlive)
 						{
@@ -782,6 +817,7 @@ namespace WTelegram
 		{
 			// Prevent multiple concurrent reconnect loops for the same path (atomic guard)
 			if (Interlocked.CompareExchange(ref path._reconnecting, 1, 0) != 0) return;
+			RaisePathChanged(path); // notify: IsReconnecting is now true
 
 			try
 			{
@@ -854,6 +890,7 @@ namespace WTelegram
 						Interlocked.Exchange(ref path.BytesRecv, 0);
 						Interlocked.Increment(ref path.ReconnectCount);
 						Helpers.Log(2, $"{_dcSession.DcID}>Path {path.PathIndex} reconnected and registered successfully.");
+						RaisePathChanged(path);
 						return;
 					}
 					catch (Exception ex)
@@ -927,6 +964,7 @@ namespace WTelegram
 						// Close the stream; the Reactor will start a per-path reconnect.
 						Helpers.Log(3, $"{_dcSession.DcID}>Path {path.PathIndex} unresponsive ({silentMs / 1000}s silent, probe unanswered). Force-closing.");
 						path.IsAlive = false;
+						RaisePathChanged(path);
 						path.NetworkStream?.Close();
 					}
 					else if ((now - path.LastProbeTicks) >= probeIntervalMs)
@@ -1758,8 +1796,10 @@ namespace WTelegram
 				primaryPath.IsAlive = true;
 				primaryPath.ConnectedSinceTicks = Environment.TickCount64;
 				primaryPath.LastRecvTicks = primaryPath.ConnectedSinceTicks;
-				lock (_pathsLock) _paths.Add(primaryPath);
+				lock (_pathsLock)
+					_paths.Add(primaryPath);
 				Helpers.Log(2, $"{dcId}>Path 0 connected{(localEPs != null ? $" from {localEPs[primaryEPIndex].Address}" : "")}.");
+				RaisePathChanged(primaryPath);
 			}
 
 			_dcSession.Salts?.Remove(DateTime.MaxValue);
@@ -1843,8 +1883,10 @@ namespace WTelegram
 						path.IsAlive = true;
 						path.ConnectedSinceTicks = Environment.TickCount64;
 						path.LastRecvTicks = path.ConnectedSinceTicks;
-						lock (_pathsLock) _paths.Add(path);
+						lock (_pathsLock)
+							_paths.Add(path);
 						Helpers.Log(2, $"{dcId}>Path {pathIdx} connected from {localEP.Address}.");
+						RaisePathChanged(path);
 
 						// Send a ping through this path to register the connection with the server
 						try
@@ -2420,6 +2462,7 @@ namespace WTelegram
 						// We can't re-encrypt for a different path (each has its own AES-CTR state),
 						// so propagate the exception and let Invoke's retry logic handle it.
 						path.IsAlive = false;
+						RaisePathChanged(path);
 						_ = ReconnectPathAsync(path);
 						throw;
 					}
