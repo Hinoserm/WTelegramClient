@@ -2514,6 +2514,12 @@ namespace WTelegram
 						throw;
 					}
 				}
+				else if (_paths.Count > 0)
+				{
+					// Multipath mode but all paths are dead — don't fall through to HTTP.
+					// Throw so the caller can retry once paths reconnect.
+					throw new IOException("All transport paths are currently dead");
+				}
 				else if (_networkStream != null)
 				{
 					// Legacy single-connection TCP mode (MTProxy)
