@@ -318,7 +318,9 @@ namespace WTelegram
 			PingInterval = cloneOf.PingInterval;
 			MaxAutoReconnects = cloneOf.MaxAutoReconnects;
 			TLConfig = cloneOf.TLConfig;
-			LocalEndPoints = cloneOf.LocalEndPoints;
+			// Copy (not share) LocalEndPoints so child clients have all interfaces
+			// available for dynamic per-transfer path selection.
+			LocalEndPoints = new List<IPEndPoint>(cloneOf.LocalEndPoints);
 			PathProbeInterval = cloneOf.PathProbeInterval;
 			PathDeadTimeout = cloneOf.PathDeadTimeout;
 			PathDisconnectDelay = cloneOf.PathDisconnectDelay;
@@ -815,12 +817,26 @@ namespace WTelegram
 					// Pick the alive path with the lowest EWMA round-trip latency.
 					// Paths with no samples yet (LatencyEwmaMs == long.MaxValue) are used as
 					// fallback if no measured paths are alive yet (e.g. right after startup).
+					// Child clients (media DCs) have no health monitor and thus no local latency
+					// data. They consult the parent's measurements for the same local interface
+					// so each transfer dynamically picks the current best path.
 					TransportPath bestPath = null;
 					long bestMs = long.MaxValue;
 					for (int i = 0; i < count; i++)
 					{
 						if (!_paths[i].IsAlive) continue;
 						long lat = Volatile.Read(ref _paths[i].LatencyEwmaMs);
+						if (lat == long.MaxValue && _parentClient != null)
+						{
+							// No local measurement — look up the parent's latency for this interface
+							lock (_parentClient._pathsLock)
+							{
+								var parentPath = _parentClient._paths.FirstOrDefault(p =>
+									p.IsAlive && p.LocalEndPoint?.Address.Equals(_paths[i].LocalEndPoint?.Address) == true);
+								if (parentPath != null)
+									lat = Volatile.Read(ref parentPath.LatencyEwmaMs);
+							}
+						}
 						if (bestPath == null || lat < bestMs)
 						{
 							bestPath = _paths[i];
@@ -1993,7 +2009,13 @@ namespace WTelegram
 					pathIdx++;
 				}
 				Helpers.Log(2, $"{dcId}>Multipath transport: {_paths.Count(p => p.IsAlive)}/{_paths.Count} paths alive.");
-				_ = PathHealthMonitor(_cts.Token);
+				// Only run the health monitor on the main client. Child clients (media DCs)
+				// are short-lived file transfer sessions where liveness probing interferes
+				// with uploads — Telegram delays Pong responses while processing file parts,
+				// inflating latency and causing false path kills. Child clients rely on the
+				// parent's latency data for path selection (see GetPrimaryAlivePath).
+				if (_parentClient == null)
+					_ = PathHealthMonitor(_cts.Token);
 			}
 		}
 
