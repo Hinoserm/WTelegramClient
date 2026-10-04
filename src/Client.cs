@@ -296,8 +296,9 @@ namespace WTelegram
 		/// so Telegram does not drop the connection the transfers are not currently using.</summary>
 		public int ChildPathKeepAlive { get; set; } = 20;
 
-		// msg_ids of hedged requests already answered: the server answers the other copy too, and that
-		// answer must not be raised a second time (OnOwnUpdates). Pruned after 5 minutes.
+		// msg_ids of requests already answered (or handed back to Invoke): a second answer, to a copy or
+		// re-delivered by the server on another connection under a new server msg_id, must not be raised
+		// again (OnOwnUpdates). Every request, not only copied ones. Pruned after 5 minutes.
 		private readonly ConcurrentDictionary<long, long> _settledHedged = new();
 		// container msg_id of each copy → msg_id of the request inside it, so a BadMsgNotification
 		// about a copy is not mistaken for one about the original. Pruned with _settledHedged.
@@ -1965,19 +1966,17 @@ namespace WTelegram
 			lock (_pendingRpcs) // pull + settle mark atomically: two reactors may get the two answers at once
 			{
 				if (_pendingRpcs.Remove(msgId, out rpc))
-				{
-					if (rpc.copyAttempted)
-						_settledHedged[msgId] = Environment.TickCount64;
-				}
+					_settledHedged[msgId] = Environment.TickCount64;
 				else
 					settledBefore = _settledHedged.ContainsKey(msgId);
 			}
+			PruneCopyState(); // at most every 10 s; this is the one path every client takes, single-path included
 			object result;
 			if (settledBefore)
 			{
-				// second answer to a request that had a copy on another path: already delivered once
+				// second answer (to a copy, or re-delivered on another connection): already delivered once
 				Interlocked.Increment(ref _statDupAnswers);
-				Helpers.Log(1, $"              → duplicate answer for copied #{(short)msgId.GetHashCode():X4} dropped");
+				Helpers.Log(1, $"              → second answer for #{(short)msgId.GetHashCode():X4} dropped (already answered)");
 				return new RpcResult { req_msg_id = msgId };
 			}
 			if (rpc != null)
