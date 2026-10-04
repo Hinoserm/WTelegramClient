@@ -307,12 +307,14 @@ namespace WTelegram
 		private readonly ConcurrentDictionary<long, TaskCompletionSource<bool>> _pingWaiters = new();
 		// msg_id of the frame (or container entry) being handled on this reactor, for Pong.msg_id.
 		private readonly AsyncLocal<long> _frameMsgId = new();
-		private const long CopyMaxAgeMs = 120_000; // a copy reuses the msg_id: keep it well inside the server's 300 s window
+		private const long CopyMaxAgeMs = 240_000; // a copy reuses the msg_id: keep it inside the server's 300 s window
 		private const int CopyAnswerTimeoutMs = 10_000; // a copy sent because its path died gets this long before we ask the server about it
-		private const int MaxStateChecks = 30; // ~5 min of "still processing" answers, then the caller gets a TimeoutException
+		private const int MaxStateChecks = 12; // ~2 min of "still processing" answers, then the caller gets a TimeoutException
+		// the server refuses client msg_ids older than 300 s: past this, a new msg_id can no longer race the old one
+		private const long ServerMsgIdWindowMs = 330_000;
 		// msg_id of each msgs_state_req we sent → the request it asks about
 		private readonly ConcurrentDictionary<long, Rpc> _stateChecks = new();
-		private const int MaxCopies = 5;
+		private const int MaxCopies = 8;
 		private long _pathGeneration; // source of TransportPath.Generation
 		private long _lastReactorReconnectTicks = -60_000; // single-path/all-dead reconnect: only repeats back off
 		// counters for the once-a-minute copy summary (LogCopyStats)
@@ -726,8 +728,16 @@ namespace WTelegram
 #pragma warning disable CA2016
 						if (sinceLast < 60_000)
 							await Task.Delay(5000);
+						try
+						{
+							await ConnectAsync(); // start a new reactor
+						}
+						catch (Exception) when (sinceLast >= 60_000)
+						{
+							await Task.Delay(5000); // the network may still be coming back: the old 5 s grace, once
+							await ConnectAsync();
+						}
 #pragma warning restore CA2016
-						await ConnectAsync(); // start a new reactor
 						// same session: re-send pending requests with their own msg_id (executed once);
 						// the rest get a ReactorError, which Invoke<T> retries with a new msg_id
 						await ResendPendingAfterReconnectAsync(reactorError);
@@ -1014,7 +1024,7 @@ namespace WTelegram
 					return; // answered meanwhile
 			if (Interlocked.CompareExchange(ref rpc.stateCheckInFlight, 1, 0) != 0)
 				return; // one question at a time (the sweep runs every second)
-			if (Interlocked.Increment(ref rpc.stateChecks) > MaxStateChecks)
+			if (Volatile.Read(ref rpc.stateChecks) >= MaxStateChecks)
 			{
 				FailPending(rpc, null, $"{why}; still unanswered after {MaxStateChecks} state checks", new TimeoutException($"Telegram did not answer {rpc.query?.GetType().Name.TrimEnd('_')} (msg_id {rpc.msgId}); not retried, it may have been executed"));
 				return;
@@ -1029,9 +1039,8 @@ namespace WTelegram
 					await sem.WaitAsync(_cts.Token);
 					try
 					{
-						reqId = await SendOnPathAsync(path, new MsgsStateReq { msg_ids = [rpc.msgId] });
-						if (reqId != 0)
-							_stateChecks[reqId] = rpc;
+						// registered before the write: the answer can arrive before SendOnPathAsync returns
+						reqId = await SendOnPathAsync(path, new MsgsStateReq { msg_ids = [rpc.msgId] }, beforeWrite: id => _stateChecks[id] = rpc);
 					}
 					finally
 					{
@@ -1046,11 +1055,15 @@ namespace WTelegram
 			}
 			if (reqId == 0)
 			{
+				foreach (var kvp in _stateChecks) // a write that failed after registering
+					if (kvp.Value == rpc)
+						_stateChecks.TryRemove(kvp.Key, out _);
 				Volatile.Write(ref rpc.stateCheckInFlight, 0);
-				if (Environment.TickCount64 - rpc.sentTicks > CopyMaxAgeMs)
+				if (Environment.TickCount64 - rpc.sentTicks > ServerMsgIdWindowMs) // the old msg_id can no longer run
 					FailForRetry(rpc, new IOException($"{why}; no path to ask the server"));
-				return; // young: the monitors' sweep or the reconnect handles it once a path is up
+				return; // otherwise: the monitors' sweep or the reconnect handles it once a path is up
 			}
+			Interlocked.Increment(ref rpc.stateChecks); // only questions actually asked count
 			Helpers.Log(2, $"{_dcSession.DcID}>{why}: asking Telegram about #{(short)rpc.msgId.GetHashCode():X4} {rpc.query?.GetType().Name.TrimEnd('_')}");
 			_ = StateCheckTimeoutAsync(reqId, rpc, why);
 		}
@@ -1067,36 +1080,43 @@ namespace WTelegram
 		}
 
 		/// <summary>The server's status byte for a pending request's msg_id (msgs_state_info): low bits 1 = unknown
-		/// (too old), 2/3 = certainly not received, 4 = received; +32 = being processed or done, +64 = answer
-		/// already generated. A new msg_id is used only when the server does not have (or forgot) the old one.</summary>
+		/// (too old), 2/3 = not received, 4 = received; +32 = being processed or done, +64 = answer already
+		/// generated. Every non-final outcome sends a copy (a duplicate msg_id never runs twice; for an answered
+		/// request it makes the server point us at the lost answer via msg_detailed_info) and asks again in 10 s.
+		/// A new msg_id only once the old one is past the server's acceptance window: "not received" is a
+		/// snapshot, and the original may still sit in a stalled connection's buffer.</summary>
 		private async Task OnMsgStateAsync(Rpc rpc, int state)
 		{
-			// stateCheckInFlight is still 1 here; it stays 1 through a re-check delay so the sweep does not re-ask
+			// stateCheckInFlight is still 1 here; RecheckLaterAsync holds it through its delay so the sweep does not re-ask
 			string query = rpc.query?.GetType().Name.TrimEnd('_');
+			bool pastWindow = Environment.TickCount64 - rpc.sentTicks > ServerMsgIdWindowMs;
 			switch (state & 7)
 			{
-				case 2 or 3: // never arrived: same msg_id again if still possible, else a new one is safe
-					Volatile.Write(ref rpc.stateCheckInFlight, 0);
-					Helpers.Log(2, $"{_dcSession.DcID}>Telegram never got #{(short)rpc.msgId.GetHashCode():X4} {query}; re-sending");
-					if (!await SendCopyAsync(rpc, -1, "not received", sole: true))
-						FailForRetry(rpc, new IOException("Telegram never received the request"));
-					break;
-				case 4 when (state & 64) != 0: // answered, but the answer never reached us: a copy makes the server
-					Helpers.Log(2, $"{_dcSession.DcID}>Telegram answered #{(short)rpc.msgId.GetHashCode():X4} {query} but the answer was lost; fetching it");
-					if (await SendCopyAsync(rpc, -1, "answer lost", sole: true)) // send msg_detailed_info → msg_resend_req
+				case 2 or 3:
+					Helpers.Log(2, $"{_dcSession.DcID}>Telegram has not got #{(short)rpc.msgId.GetHashCode():X4} {query}; re-sending it");
+					if (!await SendCopyAsync(rpc, -1, "not received", sole: false) && pastWindow)
+					{
 						Volatile.Write(ref rpc.stateCheckInFlight, 0);
-					else
-						_ = RecheckLaterAsync(rpc, "answer lost");
+						FailForRetry(rpc, new IOException("Telegram never received the request"));
+						return;
+					}
 					break;
-				case 4: // received, being processed (or queued): wait; never execute it twice
-					Helpers.Log(2, $"{_dcSession.DcID}>Telegram is still processing #{(short)rpc.msgId.GetHashCode():X4} {query}; waiting");
-					_ = RecheckLaterAsync(rpc, "still processing");
+				case 4:
+					Helpers.Log(2, (state & 64) != 0
+						? $"{_dcSession.DcID}>Telegram answered #{(short)rpc.msgId.GetHashCode():X4} {query} but the answer was lost; fetching it"
+						: $"{_dcSession.DcID}>Telegram is still processing #{(short)rpc.msgId.GetHashCode():X4} {query}; waiting");
+					if ((state & 64) != 0 || Volatile.Read(ref rpc.stateChecks) % 3 == 0) // processing: a copy now and then, not every time
+						await SendCopyAsync(rpc, -1, (state & 64) != 0 ? "answer lost" : "still processing", sole: false);
 					break;
-				default: // 1: too old for the server to know; nothing better is possible than a new msg_id
+				case 1 when pastWindow: // the server forgot it and can no longer accept the old msg_id
 					Volatile.Write(ref rpc.stateCheckInFlight, 0);
 					FailForRetry(rpc, new IOException($"Telegram no longer knows the request (state {state})"));
+					return;
+				default: // 1 inside the window, or an undefined value: ask again
+					Helpers.Log(2, $"{_dcSession.DcID}>Unexpected state {state} for #{(short)rpc.msgId.GetHashCode():X4} {query}; asking again");
 					break;
 			}
+			_ = RecheckLaterAsync(rpc, "re-check");
 		}
 
 		/// <summary>Asks again after a delay; holds the in-flight mark meanwhile.</summary>
@@ -1198,18 +1218,14 @@ namespace WTelegram
 						(stranded ??= []).Add(rpc);
 				if (stranded == null)
 					return;
-				int copied = 0, asked = 0;
+				int copied = 0;
 				foreach (var rpc in stranded)
 					if (await SendCopyAsync(rpc, -1, reason, sole: true))
 						copied++;
 					else if (Environment.TickCount64 - rpc.sentTicks > CopyMaxAgeMs || Volatile.Read(ref rpc.copies) >= MaxCopies)
-					{
-						if (Volatile.Read(ref rpc.stateCheckInFlight) == 0)
-							asked++;
-						await CheckStateOrRetryAsync(rpc, $"{reason}, cannot copy"); // never a blind new msg_id
-					}
-				if (copied + asked > 0)
-					Helpers.Log(2, $"{_dcSession.DcID}>{reason}: {copied} RPC(s) re-sent with their own msg_id, {asked} asked about, {stranded.Count - copied - asked} waiting for a path.");
+						_ = CheckStateOrRetryAsync(rpc, $"{reason}, cannot copy"); // never a blind new msg_id; single-flight, logs itself
+				if (copied > 0)
+					Helpers.Log(2, $"{_dcSession.DcID}>{reason}: {copied} of {stranded.Count} stranded RPC(s) re-sent with their own msg_id.");
 			}
 			catch (Exception e)
 			{
@@ -1246,10 +1262,10 @@ namespace WTelegram
 				else
 				{
 					retried++;
-					await CheckStateOrRetryAsync(rpc, "reconnected, cannot copy"); // never a blind new msg_id
+					_ = CheckStateOrRetryAsync(rpc, "reconnected, cannot copy"); // never a blind new msg_id
 				}
 			if (resent + retried > 0)
-				Helpers.Log(2, $"{_dcSession?.DcID}>After reconnect: {resent} RPC(s) re-sent with their own msg_id, {retried} not (asked about or retried).");
+				Helpers.Log(2, $"{_dcSession?.DcID}>After reconnect: {resent} RPC(s) re-sent with their own msg_id, {retried} retried or being asked about.");
 		}
 
 		/// <summary>Requests unanswered after <see cref="PathRpcStallTimeout"/> get one copy on another path
@@ -1822,12 +1838,14 @@ namespace WTelegram
 		/// Caller holds the send semaphore.</summary>
 		/// <param name="registering">The path is not alive yet: this is its registration ping</param>
 		/// <returns>The msg_id it was sent with, or 0 when the path cannot take it</returns>
-		private async Task<long> SendOnPathAsync(TransportPath path, IObject msg, bool registering = false)
+		/// <param name="beforeWrite">Called with the msg_id before the frame is written (to register for its answer)</param>
+		private async Task<long> SendOnPathAsync(TransportPath path, IObject msg, bool registering = false, Action<long> beforeWrite = null)
 		{
 			var stream = path.NetworkStream;
 			if ((!path.IsAlive && !registering) || stream == null || _dcSession.authKeyID == 0)
 				return 0;
 			var (msgId, seqno) = NewMsgId(false);
+			beforeWrite?.Invoke(msgId);
 			using var memStream = new MemoryStream(1024);
 			using var writer = new BinaryWriter(memStream);
 			writer.Write(0); // payload_len placeholder
@@ -2325,6 +2343,9 @@ namespace WTelegram
 						_ = OnMsgStateAsync(checkedRpc, stateInfo.info[0]);
 					else
 						_ = RecheckLaterAsync(checkedRpc, "empty state answer");
+					break;
+				case MsgsStateInfo: // late (its check timed out and was re-asked) or the reply to a msg_resend_req
+					Helpers.Log(1, $"{_dcSession.DcID}>Ignoring untracked msgs_state_info");
 					break;
 				case MsgDetailedInfo detailedInfo:
 					// The server already answered this msg_id (typically: a copy arrived after the original
