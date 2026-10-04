@@ -317,6 +317,8 @@ namespace WTelegram
 		private readonly ConcurrentDictionary<long, Rpc> _stateChecks = new();
 		private const int MaxCopies = 8;
 		private long _pathGeneration; // source of TransportPath.Generation
+		// copies and state checks never wait longer than this for the send semaphore (a reconnect holds it)
+		private static readonly TimeSpan SendLockWait = TimeSpan.FromSeconds(5);
 		private long _lastReactorReconnectTicks = -60_000; // single-path/all-dead reconnect: only repeats back off
 		// counters for the once-a-minute copy summary (LogCopyStats)
 		private long _statHedged, _statStalled, _statRescued, _statDupAnswers, _statDupFrames, _lastCopyStatsTicks;
@@ -963,7 +965,8 @@ namespace WTelegram
 			var sem = _sendSemaphore;
 			try
 			{
-				await sem.WaitAsync(_cts.Token);
+				if (!await sem.WaitAsync(SendLockWait, _cts.Token))
+					return false; // reconnecting (semaphore held or swapped): the caller's loop tries again
 				try
 				{
 					lock (_pendingRpcs)
@@ -972,7 +975,9 @@ namespace WTelegram
 					if (Environment.TickCount64 - rpc.sentTicks > CopyMaxAgeMs)
 						return false; // aged while waiting for the semaphore (the server would refuse it: BadMsg 16)
 					generation = path.Generation;
-					containerId = await SendOnPathAsync(path, new MsgContainer { messages = [new(rpc.msgId, rpc.seqno, rpc.query)] });
+					// registered before the write: a refusal (BadMsgNotification) can arrive before the write returns
+					containerId = await SendOnPathAsync(path, new MsgContainer { messages = [new(rpc.msgId, rpc.seqno, rpc.query)] },
+						beforeWrite: id => _copyContainers[id] = (rpc.msgId, Environment.TickCount64));
 				}
 				finally
 				{
@@ -990,7 +995,6 @@ namespace WTelegram
 			}
 			if (containerId == 0)
 				return false;
-			_copyContainers[containerId] = (rpc.msgId, Environment.TickCount64);
 			rpc.hedgedGen = generation;
 			rpc.hedgedPathIndex = path.PathIndex;
 			rpc.hedged = true;
@@ -1029,9 +1033,10 @@ namespace WTelegram
 				return; // one question at a time (the sweep runs every second)
 			if (Environment.TickCount64 - rpc.sentTicks > ServerMsgIdWindowMs)
 			{
-				// The old msg_id can no longer run. If the server never confirmed having it, a new one is safe;
-				// if it did, the request may have run: the caller gets an error, never a second execution.
-				if (rpc.serverHasIt)
+				// The old msg_id can no longer run. A new one is safe only for a request that never reached the
+				// wire (never written, never copied). Anything that may have reached the server (confirmed, or
+				// just written: its answer may be what got lost) gets an error, never a second execution.
+				if (rpc.serverHasIt || Volatile.Read(ref rpc.writtenTicks) != 0 || rpc.copyAttempted)
 					FailPending(rpc, null, $"{why}; received by Telegram but never answered", new TimeoutException($"Telegram did not answer {rpc.query?.GetType().Name.TrimEnd('_')} (msg_id {rpc.msgId}); not retried, it may have been executed"));
 				else
 					FailForRetry(rpc, new IOException($"{why}; Telegram never confirmed receiving it"));
@@ -1044,18 +1049,18 @@ namespace WTelegram
 				var sem = _sendSemaphore;
 				try
 				{
-					await sem.WaitAsync(_cts.Token);
-					try
-					{
-						generation = path.Generation;
-						Interlocked.Increment(ref rpc.stateChecks);
-						// registered before the write: the answer can arrive before SendOnPathAsync returns
-						reqId = await SendOnPathAsync(path, new MsgsStateReq { msg_ids = [rpc.msgId] }, beforeWrite: id => _stateChecks[id] = rpc);
-					}
-					finally
-					{
-						sem.Release();
-					}
+					if (await sem.WaitAsync(SendLockWait, _cts.Token)) // reconnecting otherwise: reqId stays 0, asked again in 10 s
+						try
+						{
+							generation = path.Generation;
+							Interlocked.Increment(ref rpc.stateChecks);
+							// registered before the write: the answer can arrive before SendOnPathAsync returns
+							reqId = await SendOnPathAsync(path, new MsgsStateReq { msg_ids = [rpc.msgId] }, beforeWrite: id => _stateChecks[id] = rpc);
+						}
+						finally
+						{
+							sem.Release();
+						}
 				}
 				catch (Exception ex)
 				{
@@ -1075,7 +1080,7 @@ namespace WTelegram
 				_ = RecheckLaterAsync(rpc, why); // keeps driving it (the age bound above ends the loop)
 				return;
 			}
-			Helpers.Log(2, $"{_dcSession.DcID}>{why}: asking Telegram about #{(short)rpc.msgId.GetHashCode():X4} {rpc.query?.GetType().Name.TrimEnd('_')}");
+			Helpers.Log(2, $"{_dcSession?.DcID}>{why}: asking Telegram about #{(short)rpc.msgId.GetHashCode():X4} {rpc.query?.GetType().Name.TrimEnd('_')}");
 			_ = StateCheckTimeoutAsync(reqId, rpc, why);
 		}
 
@@ -2479,6 +2484,8 @@ namespace WTelegram
 						foreach (var rpc in refused)
 							if (badMsgNotification.error_code == 48)
 								_ = ResendRefusedAsync(rpc, badMsgError); // msg_id is fine, only the salt was wrong
+							else if (badMsgNotification.error_code == 20 && rpc.copyAttempted)
+								_ = CheckStateOrRetryAsync(rpc, badMsgError.error_message); // "cannot verify": a copy may have run
 							else
 								FailPending(rpc, badMsgError, badMsgError.error_message); // msg_id itself refused: Invoke retries with a new one
 						RaiseUpdates(badMsgNotification);
