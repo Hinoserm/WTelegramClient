@@ -969,6 +969,8 @@ namespace WTelegram
 					lock (_pendingRpcs)
 						if (!_pendingRpcs.TryGetValue(rpc.msgId, out var current) || current != rpc)
 							return false; // answered meanwhile
+					if (Environment.TickCount64 - rpc.sentTicks > CopyMaxAgeMs)
+						return false; // aged while waiting for the semaphore (the server would refuse it: BadMsg 16)
 					generation = path.Generation;
 					containerId = await SendOnPathAsync(path, new MsgContainer { messages = [new(rpc.msgId, rpc.seqno, rpc.query)] });
 				}
@@ -1181,15 +1183,22 @@ namespace WTelegram
 				_pendingRpcs.TryGetValue(rpcMsgId, out rpc);
 			if (rpc == null)
 				return;
-			var error = new RpcError { error_code = -503, error_message = $"BadMsgNotification {errorCode}" };
-			if (errorCode == 20)
+			// Only the copy was refused; the original may well have run. Never a new msg_id from here:
+			// copy again if nothing else carries it, else (or if that fails) ask the server about it.
+			rpc.hedged = false;
+			if (errorCode == 20 || HasLiveCarrier(rpc))
 			{
-				FailPending(rpc, error, error.error_message);
+				if (errorCode == 20)
+					_ = CheckStateOrRetryAsync(rpc, $"copy refused ({errorCode})");
 				return;
 			}
-			rpc.hedged = false;
-			if (!HasLiveCarrier(rpc))
-				_ = ResendRefusedAsync(rpc, error);
+			_ = CopyOrCheckAsync(rpc, $"copy refused ({errorCode})");
+		}
+
+		private async Task CopyOrCheckAsync(Rpc rpc, string why)
+		{
+			if (!await SendCopyAsync(rpc, -1, why, sole: true))
+				await CheckStateOrRetryAsync(rpc, why);
 		}
 
 		/// <summary>If nothing answers a request within <paramref name="delayMs"/>, asks the server about it
@@ -1201,10 +1210,15 @@ namespace WTelegram
 		}
 
 		/// <summary>The server refused the message for its salt only: re-send it under the same msg_id
-		/// (a copy that got through already makes this a no-op server-side), else retry with a new one.</summary>
+		/// (a copy that got through already makes this a no-op server-side). If that is impossible: a new
+		/// msg_id only when no copy ever went out (the refused original never ran); otherwise ask the server.</summary>
 		private async Task ResendRefusedAsync(Rpc rpc, RpcError fallback)
 		{
-			if (!await SendCopyAsync(rpc, -1, fallback.error_message, sole: true))
+			if (await SendCopyAsync(rpc, -1, fallback.error_message, sole: true))
+				return;
+			if (rpc.copyAttempted)
+				await CheckStateOrRetryAsync(rpc, fallback.error_message);
+			else
 				FailPending(rpc, fallback, fallback.error_message);
 		}
 
