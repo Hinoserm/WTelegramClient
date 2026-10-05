@@ -249,12 +249,15 @@ namespace WTelegram
 		/// <summary>Info about the current logged-in user. This is only filled after a successful (re)login, not updated later</summary>
 		public User User { get; private set; }
 		/// <summary>Number of parallel transfers operations (uploads/downloads) allowed at the same time.</summary>
-		/// <remarks>Don't use this property while transfers are ongoing!</remarks>
+		/// <remarks>Don't use this property while transfers are ongoing! Lowering it waits until enough of the transfers
+		/// in progress have finished (holding back other setters meanwhile).</remarks>
 		public int ParallelTransfers
 		{
 			get => _parallelTransfers.CurrentCount;
 			set
 			{
+				// at least one: below that it would wait for permits that never exist, holding the setters' lock forever
+				ArgumentOutOfRangeException.ThrowIfLessThan(value, 1);
 				// one setter at a time (its own lock, never the connect lock: it may wait for a permit): two at once each
 				// read the same count and both took permits away, down to none - every transfer then waited forever
 				lock (_parallelTransfersSetLock)
@@ -267,7 +270,6 @@ namespace WTelegram
 				}
 			}
 		}
-		private readonly object _parallelTransfersSetLock = new();
 
 		private Func<string, string> _config;
 		private readonly Session _session;
@@ -294,6 +296,7 @@ namespace WTelegram
 		private const string ConnectionShutDown = "Could not read payload length : Connection shut down";
 		private const long Ticks5Secs = 5 * TimeSpan.TicksPerSecond;
 		private readonly SemaphoreSlim _parallelTransfers = new(2); // max parallel part uploads/downloads
+		private readonly object _parallelTransfersSetLock = new(); // ParallelTransfers' setter, one at a time
 		private readonly SHA256 _sha256 = SHA256.Create();
 		private readonly SHA256 _sha256Recv = SHA256.Create();
 #if OBFUSCATION
