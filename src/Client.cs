@@ -474,7 +474,9 @@ namespace WTelegram
 			foreach (var path in disposed)
 				path.DisposeQuietly(); // outside _pathsLock (it takes WriteChainLock); one failure never skips the rest
 			_networkStream = null;
-			if (IsMainDC)
+			// the session (and its file) belongs to the root client, whichever DC it ended up on (a client left on another DC
+			// by a failed connect is not IsMainDC, yet nobody else would release the file); alt-DC clones share it
+			if (_parentClient == null)
 				_session.Dispose();
 			GC.SuppressFinalize(this);
 		}
@@ -3286,7 +3288,7 @@ namespace WTelegram
 					}
 					catch (SocketException ex) // cannot connect to target endpoint, try to find an alternate
 					{
-						Helpers.Log(4, $"SocketException {ex.SocketErrorCode} ({ex.ErrorCode}): {ex.Message}");
+						Helpers.Log(4, $"SocketException {ex.SocketErrorCode}: {ex.Message}"); // (ErrorCode is the native errno: not shown)
 						if (_dcSession?.DataCenter == null)
 						throw;
 						var triedEndpoints = new HashSet<IPEndPoint> { endpoint };
@@ -3314,6 +3316,10 @@ namespace WTelegram
 							endpoint = GetDefaultEndpoint(out defaultDc); // re-ask callback for an address
 							if (!triedEndpoints.Add(endpoint))
 						throw;
+							// switched to the default address's DC session for this last try; restored if it fails too, so a
+							// later reconnect of this client starts again from its own DC (not stranded on the default's DC
+							// with DataCenter cleared, which skips every alternate and the migration)
+							var (ownSession, ownDataCenter) = (_dcSession, _dcSession.DataCenter);
 							needMigrate = _dcSession.DataCenter.id == _session.MainDC && defaultDc != _session.MainDC;
 							_dcSession.Client = null;
 							// is it address for a known DCSession?
@@ -3322,10 +3328,21 @@ namespace WTelegram
 							if (defaultDc != 0)
 						_dcSession ??= _session.DCSessions.GetValueOrDefault(defaultDc);
 							_dcSession ??= new();
+							var (defaultSession, defaultDataCenter, defaultClient) = (_dcSession, _dcSession.DataCenter, _dcSession.Client);
 							_dcSession.Client = this;
 							_dcSession.DataCenter = null;
 							Helpers.Log(2, $"Connecting to {endpoint}...");
-							tcpClient = await PrimaryConnectAsync(endpoint);
+							try
+							{
+								tcpClient = await PrimaryConnectAsync(endpoint);
+							}
+							catch
+							{
+								(defaultSession.DataCenter, defaultSession.Client) = (defaultDataCenter, defaultClient); // as it was (another DC's client, if any, keeps it)
+								(_dcSession, ownSession.DataCenter, ownSession.Client) = (ownSession, ownDataCenter, this);
+								needMigrate = false;
+								throw;
+							}
 						}
 					}
 
@@ -3350,8 +3367,6 @@ namespace WTelegram
 				TransportPath primaryPath = null;
 				try
 				{
-					// logged here, where tcpClient is already owned (the catch below disposes it)
-					Helpers.Log(2, $"Primary connected to {endpoint}{(localEPs?.Count > 0 ? $" via {localEPs[primaryEPIndex].Address}" : "")}.");
 					ConfigureKeepalive(tcpClient);
 					// built with nothing that can throw, then given its parts one by one: once it exists it owns whatever
 					// it holds, so a failure below disposes exactly that (DisposeQuietly in the catch)
@@ -3389,7 +3404,7 @@ namespace WTelegram
 				primaryPath.LastRecvTicks = primaryPath.ConnectedSinceTicks;
 				lock (_pathsLock)
 					_paths.Add(primaryPath);
-				Helpers.Log(2, $"{dcId}>Path 0 connected{(localEPs != null ? $" from {localEPs[primaryEPIndex].Address}" : "")}.");
+				Helpers.Log(2, $"{dcId}>Path 0 connected to {endpoint}{(localEPs != null ? $" from {localEPs[primaryEPIndex].Address}" : "")}.");
 				RaisePathChanged(primaryPath);
 			}
 
