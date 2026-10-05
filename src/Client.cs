@@ -453,18 +453,24 @@ namespace WTelegram
 			{
 				aborted = [.. _pendingRpcs.Values];
 				foreach (var rpc in aborted)
-					rpc.tcs.TrySetException(ex); // no reactor runs after ResetAsync: no late answer to mark
+				{
+					rpc.tcs.TrySetException(ex);
+					// ResetAsync waits only 1 s per reactor: one may still deliver a late answer, dropped as a second one
+					_settledHedged[rpc.msgId] = Environment.TickCount64;
+				}
 				_pendingRpcs.Clear();
 			}
 			foreach (var rpc in aborted)
 				SettledTransfer(rpc);
 			_sendSemaphore.Dispose();
 			_httpClient?.Dispose();
+			TransportPath[] disposed;
 			lock (_pathsLock)
 			{
-				foreach (var path in _paths) path.Dispose();
+				disposed = [.. _paths];
 				_paths.Clear();
 			}
+			foreach (var path in disposed) path.Dispose(); // outside _pathsLock (it takes WriteChainLock)
 			_networkStream = null;
 			if (IsMainDC)
 				_session.Dispose();
@@ -534,14 +540,15 @@ namespace WTelegram
 			}
 			catch { }
 			_reactorTask = resetSessions ? null : Task.CompletedTask;
-			// Dispose all paths
+			// Dispose all paths: dropped under _pathsLock, disposed outside it (TransportPath.Dispose takes WriteChainLock)
 			lock (_pathsLock)
 			{
-				foreach (var path in _paths) path.Dispose();
+				pathsCopy = [.. _paths];
 				_paths.Clear();
 				_primaryPathIndex = 0;
 				_fullReconnectStarted = false;
 			}
+			foreach (var path in pathsCopy) path.Dispose();
 			_pendingPings.Clear();
 			_networkStream?.Close();
 			_tcpClient?.Dispose();
@@ -658,6 +665,7 @@ namespace WTelegram
 			var data = new byte[MinBufferSize];
 			var sha256Recv = path?.Sha256Recv ?? _sha256Recv;
 			var paddedMode = path?.PaddedMode ?? _paddedMode;
+			long generation = path != null ? Interlocked.Read(ref path.Generation) : 0; // the connection this reactor reads
 #if OBFUSCATION
 			var recvCtr = path?.RecvCtr ?? _recvCtr;
 #endif
@@ -684,7 +692,8 @@ namespace WTelegram
 					recvCtr.EncryptDecrypt(data.AsSpan(0, payloadLen));
 #endif
 					obj = ReadFrame(data, payloadLen, sha256Recv, paddedMode, path?.PathIndex ?? -1);
-					if (path != null && !ct.IsCancellationRequested) // a torn-down connection's last frame is not the new one's traffic
+					// a torn-down connection's last frame is not the new one's traffic (Generation is set before its reactor starts)
+					if (path != null && Interlocked.Read(ref path.Generation) == generation)
 					{
 						path.LastRecvTicks = Environment.TickCount64;
 						Interlocked.Add(ref path.BytesRecv, 4 + payloadLen);
@@ -1799,18 +1808,26 @@ namespace WTelegram
 #endif
 						await networkStream.WriteAsync(preamble, 0, preamble.Length);
 
+						// everything that can fail is built before the publish below, which only assigns
+						var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(_cts?.Token ?? throw new OperationCanceledException());
+						var (sha256Send, sha256Recv) = (SHA256.Create(), SHA256.Create());
 						lock (_pathsLock) // a full reset may have dropped this path while we were connecting
 						{
 							if (!_paths.Contains(path))
+							{
+								linkedCts.Dispose();
+								sha256Send.Dispose();
+								sha256Recv.Dispose();
 								return;
+							}
 #if OBFUSCATION
 							(path.SendCtr, path.RecvCtr) = (sendCtr, recvCtr);
 #endif
 							path.TcpClient = tcpClient;
 							path.NetworkStream = networkStream;
-							path.Sha256Send = SHA256.Create();
-							path.Sha256Recv = SHA256.Create();
-							path.Cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+							path.Sha256Send = sha256Send;
+							path.Sha256Recv = sha256Recv;
+							path.Cts = linkedCts;
 							path.Generation = Interlocked.Increment(ref _pathGeneration);
 							published = true; // the path owns them now: the next teardown disposes them
 						}
@@ -2144,15 +2161,6 @@ namespace WTelegram
 			tcp.Client.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 3);
 		}
 
-		/// <summary>Queue a raw message directly on a specific transport path (bypassing primary path selection).
-		/// Caller holds the send semaphore, and awaits <paramref name="written"/> only after releasing it.</summary>
-		/// <param name="path">The path to queue it on</param>
-		/// <param name="msg">The message (a service message: no seqno content bit)</param>
-		/// <param name="written">Completes once the frame is written; fails only with an IOException</param>
-		/// <param name="registering">The path is not alive yet: this is its registration ping</param>
-		/// <param name="beforeWrite">Called with the msg_id and the generation of the connection it goes out on, right before
-		/// the frame is queued, after everything that can fail (to register for its answer)</param>
-		/// <returns>The msg_id it was sent with, or 0 when the path cannot take it (<paramref name="written"/> is then complete)</returns>
 		/// <summary>msg_key and encrypted payload of a frame. A path's hash is disposed by its teardown, possibly under a
 		/// sender holding the old connection's snapshot: that is a lost connection (IOException, retried), not a crash</summary>
 		private (byte[] msgKeyLarge, byte[] encrypted) EncryptFrame(TransportPath path, SHA256 sha256Send, byte[] clearBuffer, int clearLength, int padding, int msgKeyOffset)
@@ -2168,6 +2176,15 @@ namespace WTelegram
 			}
 		}
 
+		/// <summary>Queue a raw message directly on a specific transport path (bypassing primary path selection).
+		/// Caller holds the send semaphore, and awaits <paramref name="written"/> only after releasing it.</summary>
+		/// <param name="path">The path to queue it on</param>
+		/// <param name="msg">The message (a service message: no seqno content bit)</param>
+		/// <param name="written">Completes once the frame is written; fails only with an IOException</param>
+		/// <param name="registering">The path is not alive yet: this is its registration ping</param>
+		/// <param name="beforeWrite">Called with the msg_id and the generation of the connection it goes out on, right before
+		/// the frame is queued, after everything that can fail (to register for its answer)</param>
+		/// <returns>The msg_id it was sent with, or 0 when the path cannot take it (<paramref name="written"/> is then complete)</returns>
 		private long QueueOnPath(TransportPath path, IObject msg, out Task written, bool registering = false, Action<long, long> beforeWrite = null)
 		{
 			written = Task.CompletedTask;
@@ -2705,12 +2722,15 @@ namespace WTelegram
 			public long FailedGeneration; // the connection a failed write was already acted on for (under _pathsLock)
 			public long LastProbeWrittenTicks; // when the last liveness probe was actually written (not just queued)
 
+			/// <summary>Never under _pathsLock: the send cipher is disposed under WriteChainLock, which nests _pathsLock
+			/// (QueueFrameWrite), so never under an encryption in progress</summary>
 			public void Dispose()
 			{
-				Sha256Send?.Dispose();
+				Sha256Send?.Dispose(); // a sender building a frame with it gets an IOException (EncryptFrame)
 				Sha256Recv?.Dispose();
 #if OBFUSCATION
-				SendCtr?.Dispose();
+				lock (WriteChainLock)
+					SendCtr?.Dispose();
 				RecvCtr?.Dispose();
 #endif
 				NetworkStream?.Close();
@@ -4025,9 +4045,7 @@ namespace WTelegram
 						Volatile.Write(ref queued.queuedTicks, queuedAt);
 						MarkTransferQueued(queued, queuedAt);
 					}
-					pathWrite = pathStream != null
-						? QueueFrameWrite(path, pathStream, buffer, frameLength)
-						: Task.FromException(new IOException($"Path {path.PathIndex} has no connection"));
+					pathWrite = QueueFrameWrite(path, pathStream, buffer, frameLength); // pathStream: checked non-null above
 				}
 				else if (_paths.Count > 0)
 				{
