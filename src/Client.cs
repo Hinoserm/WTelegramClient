@@ -3327,11 +3327,16 @@ namespace WTelegram
 					// only through the address that just failed); with one or none, as it always was
 					async Task<TcpClient> FallbackConnectAsync(IPEndPoint alternate)
 					{
+						// an address of a family the local addresses cannot reach (an IPv6 DC option from IPv4 local
+						// addresses: binding them throws NotSupportedException): unreachable from here, like any other
+						if (localEPs?.Count > 0 && !localEPs.Any(ep => ep.AddressFamily == alternate.AddressFamily))
+							throw new SocketException((int)SocketError.AddressFamilyNotSupported);
 						if (localEPs is not { Count: > 1 })
 							return await TcpHandler(alternate.Address.ToString(), alternate.Port, localEPs?[primaryEPIndex]);
-						var (client, epIdx) = await RaceConnectAsync(alternate, localEPs);
-						primaryEPIndex = epIdx;
-						_lastConnectedEPIndex = epIdx;
+						var usable = Enumerable.Range(0, localEPs.Count).Where(i => localEPs[i].AddressFamily == alternate.AddressFamily).ToList();
+						var (client, k) = await RaceConnectAsync(alternate, usable.Select(i => localEPs[i]).ToList());
+						primaryEPIndex = usable[k]; // its index among all the local addresses
+						_lastConnectedEPIndex = primaryEPIndex;
 						return client;
 					}
 				}
