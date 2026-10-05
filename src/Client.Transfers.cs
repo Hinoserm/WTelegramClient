@@ -60,6 +60,7 @@ namespace WTelegram
 			internal int released;
 			internal WanStats CopyWan; // a copy of this part counted in that WAN's InFlight (one at most), until released
 			internal Rpc CopyOwner; // the attempt (request) whose copy that is
+			internal int Attempts; // attempts (requests) made for this part so far: Rpc.transferAttempt
 			internal long QueuedTicks; // when its part's current attempt was queued on a path (0: not yet); Volatile
 		}
 
@@ -213,14 +214,29 @@ namespace WTelegram
 
 		/// <summary>A file part's request was answered, given up on, or forgotten (called after its removal from the pending
 		/// requests): its copy load goes. The version is bumped after the removal, so any sync that reads this version also
-		/// reads the request as settled, and a sync that still read it as pending has an older version and is dropped.</summary>
+		/// reads the request as settled, and a sync that still read it as pending has an older version and is dropped.
+		/// Called after the request's answer or error is delivered, and never throws: bookkeeping must not keep a caller
+		/// from its result.</summary>
 		private void SettledTransfer(Rpc rpc)
 		{
-			if (rpc.transferDir < 0 || rpc.lease == null)
-				return;
+			if (rpc.transferDir < 0 || rpc.lease == null || !rpc.copyAttempted)
+				return; // not a file part, or never copied (copyAttempted is set before any copy exists): no copy load
 			lock (rpc)
 				rpc.copySyncVersion++;
-			SyncTransferCopy(rpc);
+			SyncTransferCopySafe(rpc);
+		}
+
+		/// <summary><see cref="SyncTransferCopy"/>, logging instead of throwing (bookkeeping on the reactor and send paths).</summary>
+		private void SyncTransferCopySafe(Rpc rpc)
+		{
+			try
+			{
+				SyncTransferCopy(rpc);
+			}
+			catch (Exception ex)
+			{
+				Helpers.Log(3, $"{_dcSession?.DcID}>Transfer copy load of #{(short)rpc.msgId.GetHashCode():X4}: {ex.Message}");
+			}
 		}
 
 		/// <summary>A file part's copy load, made to match its request's live copies (after any change to them, or its
@@ -259,7 +275,7 @@ namespace WTelegram
 						UncountTransferCopyLocked(lease);
 					return;
 				}
-				if (!mine && lease.CopyOwner is Rpc other && other.msgId > rpc.msgId && !other.tcs.Task.IsCompleted)
+				if (!mine && lease.CopyOwner is Rpc other && other.transferAttempt > rpc.transferAttempt && !other.tcs.Task.IsCompleted)
 					return; // a newer attempt's copy holds the count (a settled one's does not)
 				if (lease.CopyWan == w && mine)
 					return;
