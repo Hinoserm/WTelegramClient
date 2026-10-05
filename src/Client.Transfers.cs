@@ -281,9 +281,10 @@ namespace WTelegram
 			double fastMs = (otherInFlight + 1) * rpc.transferBytes * 1000.0 / bestOther;
 			if (ownBps <= 0) // its own WAN not measured: by age alone
 				return age > 3 * fastMs;
-			// copy when the fast WAN would finish it well before its own WAN gets through the parts ahead of it and it
-			double ownRemainingMs = (ahead + 1) * rpc.transferBytes * 1000.0 / ownBps - age;
-			return ownRemainingMs > 2 * fastMs + 250;
+			// copy when it is overdue on its own WAN (the measured speed can read high on a lossy link), or when the fast
+			// WAN would finish it well before its own WAN gets through the parts ahead of it and it
+			double ownExpectedMs = (ahead + 1) * rpc.transferBytes * 1000.0 / ownBps;
+			return age > 3 * fastMs && (age > ownExpectedMs * 1.25 || ownExpectedMs - age > 2 * fastMs + 250);
 		}
 
 		/// <summary>FLOOD_WAIT_X / FLOOD_PREMIUM_WAIT_X (error 420) on a file part.</summary>
@@ -318,13 +319,21 @@ namespace WTelegram
 			AddTransferSample(carrier, dir, bytes, Volatile.Read(ref rpc.writtenTicks), done: true);
 		}
 
-		/// <summary>A file part being copied because its WAN is slow: if it was already written (not still queued behind
-		/// the WAN's earlier parts, which would count queueing as slowness), an upper bound of that WAN's speed (bytes /
-		/// time since written), so the scheduler learns it even though no answer will say so.</summary>
+		/// <summary>A file part being copied because its WAN is slow: an upper bound of that WAN's speed, so the scheduler
+		/// learns it even though no answer will say so. Since it was queued, the WAN has moved at most this part and the
+		/// ones handed out before it (it may still be waiting behind them): those bytes over that time, so queueing is
+		/// not counted as slowness. (Not from the write: on a slow uplink even the first part's write takes seconds.)</summary>
 		private void RecordSlowTransfer(Rpc rpc)
 		{
-			if (rpc.transferDir >= 0 && rpc.transferBytes >= MinSampleBytes && Volatile.Read(ref rpc.writtenTicks) > 0)
-				AddTransferSample(rpc.sentPathIndex, rpc.transferDir, rpc.transferBytes, Volatile.Read(ref rpc.writtenTicks), done: false);
+			if (rpc.transferDir < 0 || rpc.transferBytes < MinSampleBytes || Volatile.Read(ref rpc.queuedTicks) <= 0)
+				return;
+			int ahead = 0;
+			if (rpc.lease is TransferLease lease)
+				lock (RootClient._transferLock)
+					foreach (var l in lease.Wan.Active[rpc.transferDir])
+						if (l.StartTicks < lease.StartTicks)
+							ahead++;
+			AddTransferSample(rpc.sentPathIndex, rpc.transferDir, (ahead + 1) * rpc.transferBytes, Volatile.Read(ref rpc.queuedTicks), done: false);
 		}
 
 		/// <param name="done">An answered part: its time runs from its write, or from the WAN's previous answer if that
