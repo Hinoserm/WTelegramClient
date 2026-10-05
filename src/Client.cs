@@ -3317,7 +3317,8 @@ namespace WTelegram
 							needMigrate = _dcSession.DataCenter.id == _session.MainDC && defaultDc != _session.MainDC;
 							_dcSession.Client = null;
 							// is it address for a known DCSession?
-							_dcSession = _session.DCSessions.Values.FirstOrDefault(dcs => dcs.EndPoint.Equals(endpoint));
+							// (a DC session never connected has no EndPoint: compared from our side, never dereferenced)
+							_dcSession = _session.DCSessions.Values.FirstOrDefault(dcs => endpoint.Equals(dcs.EndPoint));
 							if (defaultDc != 0)
 						_dcSession ??= _session.DCSessions.GetValueOrDefault(defaultDc);
 							_dcSession ??= new();
