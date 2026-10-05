@@ -491,7 +491,7 @@ namespace WTelegram
 		{
 			Helpers.Log(2, $"{_dcSession.DcID}>Disposing the client");
 			await ResetAsync(false, root).ConfigureAwait(false);
-			var ex = new ObjectDisposedException("WTelegram.Client was disposed");
+			var ex = new ObjectDisposedException(nameof(Client), "WTelegram.Client was disposed");
 			Rpc[] aborted;
 			lock (_pendingRpcs) // abort all pending requests
 			{
@@ -536,9 +536,11 @@ namespace WTelegram
 					throw new InvalidOperationException("Cannot switch to HTTP while connecting");
 				_httpClient = httpClient ?? new();
 				_httpWait = defaultHttpWait;
-				ParallelTransfers = 1;
-				TransferMode = PathTransferMode.FollowSendMode; // one part at a time, as HTTP needs
 			}
+			// after the lock: the ParallelTransfers setter may wait for a permit, never while holding the connect lock
+			// (a connect starting meanwhile already sees _httpClient: HTTP mode)
+			ParallelTransfers = 1;
+			TransferMode = PathTransferMode.FollowSendMode; // one part at a time, as HTTP needs
 		}
 		/// <summary>DoConnectAsync runs under way (counted from its start under ConnectAsync's lock to its end)</summary>
 		private int _connectsInFlight;
@@ -2261,7 +2263,7 @@ namespace WTelegram
 
 					await Task.Delay(Math.Max(1000, Math.Min(attempt * 2000, PathReconnectMaxBackoff * 1000))); // backoff: 2s, 4s, 6s, ... up to 30s (min 1s)
 					if (_disposed) // disposed meanwhile: ends the loop (caught below)
-						throw new ObjectDisposedException("WTelegram.Client was disposed");
+						throw new ObjectDisposedException(nameof(Client), "WTelegram.Client was disposed");
 					await ConnectAsync();
 
 					// Success — same session, so pending RPCs are re-sent with their own msg_id
@@ -3401,13 +3403,13 @@ namespace WTelegram
 			// Checked again once the new token source exists: DisposeAsync sets _disposed before it cancels _cts, so a
 			// dispose either is seen here or cancels this source.
 			if (_disposed)
-				throw new ObjectDisposedException("WTelegram.Client was disposed");
+				throw new ObjectDisposedException(nameof(Client), "WTelegram.Client was disposed");
 			var cts = new CancellationTokenSource();
 			Interlocked.Exchange(ref _cts, cts); // a full fence: the _disposed read below is not reordered before this store
 			if (_disposed)
 			{
 				cts.Cancel();
-				throw new ObjectDisposedException("WTelegram.Client was disposed");
+				throw new ObjectDisposedException(nameof(Client), "WTelegram.Client was disposed");
 			}
 			IPEndPoint endpoint = null;
 			bool needMigrate = false;
