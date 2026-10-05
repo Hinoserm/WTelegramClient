@@ -316,7 +316,7 @@ namespace WTelegram
 		}
 
 		/// <summary>A file part being copied because its WAN is slow: if it is that WAN's oldest part in flight, its size over
-		/// the time since it was queued is a ceiling of the WAN's speed, which only ever lowers an existing estimate (see
+		/// the time since it was queued is a ceiling of the WAN's speed, which only ever lowers the estimate (see
 		/// AddTransferSample), so the scheduler learns the WAN is slow even though no answer will say so. (Not from the
 		/// write: on a slow uplink even the first part's write takes seconds.)</summary>
 		private void RecordSlowTransfer(Rpc rpc)
@@ -351,8 +351,10 @@ namespace WTelegram
 				if (done)
 					w.LastAckTicks[dir] = now;
 				sample = bytes * 1000.0 / Math.Max(1, now - from);
-				// a bound taken mid-way is a ceiling: it can only lower an estimate, never raise one or be the first
-				if (!done && (w.Samples[dir] == 0 || sample >= w.Bps[dir]))
+				// a bound taken mid-way is a ceiling: it can only lower an estimate, never raise one. It may be the first:
+				// a WAN whose parts are always rescued gives no other sample (copied parts are ambiguous), and unmeasured
+				// it would count as fast and keep getting parts (tested: 68 rescues a minute, sends 4x slower)
+				if (!done && w.Samples[dir] > 0 && sample >= w.Bps[dir])
 					return;
 				// a slowdown counts at once, a recovery gradually: a WAN that just got slow must not keep taking parts
 				double weight = sample < w.Bps[dir] ? SlowSampleWeight : SampleWeight;
