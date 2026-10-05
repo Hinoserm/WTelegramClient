@@ -1003,14 +1003,15 @@ namespace WTelegram
 					containerId = QueueOnPath(path, new MsgContainer { messages = [new(rpc.msgId, rpc.seqno, rpc.query)] },
 						out written, beforeWrite: id => _copyContainers[id] = (rpc.msgId, Environment.TickCount64));
 					if (containerId != 0)
-					{
-						// it carries the request from now on (queued in order on its path); counted at once, so a
-						// concurrent caller cannot send another copy while this one waits to be written
-						rpc.hedgedGen = generation;
-						rpc.hedgedPathIndex = path.PathIndex;
-						rpc.hedged = true;
-						Interlocked.Increment(ref rpc.copies);
-					}
+						lock (rpc) // with CopyWrittenAsync's rollback
+						{
+							// it carries the request from now on (queued in order on its path); counted at once, so a
+							// concurrent caller cannot send another copy while this one waits to be written
+							rpc.hedgedGen = generation;
+							rpc.hedgedPathIndex = path.PathIndex;
+							rpc.hedged = true;
+							Interlocked.Increment(ref rpc.copies);
+						}
 				}
 				finally
 				{
@@ -1025,7 +1026,34 @@ namespace WTelegram
 			if (containerId == 0)
 				return false;
 			// not awaited: the callers include the path monitors, which serve every path and must not wait on a slow one
-			_ = CopyWrittenAsync(written, rpc, path, generation, reason);
+			_ = CopyWrittenAsync(written, rpc, path, generation, reason, sole, avoidIndex);
+			return true;
+		}
+
+		/// <summary>Once a copy is written: counted, logged, and (a copy that is now the only carrier) watched for its answer
+		/// from then on, not from its queuing. If its write failed it carries nothing: the request is open to another copy
+		/// (its budget slot back), and the connection (its CTR state past a partial frame) is closed for its reactor to
+		/// reconnect, unless a newer connection was swapped in meanwhile.</summary>
+		private async Task CopyWrittenAsync(Task written, Rpc rpc, TransportPath path, long generation, string reason, bool sole, int avoidIndex)
+		{
+			try
+			{
+				await written;
+			}
+			catch (Exception ex)
+			{
+				Helpers.Log(2, $"{_dcSession?.DcID}>{reason}: copy of #{(short)rpc.msgId.GetHashCode():X4} on P{path.PathIndex} failed: {ex.Message}");
+				lock (rpc)
+					if (rpc.hedged && rpc.hedgedPathIndex == path.PathIndex && rpc.hedgedGen == generation)
+					{
+						rpc.hedged = false;
+						Interlocked.Decrement(ref rpc.copies);
+					}
+				lock (_pathsLock)
+					if (path.Generation == generation)
+						path.NetworkStream?.Close();
+				return;
+			}
 			if (sole)
 				Interlocked.Increment(ref _statRescued);
 			else if (reason == "Hedge")
@@ -1035,27 +1063,6 @@ namespace WTelegram
 			Helpers.Log(sole ? 2 : 1, $"{_dcSession.DcID}>{reason}: copied #{(short)rpc.msgId.GetHashCode():X4} {rpc.query.GetType().Name.TrimEnd('_')} to P{path.PathIndex}{(avoidIndex >= 0 ? $" (was P{avoidIndex})" : "")}");
 			if (sole)
 				_ = CopyAnswerWatchdog(rpc, Interlocked.Increment(ref rpc.soleCopies));
-			return true;
-		}
-
-		/// <summary>A copy's write failed: it carries nothing, so the request is open to another copy again, and the
-		/// connection (its CTR state past a partial frame) is closed for its reactor to reconnect, unless a newer
-		/// connection was swapped in meanwhile.</summary>
-		private async Task CopyWrittenAsync(Task written, Rpc rpc, TransportPath path, long generation, string reason)
-		{
-			try
-			{
-				await written;
-			}
-			catch (Exception ex)
-			{
-				Helpers.Log(2, $"{_dcSession?.DcID}>{reason}: copy of #{(short)rpc.msgId.GetHashCode():X4} on P{path.PathIndex} failed: {ex.Message}");
-				if (rpc.hedgedPathIndex == path.PathIndex && rpc.hedgedGen == generation)
-					rpc.hedged = false;
-				lock (_pathsLock)
-					if (path.Generation == generation)
-						path.NetworkStream?.Close();
-			}
 		}
 
 		/// <summary>A copy that replaced a lost original gets <see cref="CopyAnswerTimeoutMs"/> to be answered,
@@ -3867,7 +3874,10 @@ namespace WTelegram
 		{
 			lock (_pendingRpcs)
 				if (_pendingRpcs.TryGetValue(rpc.msgId, out var current) && current == rpc)
+				{
 					_pendingRpcs.Remove(rpc.msgId);
+					_settledHedged[rpc.msgId] = Environment.TickCount64; // a copy already out may still be answered: dropped
+				}
 		}
 
 		/// <summary>Main client with several paths: every request also goes out on the next best path at once

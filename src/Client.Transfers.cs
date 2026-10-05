@@ -56,6 +56,7 @@ namespace WTelegram
 			internal WanStats Wan;
 			internal long StallExtraMs;
 			internal long StartTicks; // when it was handed out
+			internal long Seq; // hand-out order (StartTicks can tie within a millisecond)
 			internal int Bytes;
 			internal int released;
 		}
@@ -85,6 +86,7 @@ namespace WTelegram
 		private readonly object _transferLock = new();
 		private TaskCompletionSource<bool> _transferPulse = new(TaskCreationOptions.RunContinuationsAsynchronously);
 		private long _lastTransferStatsTicks;
+		private long _transferSeq; // source of TransferLease.Seq (on the main client, under _transferLock)
 
 		private Client RootClient => _parentClient?.RootClient ?? this;
 		private static IPAddress WanKey(TransportPath path) => path?.LocalEndPoint?.Address ?? IPAddress.None;
@@ -168,7 +170,8 @@ namespace WTelegram
 							{
 								best.Wan.InFlight[dir]++;
 								var lease = new TransferLease { Client = client, PathIndex = best.Path.PathIndex, Dir = dir, Wan = best.Wan,
-									StallExtraMs = (long)Math.Min(2 * bestEta, 120_000), StartTicks = now, Bytes = bytes };
+									StallExtraMs = (long)Math.Min(2 * bestEta, 120_000), StartTicks = now, Bytes = bytes,
+									Seq = ++root._transferSeq };
 								best.Wan.Active[dir].Add(lease);
 								return lease;
 							}
@@ -260,7 +263,7 @@ namespace WTelegram
 				ownBps = ownWan.Bps[dir];
 				if (rpc.lease is TransferLease lease) // parts of its WAN handed out before it: it waits behind them
 					foreach (var l in ownWan.Active[dir])
-						if (l.StartTicks < lease.StartTicks)
+						if (l.Seq < lease.Seq)
 							ahead++;
 				foreach (var p in paths)
 					if (p != own && Wan(WanKey(p)) is var w && w != ownWan && w.FloodUntilTicks[dir] <= now)
@@ -331,7 +334,7 @@ namespace WTelegram
 			if (rpc.lease is TransferLease lease)
 				lock (RootClient._transferLock)
 					foreach (var l in lease.Wan.Active[rpc.transferDir])
-						if (l.StartTicks < lease.StartTicks)
+						if (l.Seq < lease.Seq)
 							ahead++;
 			AddTransferSample(rpc.sentPathIndex, rpc.transferDir, (ahead + 1) * rpc.transferBytes, Volatile.Read(ref rpc.queuedTicks), done: false);
 		}
@@ -357,6 +360,9 @@ namespace WTelegram
 				if (done)
 					w.LastAckTicks[dir] = now;
 				sample = bytes * 1000.0 / Math.Max(1, now - from);
+				// a bound taken mid-way is a ceiling: it can only lower the estimate, never raise it
+				if (!done && w.Bps[dir] > 0 && sample >= w.Bps[dir])
+					return;
 				// a slowdown counts at once, a recovery gradually: a WAN that just got slow must not keep taking parts
 				double weight = sample < w.Bps[dir] ? SlowSampleWeight : SampleWeight;
 				w.Bps[dir] = w.Samples[dir] == 0 ? sample : w.Bps[dir] * (1 - weight) + sample * weight;
