@@ -250,14 +250,24 @@ namespace WTelegram
 			var root = RootClient;
 			int dir = rpc.transferDir;
 			double ownBps, bestOther = 0;
+			bool otherUnmeasured = false;
 			lock (root._transferLock)
 			{
 				ownBps = Wan(WanKey(own)).Bps[dir];
 				foreach (var p in paths)
 					if (p != own && Wan(WanKey(p)) is var w && w != Wan(WanKey(own)) && w.FloodUntilTicks[dir] <= now)
+					{
 						bestOther = Math.Max(bestOther, w.Bps[dir]);
+						otherUnmeasured |= w.Bps[dir] <= 0;
+					}
 			}
-			if (bestOther <= 0 || (ownBps > 0 && ownBps >= bestOther * RescueRatio))
+			// another WAN not measured yet (just connected, e.g. right after a start) counts as fast, as in the
+			// scheduler; with nothing measured at all, a part 2 s old is copied
+			if (otherUnmeasured && ownBps > 0)
+				bestOther = Math.Max(bestOther, ownBps * 2);
+			if (bestOther <= 0)
+				return otherUnmeasured && age > 2000;
+			if (ownBps > 0 && ownBps >= bestOther * RescueRatio)
 				return false;
 			return age > 3 * (rpc.transferBytes * 1000.0 / bestOther);
 		}
