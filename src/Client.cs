@@ -1346,7 +1346,8 @@ namespace WTelegram
 				return;
 			foreach (var rpc in stalled)
 			{
-				if (!await SendCopyAsync(rpc, rpc.sentPathIndex, $"Stalled >{PathRpcStallTimeout}s", sole: false))
+				bool timedOut = rpc.writtenTicks > 0 && now - rpc.writtenTicks > stallMs + Volatile.Read(ref rpc.stallExtraMs);
+				if (!await SendCopyAsync(rpc, rpc.sentPathIndex, timedOut ? $"Stalled >{PathRpcStallTimeout}s" : "Slow WAN", sole: false))
 					continue;
 				RecordSlowTransfer(rpc); // a file part: its WAN's speed so far is a sample (no answer will be one)
 				lock (_pathsLock)
@@ -2372,6 +2373,7 @@ namespace WTelegram
 			internal int transferBytes; // part size (upload), or the requested limit (download)
 			internal long stallExtraMs; // added to PathRpcStallTimeout: the time its path is expected to need
 			internal long queuedTicks; // when its frame was queued on a path (it may wait there behind slow writes)
+			internal int hedgeStarted; // 1 once HedgeIfWanted sent (or is sending) its copy
 			public Task<object> Task => tcs.Task;
 		}
 
@@ -3605,8 +3607,6 @@ namespace WTelegram
 				}
 			}
 			Task receiveTask = null;
-			TransportPath failedPath = null;
-			IOException writeError = null;
 			Task pathWrite = null;
 			TransportPath writePath = null;
 			int writeLength = 0;
@@ -3756,55 +3756,59 @@ namespace WTelegram
 			}
 			if (pathWrite != null)
 			{
-				var path = writePath;
-				try
-				{
-					await pathWrite;
-					Interlocked.Add(ref path.BytesSent, writeLength);
-					var writtenAt = Environment.TickCount64;
-					Volatile.Write(ref path.LastSendTicks, writtenAt);
-					if ((rpc ?? containedRpc) is Rpc written)
-						Volatile.Write(ref written.writtenTicks, writtenAt);
-				}
-				catch (IOException ex) when (_paths.Count > 0)
-				{
-					// Path write failed — mark dead and start reconnect. The frame may or may not
-					// have reached the server, so its requests are copied (same msg_id) to another
-					// path below; see RescueAfterWriteError.
-					// Task.Run so ReconnectPathAsync (and its RaisePathChanged) starts on a
-					// ThreadPool thread, never inline in a caller that may hold locks.
-					bool wasAlive;
-					lock (_pathsLock)
-					{
-						wasAlive = path.IsAlive;
-						path.IsAlive = false;
-					}
-					AddPenalty(path, 500);
-					if (wasAlive)
-						Helpers.Log(3, $"{_dcSession.DcID}>Path {path.PathIndex} write failed ({ex.Message}). Reconnecting path in background.");
-					if (_paths.Count > 1)
-						_ = Task.Run(() => ReconnectPathAsync(path, ex));
-					else
-						path.NetworkStream?.Close(); // single path: its reactor fails and runs the full reconnect (with Updates_GetState)
-					failedPath = path;
-					writeError = ex;
-				}
-			}
-			if (writeError != null)
-			{
-				// The frame may have reached the server before the write failed: copy its request to
-				// another path under the same msg_id rather than letting Invoke retry with a new one.
-				// With no other path alive it stays pending: the path's reconnect re-sends it the same
-				// way or hands it back to Invoke (RescueStrandedRpcsAsync / ResendPendingAfterReconnectAsync).
 				var subject = rpc ?? containedRpc;
-				if (subject == null)
-					throw writeError;
-				await SendCopyAsync(subject, failedPath.PathIndex, $"P{failedPath.PathIndex} write failed", sole: true);
+				HedgeIfWanted(subject); // at once: the copy never waits for this path to drain
+				// A request answered (by a copy) while its frame still waits to be written on a slow path: the
+				// caller has its answer now; the write completes in the background, handled the same way.
+				if (subject != null && !pathWrite.IsCompleted && await Task.WhenAny(pathWrite, subject.Task) != pathWrite)
+					_ = AfterPathWriteAsync(pathWrite, writePath, writeLength, subject);
+				else
+					await AfterPathWriteAsync(pathWrite, writePath, writeLength, subject);
 				return;
 			}
 			HedgeIfWanted(rpc);
 			if (receiveTask != null)
 				await receiveTask;
+		}
+
+		/// <summary>Once a queued frame is written: path counters and the request's write time. A failed write marks the
+		/// path dead and reconnects it; the frame may have reached the server, so its request is copied (same msg_id)
+		/// to another path rather than letting Invoke retry with a new one. With no other path alive it stays pending:
+		/// the path's reconnect re-sends it the same way or hands it back to Invoke (RescueStrandedRpcsAsync /
+		/// ResendPendingAfterReconnectAsync). A frame without a request rethrows the write error.</summary>
+		private async Task AfterPathWriteAsync(Task write, TransportPath path, int length, Rpc subject)
+		{
+			try
+			{
+				await write;
+				Interlocked.Add(ref path.BytesSent, length);
+				var writtenAt = Environment.TickCount64;
+				Volatile.Write(ref path.LastSendTicks, writtenAt);
+				if (subject != null)
+					Volatile.Write(ref subject.writtenTicks, writtenAt);
+				return;
+			}
+			catch (IOException ex) when (_paths.Count > 0)
+			{
+				// Task.Run so ReconnectPathAsync (and its RaisePathChanged) starts on a ThreadPool thread,
+				// never inline in a caller that may hold locks.
+				bool wasAlive;
+				lock (_pathsLock)
+				{
+					wasAlive = path.IsAlive;
+					path.IsAlive = false;
+				}
+				AddPenalty(path, 500);
+				if (wasAlive)
+					Helpers.Log(3, $"{_dcSession.DcID}>Path {path.PathIndex} write failed ({ex.Message}). Reconnecting path in background.");
+				if (_paths.Count > 1)
+					_ = Task.Run(() => ReconnectPathAsync(path, ex));
+				else
+					path.NetworkStream?.Close(); // single path: its reactor fails and runs the full reconnect (with Updates_GetState)
+				if (subject == null)
+					throw;
+				await SendCopyAsync(subject, path.PathIndex, $"P{path.PathIndex} write failed", sole: true);
+			}
 		}
 
 		/// <summary>Removes a request whose caller is getting an exception, unless it was already answered.</summary>
@@ -3826,6 +3830,8 @@ namespace WTelegram
 				return;
 			if (rpc.query is TL.Methods.Ping or TL.Methods.PingDelayDisconnect)
 				return;
+			if (Interlocked.Exchange(ref rpc.hedgeStarted, 1) != 0)
+				return; // once (a request in a container passes here twice)
 			_ = SendCopyAsync(rpc, rpc.sentPathIndex, "Hedge", sole: false);
 		}
 
