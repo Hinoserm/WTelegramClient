@@ -1750,24 +1750,25 @@ namespace WTelegram
 					// TransportPath.Dispose (outside the lock) takes it the same way, and only one of them disposes it.
 					lock (_pathsLock)
 						oldCts = Interlocked.Exchange(ref path.Cts, null);
-					try { oldCts?.Cancel(); } // disposed below whatever a callback throws
-					catch (Exception ex) { Helpers.Log(3, $"{_dcSession.DcID}>Path {path.PathIndex} cancellation callback failed: {ex.Message}"); }
+					if (oldCts != null) // its reactor holds the token (a struct): still readable once the source is disposed
+						TransportPath.CancelAndDispose(oldCts);
 					Stream oldStream;
 					lock (_pathsLock) // unpublished first: no frame is encrypted for it from now on (see QueueFrameWrite)
 					{
 						oldStream = path.NetworkStream;
 						path.NetworkStream = null;
 					}
-					oldStream?.Close();
-					path.TcpClient?.Dispose();
-					path.Sha256Send?.Dispose(); // a sender still building a frame with it fails with an IOException (SendAsync / QueueOnPath)
-					path.Sha256Recv?.Dispose();
+					// each step on its own: one that throws never skips the rest (nor fails this reconnect)
+					TransportPath.Step(() => oldStream?.Close(), path.PathIndex);
+					TransportPath.Step(() => path.TcpClient?.Dispose(), path.PathIndex);
+					// a sender still building a frame with it fails with an IOException (EncryptFrame)
+					TransportPath.Step(() => path.Sha256Send?.Dispose(), path.PathIndex);
+					TransportPath.Step(() => path.Sha256Recv?.Dispose(), path.PathIndex);
 #if OBFUSCATION
-					lock (path.WriteChainLock) // never under an encryption in progress (QueueFrameWrite holds this lock for it)
-						path.SendCtr?.Dispose();
-					path.RecvCtr?.Dispose();
+					// never under an encryption in progress (QueueFrameWrite holds this lock for it)
+					TransportPath.Step(() => { lock (path.WriteChainLock) path.SendCtr?.Dispose(); }, path.PathIndex);
+					TransportPath.Step(() => path.RecvCtr?.Dispose(), path.PathIndex);
 #endif
-					oldCts?.Dispose();
 
 					if (_cts?.IsCancellationRequested == true)
 						return;
@@ -1811,9 +1812,19 @@ namespace WTelegram
 						await networkStream.WriteAsync(preamble, 0, preamble.Length);
 
 						// everything that can fail is built before the publish below, which only assigns
-						var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token); // _cts: set before any path exists, never nulled
-						var linkedToken = linkedCts.Token; // still valid once a reset's Dispose has taken and disposed linkedCts
 						var (sha256Send, sha256Recv) = (SHA256.Create(), SHA256.Create());
+						CancellationTokenSource linkedCts;
+						try
+						{
+							linkedCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token); // _cts: set before any path exists, never nulled
+						}
+						catch
+						{
+							sha256Send.Dispose();
+							sha256Recv.Dispose();
+							throw;
+						}
+						var linkedToken = linkedCts.Token; // still valid once a reset's Dispose has taken and disposed linkedCts
 						lock (_pathsLock) // a full reset may have dropped this path while we were connecting
 						{
 							if (!_paths.Contains(path))
@@ -2690,8 +2701,10 @@ namespace WTelegram
 			public TcpClient TcpClient;
 			public Stream NetworkStream;
 			public Task ReactorTask;
-			public SHA256 Sha256Send = SHA256.Create();
-			public SHA256 Sha256Recv = SHA256.Create();
+			// set with the connection (last in its initializer, or published by a reconnect): a path that never got
+			// one (a dead path awaiting its reconnect) owns none to leak
+			public SHA256 Sha256Send;
+			public SHA256 Sha256Recv;
 #if OBFUSCATION
 			public AesCtr SendCtr;
 			public AesCtr RecvCtr;
@@ -2735,15 +2748,22 @@ namespace WTelegram
 				// A reconnect teardown takes it (under _pathsLock) and disposes it itself: never cancel a disposed one.
 				if (Interlocked.Exchange(ref Cts, null) is { } cts)
 					CancelAndDispose(cts);
-				Sha256Send?.Dispose(); // a sender building a frame with it gets an IOException (EncryptFrame)
-				Sha256Recv?.Dispose();
+				// each step on its own: one that throws never skips the rest
+				Step(() => Sha256Send?.Dispose(), PathIndex); // a sender building a frame with it gets an IOException (EncryptFrame)
+				Step(() => Sha256Recv?.Dispose(), PathIndex);
 #if OBFUSCATION
-				lock (WriteChainLock)
-					SendCtr?.Dispose();
-				RecvCtr?.Dispose();
+				Step(() => { lock (WriteChainLock) SendCtr?.Dispose(); }, PathIndex);
+				Step(() => RecvCtr?.Dispose(), PathIndex);
 #endif
-				NetworkStream?.Close();
-				TcpClient?.Dispose();
+				Step(() => NetworkStream?.Close(), PathIndex);
+				Step(() => TcpClient?.Dispose(), PathIndex);
+			}
+
+			/// <summary>One teardown step: a failure is logged, never thrown over the steps after it</summary>
+			public static void Step(Action step, int pathIndex)
+			{
+				try { step(); }
+				catch (Exception ex) { Helpers.Log(3, $"Path {pathIndex} teardown step failed: {ex.Message}"); }
 			}
 
 			/// <summary>Cancel then dispose: a throwing cancellation callback never leaves the source (and its link to
@@ -2996,6 +3016,32 @@ namespace WTelegram
 			}
 		}
 
+		/// <summary>A path's TCP connect, bounded by PathConnectTimeout. On timeout the connect itself goes on: a client
+		/// it still produces is nobody's, disposed when it arrives (DisposeWhenDone)</summary>
+		private async Task<TcpClient> ConnectPathAsync(IPEndPoint endpoint, IPEndPoint localEP)
+		{
+			var connect = TcpHandler(endpoint.Address.ToString(), endpoint.Port, localEP);
+			try
+			{
+				return await connect.WaitAsync(TimeSpan.FromSeconds(PathConnectTimeout));
+			}
+			catch (TimeoutException)
+			{
+				DisposeWhenDone(connect);
+				throw;
+			}
+		}
+
+		/// <summary>A connect whose result nobody will take: its client is disposed when it arrives, a failure observed</summary>
+		private static void DisposeWhenDone(Task<TcpClient> connect) =>
+			_ = connect.ContinueWith(t =>
+			{
+				if (t.IsFaulted)
+					_ = t.Exception; // observed: a late failure is nobody's concern now
+				else if (t.IsCompletedSuccessfully)
+					t.Result?.Dispose();
+			}, TaskScheduler.Default);
+
 		static async Task<TcpClient> DefaultTcpHandler(string host, int port, IPEndPoint localEndPoint = null)
 		{
 			var tcpClient = localEndPoint != null ? new TcpClient(localEndPoint) : new TcpClient();
@@ -3112,8 +3158,7 @@ namespace WTelegram
 							{
 								try
 								{
-									tcpClient = await TcpHandler(endpoint.Address.ToString(), endpoint.Port, localEPs[i])
-										.WaitAsync(TimeSpan.FromSeconds(PathConnectTimeout));
+									tcpClient = await ConnectPathAsync(endpoint, localEPs[i]);
 									primaryEPIndex = i;
 									_lastConnectedEPIndex = i;
 									Helpers.Log(2, $"Primary connected via {localEPs[i].Address}{(i == 0 ? " (preferred)" : " (fallback)")}.");
@@ -3135,8 +3180,7 @@ namespace WTelegram
 							for (int i = 0; i < localEPs.Count; i++)
 							{
 								int idx = i;
-								connectTasks.Add((TcpHandler(endpoint.Address.ToString(), endpoint.Port, localEPs[idx])
-									.WaitAsync(TimeSpan.FromSeconds(PathConnectTimeout)), idx));
+								connectTasks.Add((ConnectPathAsync(endpoint, localEPs[idx]), idx));
 							}
 
 							Exception lastEx = null;
@@ -3161,7 +3205,7 @@ namespace WTelegram
 
 							// Dispose any late-arriving connections we don't need
 							foreach (var remaining in connectTasks)
-								_ = remaining.task.ContinueWith(t => { if (t.IsCompletedSuccessfully) t.Result?.Dispose(); }, TaskScheduler.Default);
+								DisposeWhenDone(remaining.task);
 
 							if (tcpClient == null && lastEx != null)
 							throw lastEx;
@@ -3235,7 +3279,9 @@ namespace WTelegram
 						LocalEndPoint = localEPs?[primaryEPIndex],
 						PathIndex = 0,
 						Cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token),
-						Generation = Interlocked.Increment(ref _pathGeneration)
+						Generation = Interlocked.Increment(ref _pathGeneration),
+						Sha256Send = SHA256.Create(), // last: nothing after them can throw (GetStream above can)
+						Sha256Recv = SHA256.Create()
 					};
 					byte protocolId = (byte)(primaryPath.PaddedMode ? 0xDD : 0xEE);
 #if OBFUSCATION
@@ -3380,23 +3426,7 @@ namespace WTelegram
 				TcpClient tcpClient2 = null;
 				try
 				{
-					var connect = TcpHandler(endpoint.Address.ToString(), endpoint.Port, localEP);
-					try
-					{
-						tcpClient2 = await connect.WaitAsync(TimeSpan.FromSeconds(PathConnectTimeout));
-					}
-					catch (TimeoutException)
-					{
-						// the connect goes on: a client it still produces is nobody's, disposed when it does
-						_ = connect.ContinueWith(t =>
-						{
-							if (t.IsFaulted)
-								_ = t.Exception; // observed: a late connect failure is nobody's concern now
-							else if (t.IsCompletedSuccessfully)
-								t.Result?.Dispose();
-						}, TaskScheduler.Default);
-						throw;
-					}
+					tcpClient2 = await ConnectPathAsync(endpoint, localEP);
 					ConfigureKeepalive(tcpClient2);
 					path = new TransportPath
 					{
@@ -3406,7 +3436,9 @@ namespace WTelegram
 						LocalEndPoint = localEP,
 						PathIndex = pathIdx,
 						Cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token),
-						Generation = Interlocked.Increment(ref _pathGeneration)
+						Generation = Interlocked.Increment(ref _pathGeneration),
+						Sha256Send = SHA256.Create(), // last: nothing after them can throw (GetStream above can)
+						Sha256Recv = SHA256.Create()
 					};
 					byte protocolId2 = (byte)(path.PaddedMode ? 0xDD : 0xEE);
 #if OBFUSCATION
