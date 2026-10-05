@@ -91,11 +91,22 @@ namespace WTelegram
 
 		public void Dispose()
 		{
-			_sha256.Dispose();
-			_store.Dispose();
-			_encryptor.Dispose();
-			_jsonWriter.Dispose();
-			_jsonStream.Dispose();
+			// the store first, and whatever the others throw: it holds the session file (opened FileShare.None), which a
+			// new client cannot open until it is released
+			try { _store.Dispose(); }
+			finally
+			{
+				try { _sha256.Dispose(); }
+				finally
+				{
+					try { _encryptor.Dispose(); }
+					finally
+					{
+						try { _jsonWriter.Dispose(); }
+						finally { _jsonStream.Dispose(); }
+					}
+				}
+			}
 		}
 
 		internal static Session LoadOrCreate(Stream store, byte[] rgbKey)

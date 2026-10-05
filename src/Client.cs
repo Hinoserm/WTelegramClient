@@ -116,24 +116,28 @@ namespace WTelegram
 		/// <summary>Is this Client instance the main or a secondary DC session</summary>
 		public bool IsMainDC => _dcSession?.DataCenter?.flags.HasFlag(DcOption.Flags.media_only) != true
 			&& (_dcSession?.DataCenter?.id - _session.MainDC) is null or 0;
-		/// <summary>Has this Client established connection been disconnected? Also true once its own reconnect has given
-		/// up (ReactorError raised, reactor ended): a multipath client is then left with no paths and no single TCP client,
-		/// which used to read as connected, so an app reconnecting on ReactorError when Disconnected never did. A client
-		/// not yet connected (or connecting) is not "disconnected", as before (GetClientForDC relies on it).</summary>
+		/// <summary>Has this Client established connection been disconnected? With a transport (paths, or the single TCP
+		/// client), by its state, as before. With none at all: disconnected once a connection was lost and not yet made again
+		/// (its reconnect gave up, or a full reconnect is under way) or the client was disposed. That state used to read as
+		/// connected, so an app reconnecting on ReactorError when Disconnected never did. A client not yet connected (or
+		/// connecting for the first time) is not "disconnected", as before (GetClientForDC relies on it).</summary>
 		public bool Disconnected
 		{
 			get
 			{
-				if (_connectionLost)
-					return true;
 				lock (_pathsLock)
 					if (_paths.Count > 0)
 						return !_paths.Any(p => p.IsAlive);
-				return _tcpClient != null && !(_tcpClient.Client?.Connected ?? false);
+				if (_tcpClient != null)
+					return !(_tcpClient.Client?.Connected ?? false);
+				return _connectionLost || _disposed;
 			}
 		}
-		/// <summary>Set when the reactor's reconnect gave up (it raised a ReactorError and ended); cleared by a successful connect</summary>
+		/// <summary>A connection was lost and not made again yet (reactor reconnect gave up, or a full reconnect is under way);
+		/// cleared by a successful connect. Only read when there is no transport at all (a live one always wins)</summary>
 		private volatile bool _connectionLost;
+		/// <summary>DisposeAsync has run: an ObjectDisposedException is then the end, not a lost connection</summary>
+		private volatile bool _disposed;
 		/// <summary>Returns a snapshot of per-path transport statistics for THIS client's DC. Empty array if not using multipath.</summary>
 		public PathStats[] GetPathStatistics()
 		{
@@ -302,6 +306,8 @@ namespace WTelegram
 		public int PathDisconnectDelay { get; set; } = 15;
 		/// <summary>Seconds to wait for a single endpoint connection attempt before timing out.</summary>
 		public int PathConnectTimeout { get; set; } = 10;
+		/// <summary>New-msg_id retries one Invoke makes after its request could not run (ReactorError results) before failing</summary>
+		private const int MaxReactorRetries = 50;
 		/// <summary>Maximum backoff delay in seconds between reconnect attempts (both per-path and full reconnect).</summary>
 		public int PathReconnectMaxBackoff { get; set; } = 30;
 		/// <summary>Seconds before an RPC on a specific path is considered stalled. The path is force-closed to trigger failover.
@@ -460,8 +466,27 @@ namespace WTelegram
 		public void Dispose() => DisposeAsync().AsTask().Wait();
 		public async ValueTask DisposeAsync()
 		{
+			_disposed = true;
+			// The root client owns the session (and its file) and the alt-DC clones, whichever DC it ended up on (a client
+			// left on another DC by a failed connect is not IsMainDC, yet nobody else would release them). Released however
+			// the rest of the disposal goes: a held session file stops every new client from opening it.
+			bool root = _parentClient == null;
+			try
+			{
+				await DisposeConnectionAsync(root).ConfigureAwait(false);
+			}
+			finally
+			{
+				if (root)
+					_session.Dispose();
+				GC.SuppressFinalize(this);
+			}
+		}
+
+		private async Task DisposeConnectionAsync(bool root)
+		{
 			Helpers.Log(2, $"{_dcSession.DcID}>Disposing the client");
-			await ResetAsync(false, IsMainDC).ConfigureAwait(false);
+			await ResetAsync(false, root).ConfigureAwait(false);
 			var ex = new ObjectDisposedException("WTelegram.Client was disposed");
 			Rpc[] aborted;
 			lock (_pendingRpcs) // abort all pending requests
@@ -488,11 +513,6 @@ namespace WTelegram
 			foreach (var path in disposed)
 				path.DisposeQuietly(); // outside _pathsLock (it takes WriteChainLock); one failure never skips the rest
 			_networkStream = null;
-			// the session (and its file) belongs to the root client, whichever DC it ended up on (a client left on another DC
-			// by a failed connect is not IsMainDC, yet nobody else would release the file); alt-DC clones share it
-			if (_parentClient == null)
-				_session.Dispose();
-			GC.SuppressFinalize(this);
 		}
 
 		public void DisableUpdates(bool disable = true) => _dcSession.DisableUpdates(disable);
@@ -818,22 +838,9 @@ namespace WTelegram
 							RaiseUpdates(updatesState);
 						}
 					}
-					catch (Exception e) when (e is not ObjectDisposedException)
+					catch (Exception e) when (!(e is ObjectDisposedException && _disposed)) // disposed: the end, not a loss
 					{
-						_connectionLost = true; // before the app hears of it: it reads Disconnected to decide to reconnect
-						if (IsMainDC)
-							RaiseUpdates(reactorError);
-						Rpc[] aborted;
-						lock (_pendingRpcs) // abort all pending requests
-						{
-							aborted = [.. _pendingRpcs.Values];
-							foreach (var rpc in aborted)
-								rpc.tcs.TrySetException(ex);
-							_pendingRpcs.Clear();
-							_bareRpc = null;
-						}
-						foreach (var rpc in aborted)
-							SettledTransfer(rpc);
+						GiveUpConnection(reactorError, ex);
 					}
 					finally
 					{
@@ -843,9 +850,47 @@ namespace WTelegram
 				}
 				if (obj != null)
 				{
-					await HandleMessageAsync(obj); // Pongs (top-level or in a container) reach OnPongReceived
+					try
+					{
+						await HandleMessageAsync(obj); // Pongs (top-level or in a container) reach OnPongReceived
+					}
+					catch (Exception ex) when (!(ex is ObjectDisposedException && _disposed))
+					{
+						// A handler that failed: the message is lost, the reactor is not (it used to end here, silently).
+						// One that reset the connection and could not make it again (a 32/33 session renewal while the
+						// network is down) left no transport: that is a lost connection like the reactor's own.
+						Helpers.Log(4, $"{_dcSession?.DcID}>Handling {obj.GetType().Name} failed: {ex}");
+						bool noTransport;
+						lock (_pathsLock)
+							noTransport = _paths.Count == 0 && _tcpClient == null && _httpClient == null;
+						if (noTransport)
+						{
+							GiveUpConnection(new ReactorError { Exception = ex }, ex);
+							return; // a reconnect starts a new reactor
+						}
+					}
 				}
 			}
+		}
+
+		/// <summary>The connection is lost and this client will not make it again by itself: marked (Disconnected reads it),
+		/// the app told (ReactorError, main DC), every pending request failed with <paramref name="ex"/></summary>
+		private void GiveUpConnection(ReactorError reactorError, Exception ex)
+		{
+			_connectionLost = true; // before the app hears of it: it reads Disconnected to decide to reconnect
+			if (IsMainDC)
+				RaiseUpdates(reactorError);
+			Rpc[] aborted;
+			lock (_pendingRpcs) // abort all pending requests
+			{
+				aborted = [.. _pendingRpcs.Values];
+				foreach (var rpc in aborted)
+					rpc.tcs.TrySetException(ex);
+				_pendingRpcs.Clear();
+				_bareRpc = null;
+			}
+			foreach (var rpc in aborted)
+				SettledTransfer(rpc);
 		}
 
 		private TransportPath AlivePathByIndex(int pathIndex)
@@ -1353,7 +1398,7 @@ namespace WTelegram
 			{
 				switch (state & 7)
 				{
-					case 2 or 3 when rpc.seqnoRefused:
+					case 2 or 3 when rpc.seqnoRefused && !rpc.serverHasIt: // once "received", never a new msg_id
 						// not received, and its message refused for its seqno (after a session's connections were all
 						// replaced, its seqno is behind): re-sending it is refused every time, and it can never run.
 						// A new msg_id is safe, and the only way it ever gets answered.
@@ -2161,6 +2206,7 @@ namespace WTelegram
 					lock (_msgsToAck)
 						_msgsToAck.Clear();
 					await ResetAsync(false, false);
+					_connectionLost = true; // no transport until ConnectAsync succeeds (it clears this): Disconnected says so
 					// ResetAsync resets _fullReconnectStarted = false (under _pathsLock).
 					// Re-claim ownership immediately so no other thread can launch a second
 					// PerformFullReconnectAsync between here and ConnectAsync completing.
@@ -2186,9 +2232,9 @@ namespace WTelegram
 						_fullReconnectStarted = false;
 					return; // done — DoConnectAsync already released _sendSemaphore
 				}
-				catch (ObjectDisposedException)
+				catch (ObjectDisposedException) when (_disposed)
 				{
-					// Client was genuinely disposed — propagate
+					// Client was genuinely disposed — propagate (one from a concurrent reset of a live client is retried below)
 					lock (_pathsLock)
 						_fullReconnectStarted = false;
 					throw;
@@ -3368,9 +3414,11 @@ namespace WTelegram
 							}
 							catch
 							{
-								(defaultSession.DataCenter, defaultSession.Client) = (defaultDataCenter, defaultClient); // as it was (another DC's client, if any, keeps it)
+								// The default address's session as it was, unless someone changed it meanwhile (then theirs
+								// stands); its previous client only if it is still alive. Then this client back on its own.
+								if (ReferenceEquals(defaultSession.Client, this) && defaultSession.DataCenter == null)
+									(defaultSession.DataCenter, defaultSession.Client) = (defaultDataCenter, defaultClient is { _disposed: false } ? defaultClient : null);
 								(_dcSession, ownSession.DataCenter, ownSession.Client) = (ownSession, ownDataCenter, this);
-								needMigrate = false;
 								throw;
 							}
 						}
@@ -4472,7 +4520,7 @@ namespace WTelegram
 			if (_dcSession.withoutUpdates && query is not IMethod<Pong> and not IMethod<FutureSalts>)
 				query = new TL.Methods.InvokeWithoutUpdates<T> { query = query };
 			bool got503 = false;
-			int ioRetries = 0;
+			int ioRetries = 0, reactorRetries = 0;
 			static bool IsFilePart(IObject q) => q is TL.Methods.Upload_SaveFilePart or TL.Methods.Upload_SaveBigFilePart
 				or TL.Methods.Upload_GetFile or TL.Methods.Upload_GetCdnFile or TL.Methods.Upload_GetWebFile;
 			bool bulk = IsFilePart(query) || (query is TL.Methods.InvokeWithoutUpdates<T> { query: var inner } && IsFilePart(inner));
@@ -4578,7 +4626,11 @@ namespace WTelegram
 							_session.Save();
 						}
 					throw new RpcException(code, message, x);
-				case ReactorError:
+				case ReactorError reactorError:
+					// each is a new msg_id after the old one could not run (lost connection, refused message): bounded, so a
+					// request that keeps failing that way fails its caller instead of retrying forever
+					if (++reactorRetries > MaxReactorRetries)
+						throw new WTException($"{query.GetType().Name} could not be delivered after {MaxReactorRetries} retries: {reactorError.Exception?.Message}", reactorError.Exception);
 					goto retry;
 				default:
 					throw new WTException($"{query.GetType().Name} call got a result of type {result.GetType().Name} instead of {typeof(T).Name}");
