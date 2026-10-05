@@ -453,10 +453,7 @@ namespace WTelegram
 			{
 				aborted = [.. _pendingRpcs.Values];
 				foreach (var rpc in aborted)
-				{
-					rpc.tcs.TrySetException(ex);
-					_settledHedged[rpc.msgId] = Environment.TickCount64; // a late answer: dropped as a second one
-				}
+					rpc.tcs.TrySetException(ex); // no reactor runs after ResetAsync: no late answer to mark
 				_pendingRpcs.Clear();
 			}
 			foreach (var rpc in aborted)
@@ -687,7 +684,7 @@ namespace WTelegram
 					recvCtr.EncryptDecrypt(data.AsSpan(0, payloadLen));
 #endif
 					obj = ReadFrame(data, payloadLen, sha256Recv, paddedMode, path?.PathIndex ?? -1);
-					if (path != null)
+					if (path != null && !ct.IsCancellationRequested) // a torn-down connection's last frame is not the new one's traffic
 					{
 						path.LastRecvTicks = Environment.TickCount64;
 						Interlocked.Add(ref path.BytesRecv, 4 + payloadLen);
@@ -1752,10 +1749,11 @@ namespace WTelegram
 					}
 					oldStream?.Close();
 					path.TcpClient?.Dispose();
-					path.Sha256Send?.Dispose();
+					path.Sha256Send?.Dispose(); // a sender still building a frame with it fails with an IOException (SendAsync / QueueOnPath)
 					path.Sha256Recv?.Dispose();
 #if OBFUSCATION
-					path.SendCtr?.Dispose();
+					lock (path.WriteChainLock) // never under an encryption in progress (QueueFrameWrite holds this lock for it)
+						path.SendCtr?.Dispose();
 					path.RecvCtr?.Dispose();
 #endif
 					oldCts?.Dispose();
@@ -1769,24 +1767,24 @@ namespace WTelegram
 						if (!_paths.Contains(path))
 							return;
 					}
+					// this attempt's new connection and ciphers: disposed (in finally) unless published on the path
+					TcpClient tcpClient = null;
+					bool published = false;
+#if OBFUSCATION
+					AesCtr sendCtr = null, recvCtr = null;
+#endif
 					try
 					{
 						Helpers.Log(2, $"{_dcSession.DcID}>Reconnecting path {path.PathIndex} (attempt {attempt})...");
-						var tcpClient = await TcpHandler(endpoint.Address.ToString(), endpoint.Port, path.LocalEndPoint);
+						tcpClient = await TcpHandler(endpoint.Address.ToString(), endpoint.Port, path.LocalEndPoint);
 
 						// TcpHandler doesn't check CTS — re-check after it returns
 						if (_cts?.IsCancellationRequested == true)
-						{
-							tcpClient.Dispose();
 							return;
-						}
 						lock (_pathsLock)
 						{
 							if (!_paths.Contains(path))
-							{
-								tcpClient.Dispose();
 								return;
-							}
 						}
 
 						ConfigureKeepalive(tcpClient);
@@ -1795,8 +1793,7 @@ namespace WTelegram
 						byte protocolId = (byte)(path.PaddedMode ? 0xDD : 0xEE);
 #if OBFUSCATION
 						// the new connection's ciphers, published with its stream below (never beside the old stream)
-						var (sendCtr, recvCtr, obfPreamble) = InitObfuscation(null, protocolId, dcId);
-						preamble = obfPreamble;
+						(sendCtr, recvCtr, preamble) = InitObfuscation(null, protocolId, dcId);
 #else
 						preamble = new byte[] { protocolId, protocolId, protocolId, protocolId };
 #endif
@@ -1805,14 +1802,7 @@ namespace WTelegram
 						lock (_pathsLock) // a full reset may have dropped this path while we were connecting
 						{
 							if (!_paths.Contains(path))
-							{
-								tcpClient.Dispose();
-#if OBFUSCATION
-								sendCtr.Dispose();
-								recvCtr.Dispose();
-#endif
 								return;
-							}
 #if OBFUSCATION
 							(path.SendCtr, path.RecvCtr) = (sendCtr, recvCtr);
 #endif
@@ -1822,6 +1812,7 @@ namespace WTelegram
 							path.Sha256Recv = SHA256.Create();
 							path.Cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
 							path.Generation = Interlocked.Increment(ref _pathGeneration);
+							published = true; // the path owns them now: the next teardown disposes them
 						}
 						path.LastRecvTicks = Environment.TickCount64;
 						path.LastProbeTicks = 0;
@@ -1860,6 +1851,17 @@ namespace WTelegram
 						if (_cts?.IsCancellationRequested == true)
 							return;
 						await Task.Delay(Math.Max(1000, Math.Min(attempt * 2000, PathReconnectMaxBackoff * 1000))); // backoff up to 30s (min 1s)
+					}
+					finally
+					{
+						if (!published) // gave up or failed before the path took them
+						{
+							tcpClient?.Dispose();
+#if OBFUSCATION
+							sendCtr?.Dispose();
+							recvCtr?.Dispose();
+#endif
+						}
 					}
 				}
 			}
@@ -2151,6 +2153,21 @@ namespace WTelegram
 		/// <param name="beforeWrite">Called with the msg_id and the generation of the connection it goes out on, right before
 		/// the frame is queued, after everything that can fail (to register for its answer)</param>
 		/// <returns>The msg_id it was sent with, or 0 when the path cannot take it (<paramref name="written"/> is then complete)</returns>
+		/// <summary>msg_key and encrypted payload of a frame. A path's hash is disposed by its teardown, possibly under a
+		/// sender holding the old connection's snapshot: that is a lost connection (IOException, retried), not a crash</summary>
+		private (byte[] msgKeyLarge, byte[] encrypted) EncryptFrame(TransportPath path, SHA256 sha256Send, byte[] clearBuffer, int clearLength, int padding, int msgKeyOffset)
+		{
+			try
+			{
+				var msgKeyLarge = sha256Send.ComputeHash(clearBuffer, 0, 32 + clearLength + padding);
+				return (msgKeyLarge, EncryptDecryptMessage(clearBuffer.AsSpan(32, clearLength + padding), true, 0, _dcSession.AuthKey, msgKeyLarge, msgKeyOffset, sha256Send));
+			}
+			catch (ObjectDisposedException) when (path != null)
+			{
+				throw new IOException($"Path {path.PathIndex}: connection torn down while its frame was built");
+			}
+		}
+
 		private long QueueOnPath(TransportPath path, IObject msg, out Task written, bool registering = false, Action<long, long> beforeWrite = null)
 		{
 			written = Task.CompletedTask;
@@ -2187,9 +2204,8 @@ namespace WTelegram
 			byte[] clearBuffer = clearStream.GetBuffer();
 			BinaryPrimitives.WriteInt32LittleEndian(clearBuffer.AsSpan(60), clearLength - 32);
 			RNG.GetBytes(clearBuffer, 32 + clearLength, padding);
-			var msgKeyLarge = sha256Send.ComputeHash(clearBuffer, 0, 32 + clearLength + padding);
 			const int msgKeyOffset = 8;
-			byte[] encrypted_data = EncryptDecryptMessage(clearBuffer.AsSpan(32, clearLength + padding), true, 0, _dcSession.AuthKey, msgKeyLarge, msgKeyOffset, sha256Send);
+			var (msgKeyLarge, encrypted_data) = EncryptFrame(path, sha256Send, clearBuffer, clearLength, padding, msgKeyOffset);
 
 			writer.Write(_dcSession.authKeyID);
 			writer.Write(msgKeyLarge, msgKeyOffset, 16);
@@ -2237,9 +2253,11 @@ namespace WTelegram
 						return Task.FromException(new IOException($"Path {path.PathIndex}: connection replaced before the write"));
 					ctr = path.SendCtr;
 				}
+				if (ctr == null) // every path connection has its cipher: never write a frame in the clear on an obfuscated stream
+					return Task.FromException(new IOException($"Path {path.PathIndex}: connection has no cipher"));
 				try
 				{
-					ctr?.EncryptDecrypt(buffer.AsSpan(0, length));
+					ctr.EncryptDecrypt(buffer.AsSpan(0, length)); // under WriteChainLock: its disposal waits for this (see ReconnectPathAsync)
 				}
 				catch (Exception ex) // its cipher disposed meanwhile: the connection is gone
 				{
@@ -3910,6 +3928,8 @@ namespace WTelegram
 				if (path != null)
 					lock (_pathsLock)
 						(pathStream, pathGeneration, pathSha256, pathPadded) = (path.NetworkStream, path.Generation, path.Sha256Send, path.PaddedMode);
+				if (path != null && pathStream == null) // torn down since it was picked: nothing is built or recorded for it
+					throw new IOException($"Path {path.PathIndex} has no connection");
 				// For containers: update sentPathIndex on all contained RPCs.
 				// These RPCs were registered in _pendingRpcs before container batching
 				// (with sentTicks already set) but sentPathIndex was left at -1 since
@@ -3975,9 +3995,8 @@ namespace WTelegram
 					byte[] clearBuffer = clearStream.GetBuffer();
 					BinaryPrimitives.WriteInt32LittleEndian(clearBuffer.AsSpan(60), clearLength - 32);    // patch message_data_length
 					RNG.GetBytes(clearBuffer, 32 + clearLength, padding);
-					var msgKeyLarge = sha256Send.ComputeHash(clearBuffer, 0, 32 + clearLength + padding);
 					const int msgKeyOffset = 8; // msg_key = middle 128-bits of SHA256(authkey_part+plaintext+padding)
-					byte[] encrypted_data = EncryptDecryptMessage(clearBuffer.AsSpan(32, clearLength + padding), true, 0, _dcSession.AuthKey, msgKeyLarge, msgKeyOffset, sha256Send);
+					var (msgKeyLarge, encrypted_data) = EncryptFrame(path, sha256Send, clearBuffer, clearLength, padding, msgKeyOffset);
 
 					writer.Write(_dcSession.authKeyID);             // int64 auth_key_id
 					writer.Write(msgKeyLarge, msgKeyOffset, 16);    // int128 msg_key
