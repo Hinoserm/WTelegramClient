@@ -453,8 +453,11 @@ namespace WTelegram
 			{
 				aborted = [.. _pendingRpcs.Values];
 				foreach (var rpc in aborted)
+				{
 					rpc.tcs.TrySetException(ex);
-				_pendingRpcs.Clear(); // settled: a late answer must not complete them again
+					_settledHedged[rpc.msgId] = Environment.TickCount64; // a late answer: dropped as a second one
+				}
+				_pendingRpcs.Clear();
 			}
 			foreach (var rpc in aborted)
 				SettledTransfer(rpc);
@@ -1248,10 +1251,14 @@ namespace WTelegram
 					if (await sem.WaitAsync(SendLockWait, _cts.Token)) // reconnecting otherwise: reqId stays 0, asked again in 10 s
 						try
 						{
-							generation = path.Generation;
 							Interlocked.Increment(ref rpc.stateChecks);
-							// registered before the write: the answer can arrive before the write completes
-							reqId = QueueOnPath(path, new MsgsStateReq { msg_ids = [rpc.msgId] }, out written, beforeWrite: (id, _) => _stateChecks[id] = rpc);
+							// registered before the write: the answer can arrive before the write completes; with the
+							// generation of the connection it really goes out on (for the close below, on failure)
+							reqId = QueueOnPath(path, new MsgsStateReq { msg_ids = [rpc.msgId] }, out written, beforeWrite: (id, connection) =>
+							{
+								generation = connection;
+								_stateChecks[id] = rpc;
+							});
 						}
 						finally
 						{
@@ -1737,7 +1744,13 @@ namespace WTelegram
 						path.Cts = null;
 					}
 					oldCts?.Cancel();
-					path.NetworkStream?.Close();
+					Stream oldStream;
+					lock (_pathsLock) // unpublished first: no frame is encrypted for it from now on (see QueueFrameWrite)
+					{
+						oldStream = path.NetworkStream;
+						path.NetworkStream = null;
+					}
+					oldStream?.Close();
 					path.TcpClient?.Dispose();
 					path.Sha256Send?.Dispose();
 					path.Sha256Recv?.Dispose();
@@ -1781,7 +1794,9 @@ namespace WTelegram
 						byte[] preamble;
 						byte protocolId = (byte)(path.PaddedMode ? 0xDD : 0xEE);
 #if OBFUSCATION
-						(path.SendCtr, path.RecvCtr, preamble) = InitObfuscation(null, protocolId, dcId);
+						// the new connection's ciphers, published with its stream below (never beside the old stream)
+						var (sendCtr, recvCtr, obfPreamble) = InitObfuscation(null, protocolId, dcId);
+						preamble = obfPreamble;
 #else
 						preamble = new byte[] { protocolId, protocolId, protocolId, protocolId };
 #endif
@@ -1792,8 +1807,15 @@ namespace WTelegram
 							if (!_paths.Contains(path))
 							{
 								tcpClient.Dispose();
+#if OBFUSCATION
+								sendCtr.Dispose();
+								recvCtr.Dispose();
+#endif
 								return;
 							}
+#if OBFUSCATION
+							(path.SendCtr, path.RecvCtr) = (sendCtr, recvCtr);
+#endif
 							path.TcpClient = tcpClient;
 							path.NetworkStream = networkStream;
 							path.Sha256Send = SHA256.Create();
@@ -2132,10 +2154,14 @@ namespace WTelegram
 		private long QueueOnPath(TransportPath path, IObject msg, out Task written, bool registering = false, Action<long, long> beforeWrite = null)
 		{
 			written = Task.CompletedTask;
+			// The connection's parts, read together (a reconnect publishes them together under _pathsLock); its cipher is
+			// checked against the stream when the frame is queued (QueueFrameWrite)
 			Stream stream;
-			long connection; // the generation of the connection this stream is, read with it (a reconnect swaps both)
+			long connection;
+			SHA256 sha256Send;
+			bool paddedMode;
 			lock (_pathsLock)
-				(stream, connection) = (path.NetworkStream, path.Generation);
+				(stream, connection, sha256Send, paddedMode) = (path.NetworkStream, path.Generation, path.Sha256Send, path.PaddedMode);
 			if ((!path.IsAlive && !registering) || stream == null || _dcSession.authKeyID == 0)
 				return 0;
 			var (msgId, seqno) = NewMsgId(false);
@@ -2161,15 +2187,15 @@ namespace WTelegram
 			byte[] clearBuffer = clearStream.GetBuffer();
 			BinaryPrimitives.WriteInt32LittleEndian(clearBuffer.AsSpan(60), clearLength - 32);
 			RNG.GetBytes(clearBuffer, 32 + clearLength, padding);
-			var msgKeyLarge = path.Sha256Send.ComputeHash(clearBuffer, 0, 32 + clearLength + padding);
+			var msgKeyLarge = sha256Send.ComputeHash(clearBuffer, 0, 32 + clearLength + padding);
 			const int msgKeyOffset = 8;
-			byte[] encrypted_data = EncryptDecryptMessage(clearBuffer.AsSpan(32, clearLength + padding), true, 0, _dcSession.AuthKey, msgKeyLarge, msgKeyOffset, path.Sha256Send);
+			byte[] encrypted_data = EncryptDecryptMessage(clearBuffer.AsSpan(32, clearLength + padding), true, 0, _dcSession.AuthKey, msgKeyLarge, msgKeyOffset, sha256Send);
 
 			writer.Write(_dcSession.authKeyID);
 			writer.Write(msgKeyLarge, msgKeyOffset, 16);
 			writer.Write(encrypted_data);
 
-			if (path.PaddedMode)
+			if (paddedMode)
 			{
 				var pad = new byte[_random.Next(16)];
 				RNG.GetBytes(pad);
@@ -2196,12 +2222,29 @@ namespace WTelegram
 		/// write starts once the path's previous write is done. Called under the send semaphore (so frames keep
 		/// the order they were built in); the caller awaits the returned task AFTER releasing it, so a path that
 		/// is slow to drain holds up only its own frames. The task only ever fails with an IOException.</summary>
-		private static Task QueueFrameWrite(TransportPath path, Stream stream, byte[] buffer, int length)
+		private Task QueueFrameWrite(TransportPath path, Stream stream, byte[] buffer, int length)
 		{
 			lock (path.WriteChainLock)
 			{
 #if OBFUSCATION
-				path.SendCtr?.EncryptDecrypt(buffer.AsSpan(0, length));
+				// Only for the connection the frame was built for, with that connection's cipher (a reconnect unpublishes the
+				// old stream before disposing its cipher, and publishes the new stream with the new cipher, under _pathsLock):
+				// a frame for a gone connection must never advance the CTR of the next one.
+				AesCtr ctr;
+				lock (_pathsLock) // nested in WriteChainLock: no _pathsLock section takes a WriteChainLock
+				{
+					if (!ReferenceEquals(path.NetworkStream, stream))
+						return Task.FromException(new IOException($"Path {path.PathIndex}: connection replaced before the write"));
+					ctr = path.SendCtr;
+				}
+				try
+				{
+					ctr?.EncryptDecrypt(buffer.AsSpan(0, length));
+				}
+				catch (Exception ex) // its cipher disposed meanwhile: the connection is gone
+				{
+					return Task.FromException(new IOException($"Path {path.PathIndex}: connection gone before the write ({ex.Message})", ex));
+				}
 #endif
 				var task = WriteAfterAsync(path.WriteChain, stream, buffer, length);
 				path.WriteChain = task;
@@ -2512,7 +2555,7 @@ namespace WTelegram
 						RecordTransferSample(rpc, pathIndex, rpc.transferBytes);
 					}
 
-					rpc.tcs.TrySetResult(result); // Try: a client being disposed may have failed it already
+					rpc.tcs.TrySetResult(result); // Try, like every completion: removed from the pending requests above, only we complete it
 				}
 				catch (Exception ex)
 				{
@@ -2578,6 +2621,8 @@ namespace WTelegram
 			// section; HasLiveCarrier can see them from another thread); and of those the ones the server refused meanwhile.
 			// LOCK ORDER: lock(rpc) may nest _pendingRpcs or _pathsLock (SyncTransferCopy, DropDeadCopies), never the other
 			// way: no _pendingRpcs or _pathsLock section takes lock(rpc). _transferLock is taken after releasing lock(rpc).
+			// The send semaphore may be held while taking lock(rpc), _pathsLock (QueueOnPath) or a path's WriteChainLock
+			// (which nests _pathsLock: QueueFrameWrite); nothing waits on the semaphore while holding any lock.
 			internal readonly Dictionary<long, (TransportPath Path, long Gen, long Seq)> liveCopies = [];
 			internal readonly Dictionary<long, (TransportPath Path, long Gen)> pendingCopies = [];
 			internal long copySeq; // order the copies went live in (msg_ids can go backwards after a time resync)
@@ -2674,7 +2719,7 @@ namespace WTelegram
 				if ((rpc?.type.IsAssignableFrom(obj.GetType())) == true)
 				{
 					_bareRpc = null;
-					rpc.tcs.SetResult(obj);
+					rpc.tcs.TrySetResult(obj);
 					return;
 				}
 				else if (_dcSession.authKeyID == 0)
@@ -2846,7 +2891,7 @@ namespace WTelegram
 			{
 				var rpc = PullPendingRequest(msgId);
 				if (rpc != null)
-					rpc.tcs.SetResult(result);
+					rpc.tcs.TrySetResult(result);
 				else
 					RaiseUpdates(obj);
 			}
@@ -3856,6 +3901,15 @@ namespace WTelegram
 				var path = (rpc ?? containedRpc)?.lease is { PathIndex: >= 0 } lease && lease.Client == this
 					? AlivePathByIndex(lease.PathIndex) ?? GetPrimaryAlivePath()
 					: GetPrimaryAlivePath();
+				// The connection's parts, read together (a reconnect swaps them together under _pathsLock): the frame is
+				// built, recorded and written for one and the same connection.
+				Stream pathStream = null;
+				long pathGeneration = 0;
+				SHA256 pathSha256 = null;
+				bool pathPadded = false;
+				if (path != null)
+					lock (_pathsLock)
+						(pathStream, pathGeneration, pathSha256, pathPadded) = (path.NetworkStream, path.Generation, path.Sha256Send, path.PaddedMode);
 				// For containers: update sentPathIndex on all contained RPCs.
 				// These RPCs were registered in _pendingRpcs before container batching
 				// (with sentTicks already set) but sentPathIndex was left at -1 since
@@ -3867,7 +3921,7 @@ namespace WTelegram
 						foreach (var m in msgContainer.messages)
 							if (_pendingRpcs.TryGetValue(m.msg_id, out var crpc))
 							{
-								crpc.sentGen = path.Generation;
+								crpc.sentGen = pathGeneration;
 								crpc.sentPathIndex = path.PathIndex;
 								crpc.containerMsgId = msgId;
 							}
@@ -3875,13 +3929,13 @@ namespace WTelegram
 				}
 				if (rpc != null && path != null)
 				{
-					rpc.sentGen = path.Generation;
+					rpc.sentGen = pathGeneration;
 					rpc.sentPathIndex = path.PathIndex;
 					// sentTicks stays the registration time (the msg_id's age); writtenTicks is set
 					// after the write, for stall detection (a part queued behind others is not stalled)
 				}
-				var sha256Send = path?.Sha256Send ?? _sha256;
-				var paddedMode = path?.PaddedMode ?? _paddedMode;
+				var sha256Send = path != null ? pathSha256 : _sha256;
+				var paddedMode = path != null ? pathPadded : _paddedMode;
 
 				using var memStream = new MemoryStream(1024);
 				using var writer = new BinaryWriter(memStream);
@@ -3945,15 +3999,15 @@ namespace WTelegram
 					// semaphore is released, so a path that is slow to drain holds up only its own frames
 					writePath = path;
 					writeLength = frameLength;
-					writeGeneration = path.Generation;
+					writeGeneration = pathGeneration;
 					if ((rpc ?? containedRpc) is Rpc queued)
 					{
 						long queuedAt = Environment.TickCount64;
 						Volatile.Write(ref queued.queuedTicks, queuedAt);
 						MarkTransferQueued(queued, queuedAt);
 					}
-					pathWrite = path.NetworkStream is Stream stream
-						? QueueFrameWrite(path, stream, buffer, frameLength)
+					pathWrite = pathStream != null
+						? QueueFrameWrite(path, pathStream, buffer, frameLength)
 						: Task.FromException(new IOException($"Path {path.PathIndex} has no connection"));
 				}
 				else if (_paths.Count > 0)
