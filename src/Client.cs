@@ -526,16 +526,22 @@ namespace WTelegram
 		/// <param name="defaultHttpWait">Default HttpWait parameters for requests.<para>⚠️ Telegram servers don't support this correctly at the moment.</para>So leave <see langword="null"/> for the default 25 seconds long poll</param>
 		public void HttpMode(HttpClient httpClient = null, HttpWait defaultHttpWait = null)
 		{
-			if (_tcpUsed) // (not _tcpClient: a reset nulls it, and multipath never sets it)
-				throw new InvalidOperationException("Cannot switch to HTTP after TCP connection");
-			lock (this) // nor while a connect is under way (it would end up with TCP paths beside HTTP mode)
-				if (_connecting is { IsCompleted: false })
+			// Checked and switched under the lock a connect starts under (ConnectAsync): a connect either started before
+			// (refused here) or starts after and sees HTTP mode - never TCP paths beside HTTP mode
+			lock (this)
+			{
+				if (_tcpUsed) // (not _tcpClient: a reset nulls it, and multipath never sets it)
+					throw new InvalidOperationException("Cannot switch to HTTP after TCP connection");
+				if (Volatile.Read(ref _connectsInFlight) > 0) // (not _connecting: a reset nulls it mid-connect)
 					throw new InvalidOperationException("Cannot switch to HTTP while connecting");
-			_httpClient = httpClient ?? new();
-			_httpWait = defaultHttpWait;
-			ParallelTransfers = 1;
-			TransferMode = PathTransferMode.FollowSendMode; // one part at a time, as HTTP needs
+				_httpClient = httpClient ?? new();
+				_httpWait = defaultHttpWait;
+				ParallelTransfers = 1;
+				TransferMode = PathTransferMode.FollowSendMode; // one part at a time, as HTTP needs
+			}
 		}
+		/// <summary>DoConnectAsync runs under way (counted from its start under ConnectAsync's lock to its end)</summary>
+		private int _connectsInFlight;
 
 		/// <summary>Disconnect from Telegram <i>(shouldn't be needed in normal usage)</i></summary>
 		/// <param name="resetUser">Forget about logged-in user</param>
@@ -2254,7 +2260,8 @@ namespace WTelegram
 					// We do NOT acquire the semaphore here — that would deadlock because it starts at 0.
 
 					await Task.Delay(Math.Max(1000, Math.Min(attempt * 2000, PathReconnectMaxBackoff * 1000))); // backoff: 2s, 4s, 6s, ... up to 30s (min 1s)
-					ObjectDisposedException.ThrowIf(_disposed, this); // disposed meanwhile: ends the loop (caught below)
+					if (_disposed) // disposed meanwhile: ends the loop (caught below)
+						throw new ObjectDisposedException("WTelegram.Client was disposed");
 					await ConnectAsync();
 
 					// Success — same session, so pending RPCs are re-sent with their own msg_id
@@ -3374,12 +3381,27 @@ namespace WTelegram
 				.Select(dc => dc.flags.HasFlag(DcOption.Flags.media_only) ? dc : new DcOption { id = dc.id, port = dc.port,
 					ip_address = dc.ip_address, secret = dc.secret, flags = dc.flags | DcOption.Flags.media_only });
 
+		/// <summary>Counted in flight (HttpMode refuses meanwhile): the count is taken synchronously, under ConnectAsync's lock</summary>
 		private async Task DoConnectAsync(bool quickResume)
+		{
+			Interlocked.Increment(ref _connectsInFlight);
+			try
+			{
+				await DoConnectCoreAsync(quickResume);
+			}
+			finally
+			{
+				Interlocked.Decrement(ref _connectsInFlight);
+			}
+		}
+
+		private async Task DoConnectCoreAsync(bool quickResume)
 		{
 			// a reconnect (reactor's, full, a 32/33 renewal) racing DisposeAsync must not bring a disposed client back.
 			// Checked again once the new token source exists: DisposeAsync sets _disposed before it cancels _cts, so a
 			// dispose either is seen here or cancels this source.
-			ObjectDisposedException.ThrowIf(_disposed, this);
+			if (_disposed)
+				throw new ObjectDisposedException("WTelegram.Client was disposed");
 			var cts = new CancellationTokenSource();
 			Interlocked.Exchange(ref _cts, cts); // a full fence: the _disposed read below is not reordered before this store
 			if (_disposed)
