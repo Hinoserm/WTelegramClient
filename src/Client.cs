@@ -985,7 +985,7 @@ namespace WTelegram
 			// must then be dropped (see ReadRpcResult). Never reset: a stray mark only costs a dict entry.
 			rpc.copyAttempted = true;
 			long containerId, generation = -1;
-			Task written;
+			Task written = Task.CompletedTask;
 			var sem = _sendSemaphore;
 			try
 			{
@@ -1002,28 +1002,30 @@ namespace WTelegram
 					// registered before the write: a refusal (BadMsgNotification) can arrive before the write returns
 					containerId = QueueOnPath(path, new MsgContainer { messages = [new(rpc.msgId, rpc.seqno, rpc.query)] },
 						out written, beforeWrite: id => _copyContainers[id] = (rpc.msgId, Environment.TickCount64));
+					if (containerId != 0)
+					{
+						// it carries the request from now on (queued in order on its path); counted at once, so a
+						// concurrent caller cannot send another copy while this one waits to be written
+						rpc.hedgedGen = generation;
+						rpc.hedgedPathIndex = path.PathIndex;
+						rpc.hedged = true;
+						Interlocked.Increment(ref rpc.copies);
+					}
 				}
 				finally
 				{
 					sem.Release();
 				}
-				await written; // outside the semaphore: a slow path holds up only its own frames
 			}
 			catch (Exception ex)
 			{
 				Helpers.Log(2, $"{_dcSession?.DcID}>{reason}: copy of #{(short)rpc.msgId.GetHashCode():X4} on P{path.PathIndex} failed: {ex.Message}");
-				if (ex is IOException) // its CTR state is past a partial frame: let its reactor fail and reconnect it
-					lock (_pathsLock)
-						if (path.Generation == generation) // not a newer connection swapped in meanwhile
-							path.NetworkStream?.Close();
 				return false;
 			}
 			if (containerId == 0)
 				return false;
-			rpc.hedgedGen = generation;
-			rpc.hedgedPathIndex = path.PathIndex;
-			rpc.hedged = true;
-			Interlocked.Increment(ref rpc.copies);
+			// not awaited: the callers include the path monitors, which serve every path and must not wait on a slow one
+			_ = CopyWrittenAsync(written, rpc, path, generation, reason);
 			if (sole)
 				Interlocked.Increment(ref _statRescued);
 			else if (reason == "Hedge")
@@ -1034,6 +1036,26 @@ namespace WTelegram
 			if (sole)
 				_ = CopyAnswerWatchdog(rpc, Interlocked.Increment(ref rpc.soleCopies));
 			return true;
+		}
+
+		/// <summary>A copy's write failed: it carries nothing, so the request is open to another copy again, and the
+		/// connection (its CTR state past a partial frame) is closed for its reactor to reconnect, unless a newer
+		/// connection was swapped in meanwhile.</summary>
+		private async Task CopyWrittenAsync(Task written, Rpc rpc, TransportPath path, long generation, string reason)
+		{
+			try
+			{
+				await written;
+			}
+			catch (Exception ex)
+			{
+				Helpers.Log(2, $"{_dcSession?.DcID}>{reason}: copy of #{(short)rpc.msgId.GetHashCode():X4} on P{path.PathIndex} failed: {ex.Message}");
+				if (rpc.hedgedPathIndex == path.PathIndex && rpc.hedgedGen == generation)
+					rpc.hedged = false;
+				lock (_pathsLock)
+					if (path.Generation == generation)
+						path.NetworkStream?.Close();
+			}
 		}
 
 		/// <summary>A copy that replaced a lost original gets <see cref="CopyAnswerTimeoutMs"/> to be answered,
@@ -1350,6 +1372,8 @@ namespace WTelegram
 				if (!await SendCopyAsync(rpc, rpc.sentPathIndex, timedOut ? $"Stalled >{PathRpcStallTimeout}s" : "Slow WAN", sole: false))
 					continue;
 				RecordSlowTransfer(rpc); // a file part: its WAN's speed so far is a sample (no answer will be one)
+				if (!timedOut)
+					continue; // a slow WAN for file parts: its latency (what the penalty steers) is fine
 				lock (_pathsLock)
 					if (rpc.sentPathIndex < _paths.Count)
 					{
@@ -1485,7 +1509,8 @@ namespace WTelegram
 						await sem.WaitAsync(ct);
 						try
 						{
-							QueueOnPath(path, new TL.Methods.Ping { ping_id = Random.Shared.NextInt64() }, out written);
+							if (QueueOnPath(path, new TL.Methods.Ping { ping_id = Random.Shared.NextInt64() }, out written) == 0)
+								continue; // not queued (path down meanwhile): nothing to report
 						}
 						finally
 						{
@@ -1675,7 +1700,7 @@ namespace WTelegram
 				// Telegram ignores. We must do a full reconnect (ResetAsync + ConnectAsync
 				// + InitConnection + Updates_GetState) to properly re-register the session.
 				if (alivePaths.Length > 0 && !alivePaths.Any(p =>
-					(now - p.LastRecvTicks) <= deadAfterMs || p.LastProbeTicks <= p.LastRecvTicks))
+					(now - p.LastRecvTicks) <= deadAfterMs || p.LastProbeWrittenTicks <= p.LastRecvTicks))
 				{
 					// Check if the Reactor is already handling a full reconnect
 					lock (_pathsLock)
@@ -1716,7 +1741,9 @@ namespace WTelegram
 						continue;
 					var silentMs = now - path.LastRecvTicks;
 
-					if (silentMs > deadAfterMs && path.LastProbeTicks > path.LastRecvTicks && !anyPathReceiving)
+					// probe WRITTEN after the last receive (one still queued behind slow writes proves nothing; a path
+					// whose writes are stuck is closed by WriteFrameAsync's timeout instead)
+					if (silentMs > deadAfterMs && path.LastProbeWrittenTicks > path.LastRecvTicks && !anyPathReceiving)
 					{
 						// This individual path is unresponsive AND no other paths are receiving
 						// data either — the DC may be genuinely unreachable from this address.
@@ -1750,7 +1777,7 @@ namespace WTelegram
 							// uplink), and this loop serves every path. Its clock starts when it is written, so time
 							// spent queued is neither RTT nor a missed probe.
 							if (queued != 0)
-								_ = TrackProbeAsync(written, thisPingId, path.PathIndex);
+								_ = TrackProbeAsync(written, thisPingId, path);
 						}
 						catch { /* path might already be dead, next cycle will catch it */ }
 					}
@@ -1816,12 +1843,14 @@ namespace WTelegram
 		}
 
 		/// <summary>Registers a liveness probe once its frame is written (see the health monitor).</summary>
-		private async Task TrackProbeAsync(Task written, long pingId, int pathIndex)
+		private async Task TrackProbeAsync(Task written, long pingId, TransportPath path)
 		{
 			try
 			{
 				await written;
-				_pendingPings[pingId] = (pathIndex, Environment.TickCount64);
+				long now = Environment.TickCount64;
+				_pendingPings[pingId] = (path.PathIndex, now);
+				Volatile.Write(ref path.LastProbeWrittenTicks, now);
 			}
 			catch { /* write failed: the path's reactor fails and reconnects it */ }
 		}
@@ -2414,6 +2443,8 @@ namespace WTelegram
 			public Task WriteChain = Task.CompletedTask;
 			public readonly object WriteChainLock = new();
 			public long LastQueuedTicks; // Environment.TickCount64 of the last frame queued (it may still be writing)
+			public long FailedGeneration; // the connection a failed write was already acted on for (under _pathsLock)
+			public long LastProbeWrittenTicks; // when the last liveness probe was actually written (not just queued)
 
 			public void Dispose()
 			{
@@ -3610,6 +3641,7 @@ namespace WTelegram
 			Task pathWrite = null;
 			TransportPath writePath = null;
 			int writeLength = 0;
+			long writeGeneration = 0;
 			var sem = _sendSemaphore;
 			try
 			{
@@ -3716,6 +3748,7 @@ namespace WTelegram
 					// semaphore is released, so a path that is slow to drain holds up only its own frames
 					writePath = path;
 					writeLength = frameLength;
+					writeGeneration = path.Generation;
 					if ((rpc ?? containedRpc) is Rpc queued)
 						Volatile.Write(ref queued.queuedTicks, Environment.TickCount64);
 					pathWrite = path.NetworkStream is Stream stream
@@ -3761,9 +3794,17 @@ namespace WTelegram
 				// A request answered (by a copy) while its frame still waits to be written on a slow path: the
 				// caller has its answer now; the write completes in the background, handled the same way.
 				if (subject != null && !pathWrite.IsCompleted && await Task.WhenAny(pathWrite, subject.Task) != pathWrite)
-					_ = AfterPathWriteAsync(pathWrite, writePath, writeLength, subject);
+					_ = AfterPathWriteAsync(pathWrite, writePath, writeGeneration, writeLength, subject);
 				else
-					await AfterPathWriteAsync(pathWrite, writePath, writeLength, subject);
+					try
+					{
+						await AfterPathWriteAsync(pathWrite, writePath, writeGeneration, writeLength, subject);
+					}
+					catch when (rpc != null)
+					{
+						ForgetPending(rpc); // the caller gets the exception: the request must not be re-sent after a reconnect
+						throw;
+					}
 				return;
 			}
 			HedgeIfWanted(rpc);
@@ -3776,7 +3817,9 @@ namespace WTelegram
 		/// to another path rather than letting Invoke retry with a new one. With no other path alive it stays pending:
 		/// the path's reconnect re-sends it the same way or hands it back to Invoke (RescueStrandedRpcsAsync /
 		/// ResendPendingAfterReconnectAsync). A frame without a request rethrows the write error.</summary>
-		private async Task AfterPathWriteAsync(Task write, TransportPath path, int length, Rpc subject)
+		/// <param name="generation">The connection the frame was queued on: a failure only ever concerns that one, and is
+		/// acted on once (every frame queued behind it fails too)</param>
+		private async Task AfterPathWriteAsync(Task write, TransportPath path, long generation, int length, Rpc subject)
 		{
 			try
 			{
@@ -3790,21 +3833,29 @@ namespace WTelegram
 			}
 			catch (IOException ex) when (_paths.Count > 0)
 			{
-				// Task.Run so ReconnectPathAsync (and its RaisePathChanged) starts on a ThreadPool thread,
-				// never inline in a caller that may hold locks.
-				bool wasAlive;
+				bool first, wasAlive = false;
 				lock (_pathsLock)
 				{
-					wasAlive = path.IsAlive;
-					path.IsAlive = false;
+					first = path.Generation == generation && path.FailedGeneration != generation;
+					if (first)
+					{
+						path.FailedGeneration = generation;
+						wasAlive = path.IsAlive;
+						path.IsAlive = false;
+					}
 				}
-				AddPenalty(path, 500);
-				if (wasAlive)
-					Helpers.Log(3, $"{_dcSession.DcID}>Path {path.PathIndex} write failed ({ex.Message}). Reconnecting path in background.");
-				if (_paths.Count > 1)
-					_ = Task.Run(() => ReconnectPathAsync(path, ex));
-				else
-					path.NetworkStream?.Close(); // single path: its reactor fails and runs the full reconnect (with Updates_GetState)
+				if (first)
+				{
+					// Task.Run so ReconnectPathAsync (and its RaisePathChanged) starts on a ThreadPool thread,
+					// never inline in a caller that may hold locks.
+					AddPenalty(path, 500);
+					if (wasAlive)
+						Helpers.Log(3, $"{_dcSession.DcID}>Path {path.PathIndex} write failed ({ex.Message}). Reconnecting path in background.");
+					if (_paths.Count > 1)
+						_ = Task.Run(() => ReconnectPathAsync(path, ex));
+					else
+						path.NetworkStream?.Close(); // single path: its reactor fails and runs the full reconnect (with Updates_GetState)
+				}
 				if (subject == null)
 					throw;
 				await SendCopyAsync(subject, path.PathIndex, $"P{path.PathIndex} write failed", sole: true);
@@ -3899,6 +3950,8 @@ namespace WTelegram
 			};
 			// the transfer scheduler's lease for this part (flows here from UploadFileAsync / DownloadFileAsync)
 			var lease = transferDir >= 0 && CurrentTransfer.Value is TransferLease l && l.Dir == transferDir ? l : null;
+			if (lease == null)
+				transferDir = -1; // not scheduled (TransferMode FollowSendMode): none of the transfer handling, as before it
 		retry:
 			var rpc = new Rpc { type = typeof(T), bulk = bulk, transferDir = transferDir, transferBytes = transferBytes,
 				lease = lease, stallExtraMs = lease?.StallExtraMs ?? 0 };

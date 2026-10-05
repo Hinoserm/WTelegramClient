@@ -67,6 +67,7 @@ namespace WTelegram
 
 					async Task SavePart(int file_part, byte[] bytes, TransferLease lease)
 					{
+						int floods = 0;
 						try
 						{
 							while (true)
@@ -80,7 +81,7 @@ namespace WTelegram
 										await client.Upload_SaveFilePart(file_id, file_part, bytes);
 									break;
 								}
-								catch (RpcException ex) when (lease != null && IsTransferFlood(ex))
+								catch (RpcException ex) when (lease != null && IsTransferFlood(ex) && ++floods <= MaxTransferFloods)
 								{
 									lease = await AfterTransferFloodAsync(client, lease, ex, bytes.Length);
 								}
@@ -433,6 +434,7 @@ namespace WTelegram
 				async Task<int> LoadPart(long offset, TransferLease lease)
 				{
 					Upload_FileBase fileBase;
+					int floods = 0;
 					try
 					{
 						while (true)
@@ -451,7 +453,7 @@ namespace WTelegram
 								}
 								break;
 							}
-							catch (RpcException ex) when (lease != null && IsTransferFlood(ex))
+							catch (RpcException ex) when (lease != null && IsTransferFlood(ex) && ++floods <= MaxTransferFloods)
 							{
 								lease = await AfterTransferFloodAsync(client, lease, ex, FilePartSize);
 							}

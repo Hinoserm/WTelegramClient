@@ -12,8 +12,9 @@ namespace WTelegram
 	/// <summary>How file parts (uploads and downloads) are spread over multipath transport connections.</summary>
 	public enum PathTransferMode
 	{
-		/// <summary>Every part goes on the path <see cref="Client.SendMode"/> picks for any request (the old behaviour),
-		/// at most <see cref="Client.ParallelTransfers"/> parts at once in all.</summary>
+		/// <summary>Every part goes on the path <see cref="Client.SendMode"/> picks for any request, at most
+		/// <see cref="Client.ParallelTransfers"/> parts at once in all, with no speed measurement or slow-part copies
+		/// (the old behaviour; frames are still written per path, outside the send lock).</summary>
 		FollowSendMode,
 		/// <summary>Upload and download speed are measured per WAN (local address), separately, from the parts
 		/// themselves. Each part goes to the WAN expected to finish it first, counting what that WAN already has
@@ -36,6 +37,7 @@ namespace WTelegram
 		public int TransferMaxFloodWait { get; set; } = 60;
 
 		internal const int TransferUp = 0, TransferDown = 1;
+		private const int MaxTransferFloods = 5; // FLOOD_WAITs honoured for one part before its transfer fails with the error
 		private const int MinSampleBytes = 64 * 1024; // smaller parts (a file's last one) time mostly latency
 		private const double SampleWeight = 0.3; // EWMA weight of a new speed sample
 		private const double SlowSampleWeight = 0.6; // ... of one slower than the average
@@ -174,24 +176,23 @@ namespace WTelegram
 						}
 					}
 				}
-				await Task.WhenAny(pulse, Task.Delay((int)Math.Min(waitMs, 5000)));
+				using var delayCts = new CancellationTokenSource(); // the timer is dropped as soon as a pulse comes
+				await Task.WhenAny(pulse, Task.Delay((int)Math.Min(waitMs, 5000), delayCts.Token));
+				delayCts.Cancel();
 			}
 		}
 
-		/// <summary>The WAN's speed (<paramref name="bps"/>: measured, or assumed), unless a part in flight shows it slower
-		/// right now (bytes / age so far): a WAN that just slowed down stops getting parts within a second, not after
-		/// several slow answers. 0 = no estimate. Caller holds _transferLock.</summary>
+		/// <summary>The WAN's speed (<paramref name="bps"/>: measured, or assumed), unless its oldest part in flight shows
+		/// it slower right now (bytes / age so far): a WAN that just slowed down stops getting parts within a second, not
+		/// after several slow answers. Only the oldest: the others wait behind it, so their age is queueing, not
+		/// slowness. 0 = no estimate. Caller holds _transferLock.</summary>
 		private static double LiveBps(WanStats wan, int dir, long now, double bps)
 		{
-			if (bps <= 0)
+			if (bps <= 0 || wan.Active[dir].Count == 0)
 				return bps;
-			foreach (var lease in wan.Active[dir])
-			{
-				long age = now - lease.StartTicks;
-				if (age > 250 && lease.Bytes * 1000.0 / age < bps)
-					bps = lease.Bytes * 1000.0 / age;
-			}
-			return bps;
+			var oldest = wan.Active[dir].MinBy(l => l.StartTicks);
+			long age = now - oldest.StartTicks;
+			return age > 250 ? Math.Min(bps, oldest.Bytes * 1000.0 / age) : bps;
 		}
 
 		private int Cap(WanStats wan, int dir, long now)
@@ -231,9 +232,9 @@ namespace WTelegram
 				$"that WAN rests {seconds}s, then takes {Cap(lease.Wan, lease.Dir, now)} part(s) at a time for 5 min");
 		}
 
-		/// <summary>A file part still unanswered on a WAN measured under <see cref="RescueRatio"/> of the best other one, after three times
-		/// what that one would need (and at least 750 ms): it gets a copy there (see CopyStalledRpcsAsync), so a slow
-		/// WAN never holds up the end of a file.</summary>
+		/// <summary>A file part (at least 750 ms after queuing) on a WAN measured under <see cref="RescueRatio"/> of the best
+		/// other one, when that one would finish it well before its own WAN gets through the parts queued ahead of it:
+		/// it gets a copy there (see CopyStalledRpcsAsync), so a slow WAN never holds up the end of a file.</summary>
 		private bool TransferCopyDue(Rpc rpc, long now)
 		{
 			if (rpc.transferDir < 0 || rpc.transferBytes <= 0)
@@ -251,26 +252,38 @@ namespace WTelegram
 			var root = RootClient;
 			int dir = rpc.transferDir;
 			double ownBps, bestOther = 0;
+			int ahead = 0, otherInFlight = 0;
 			bool otherUnmeasured = false;
 			lock (root._transferLock)
 			{
-				ownBps = Wan(WanKey(own)).Bps[dir];
+				var ownWan = Wan(WanKey(own));
+				ownBps = ownWan.Bps[dir];
+				if (rpc.lease is TransferLease lease) // parts of its WAN handed out before it: it waits behind them
+					foreach (var l in ownWan.Active[dir])
+						if (l.StartTicks < lease.StartTicks)
+							ahead++;
 				foreach (var p in paths)
-					if (p != own && Wan(WanKey(p)) is var w && w != Wan(WanKey(own)) && w.FloodUntilTicks[dir] <= now)
+					if (p != own && Wan(WanKey(p)) is var w && w != ownWan && w.FloodUntilTicks[dir] <= now)
 					{
-						bestOther = Math.Max(bestOther, w.Bps[dir]);
+						if (w.Bps[dir] > bestOther)
+							(bestOther, otherInFlight) = (w.Bps[dir], w.InFlight[dir]);
 						otherUnmeasured |= w.Bps[dir] <= 0;
 					}
 			}
 			// another WAN not measured yet (just connected, e.g. right after a start) counts as fast, as in the
 			// scheduler; with nothing measured at all, a part 2 s old is copied
-			if (otherUnmeasured && ownBps > 0)
-				bestOther = Math.Max(bestOther, ownBps * 2);
+			if (otherUnmeasured && ownBps > 0 && ownBps * 2 > bestOther)
+				(bestOther, otherInFlight) = (ownBps * 2, 0);
 			if (bestOther <= 0)
 				return otherUnmeasured && age > 2000;
 			if (ownBps > 0 && ownBps >= bestOther * RescueRatio)
 				return false;
-			return age > 3 * (rpc.transferBytes * 1000.0 / bestOther);
+			double fastMs = (otherInFlight + 1) * rpc.transferBytes * 1000.0 / bestOther;
+			if (ownBps <= 0) // its own WAN not measured: by age alone
+				return age > 3 * fastMs;
+			// copy when the fast WAN would finish it well before its own WAN gets through the parts ahead of it and it
+			double ownRemainingMs = (ahead + 1) * rpc.transferBytes * 1000.0 / ownBps - age;
+			return ownRemainingMs > 2 * fastMs + 250;
 		}
 
 		/// <summary>FLOOD_WAIT_X / FLOOD_PREMIUM_WAIT_X (error 420) on a file part.</summary>
@@ -283,7 +296,7 @@ namespace WTelegram
 		{
 			int seconds = Math.Max(1, ex.X);
 			if (seconds > TransferMaxFloodWait)
-				throw ex;
+				System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw(ex); // keeps its stack
 			OnTransferFlood(lease, seconds);
 			ReleaseTransfer(lease);
 			return await AcquireTransferAsync(client, lease.Dir, bytes);
@@ -305,12 +318,13 @@ namespace WTelegram
 			AddTransferSample(carrier, dir, bytes, Volatile.Read(ref rpc.writtenTicks), done: true);
 		}
 
-		/// <summary>A file part being copied because its WAN is slow: an upper bound of that WAN's speed (bytes / time
-		/// since it was queued there), so the scheduler learns it even though no answer will say so.</summary>
+		/// <summary>A file part being copied because its WAN is slow: if it was already written (not still queued behind
+		/// the WAN's earlier parts, which would count queueing as slowness), an upper bound of that WAN's speed (bytes /
+		/// time since written), so the scheduler learns it even though no answer will say so.</summary>
 		private void RecordSlowTransfer(Rpc rpc)
 		{
-			if (rpc.transferDir >= 0 && rpc.transferBytes >= MinSampleBytes)
-				AddTransferSample(rpc.sentPathIndex, rpc.transferDir, rpc.transferBytes, Volatile.Read(ref rpc.queuedTicks), done: false);
+			if (rpc.transferDir >= 0 && rpc.transferBytes >= MinSampleBytes && Volatile.Read(ref rpc.writtenTicks) > 0)
+				AddTransferSample(rpc.sentPathIndex, rpc.transferDir, rpc.transferBytes, Volatile.Read(ref rpc.writtenTicks), done: false);
 		}
 
 		/// <param name="done">An answered part: its time runs from its write, or from the WAN's previous answer if that
