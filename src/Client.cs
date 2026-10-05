@@ -302,9 +302,11 @@ namespace WTelegram
 		/// so Telegram does not drop the connection the transfers are not currently using.</summary>
 		public int ChildPathKeepAlive { get; set; } = 20;
 
-		// msg_ids of requests already answered (or handed back to Invoke): a second answer, to a copy or
-		// re-delivered by the server on another connection under a new server msg_id, must not be raised
-		// again (OnOwnUpdates). Every request, not only copied ones. Pruned after 5 minutes.
+		// msg_ids of requests already answered, handed back to Invoke, or forgotten (ForgetPending: the caller got an
+		// exception): a second answer, to a copy or re-delivered by the server on another connection under a new
+		// server msg_id, must not be raised again (OnOwnUpdates), and a BadMsgNotification 32/33 about one is no
+		// reason for a session reset (nobody waits on it; the next live request resyncs). Every request, not only
+		// copied ones. Pruned after 5 minutes.
 		private readonly ConcurrentDictionary<long, long> _settledHedged = new();
 		// container msg_id of each copy → msg_id of the request inside it, so a BadMsgNotification
 		// about a copy is not mistaken for one about the original. Pruned with _settledHedged.
@@ -986,6 +988,8 @@ namespace WTelegram
 			// must then be dropped (see ReadRpcResult). Never reset: a stray mark only costs a dict entry.
 			rpc.copyAttempted = true;
 			long containerId, generation = -1, markedId = 0;
+			(bool, int, long, long) prior = default; // the carrier fields before this copy marked itself
+			(WanStats Wan, Rpc Owner, bool Valid) priorLoad = default; // and the counted copy load
 			Task written = Task.CompletedTask;
 			var sem = _sendSemaphore;
 			try
@@ -1001,14 +1005,16 @@ namespace WTelegram
 						return false; // aged while waiting for the semaphore (the server would refuse it: BadMsg 16)
 					generation = path.Generation;
 					var gen = generation;
-					// Registered and marked before the write can start: a refusal (BadMsgNotification) about it can arrive
-					// before the write returns, and must find it registered and counted as carrier.
+					// Registered and marked right before the frame is queued (QueueOnPath calls this after everything that can
+					// fail): a refusal (BadMsgNotification) about it can arrive before the write returns, and must find it
+					// registered and counted as carrier.
 					containerId = QueueOnPath(path, new MsgContainer { messages = [new(rpc.msgId, rpc.seqno, rpc.query)] },
 						out written, beforeWrite: id =>
 						{
 							_copyContainers[id] = (rpc.msgId, Environment.TickCount64);
 							lock (rpc) // with UncountCopy
 							{
+								prior = (rpc.hedged, rpc.hedgedPathIndex, rpc.hedgedGen, rpc.hedgedContainerId);
 								// it carries the request from now on (queued in order on its path); counted at once, so a
 								// concurrent caller cannot send another copy while this one waits to be written
 								rpc.hedgedGen = gen;
@@ -1017,8 +1023,8 @@ namespace WTelegram
 								rpc.hedged = true;
 								Interlocked.Increment(ref rpc.copies);
 							}
-							CountTransferCopy(rpc, path); // a file part's copy is load on its WAN, like a part
-							markedId = id;
+							markedId = id; // before anything else can throw: the rollback below needs it
+							priorLoad = CountTransferCopy(rpc, path); // a file part's copy is load on its WAN, like a part
 						});
 				}
 				finally
@@ -1029,8 +1035,17 @@ namespace WTelegram
 			catch (Exception ex)
 			{
 				Helpers.Log(2, $"{_dcSession?.DcID}>{reason}: copy of #{(short)rpc.msgId.GetHashCode():X4} on P{path.PathIndex} failed: {ex.Message}");
-				if (markedId != 0 && UncountCopy(rpc, markedId)) // marked, then failed before its write was queued
-					UncountTransferCopy(rpc);
+				if (markedId != 0) // marked, then failed before its frame was queued: everything back as it was
+				{
+					_copyContainers.TryRemove(markedId, out _);
+					lock (rpc)
+						if (rpc.hedgedContainerId == markedId)
+						{
+							(rpc.hedged, rpc.hedgedPathIndex, rpc.hedgedGen, rpc.hedgedContainerId) = prior;
+							Interlocked.Decrement(ref rpc.copies);
+						}
+					RestoreTransferCopy(rpc, priorLoad);
+				}
 				return false;
 			}
 			if (containerId == 0)
@@ -2015,7 +2030,6 @@ namespace WTelegram
 			if ((!path.IsAlive && !registering) || stream == null || _dcSession.authKeyID == 0)
 				return 0;
 			var (msgId, seqno) = NewMsgId(false);
-			beforeWrite?.Invoke(msgId);
 			using var memStream = new MemoryStream(1024);
 			using var writer = new BinaryWriter(memStream);
 			writer.Write(0); // payload_len placeholder
@@ -2055,6 +2069,9 @@ namespace WTelegram
 			var buffer = memStream.GetBuffer();
 			int frameLength = (int)memStream.Length;
 			BinaryPrimitives.WriteInt32LittleEndian(buffer, frameLength - 4);
+			// after everything that can fail (salt, serialisation, encryption), right before the frame is queued: what it
+			// registers or marks is never left behind for a frame that was not sent
+			beforeWrite?.Invoke(msgId);
 			written = WrittenAsync(QueueFrameWrite(path, stream, buffer, frameLength));
 			return msgId;
 
@@ -4023,6 +4040,8 @@ namespace WTelegram
 			}
 			catch (IOException) when (_paths.Count > 0 && ++ioRetries <= 5)
 			{
+				if (lease != null)
+					Volatile.Write(ref lease.QueuedTicks, 0); // this attempt is over: the wait below is no time on a WAN
 				// Multipath: transport write failed on a dead path but other paths
 				// may be alive (or reconnecting). Wait for path recovery, then retry.
 				// Don't check Disconnected — even if all paths are currently dead,
@@ -4035,6 +4054,8 @@ namespace WTelegram
 				await HttpWait(_httpWait); // need to wait a bit more in some case
 
 			var result = await rpc.Task;
+			if (lease != null) // this attempt is over (answered, or about to be retried): no more time on a WAN
+				Volatile.Write(ref lease.QueuedTicks, 0);
 			switch (result)
 			{
 				case null: return default;

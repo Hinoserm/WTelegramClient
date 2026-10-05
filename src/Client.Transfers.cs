@@ -59,6 +59,7 @@ namespace WTelegram
 			internal int Bytes;
 			internal int released;
 			internal WanStats CopyWan; // a copy of this part counted in that WAN's InFlight (one at most), until released
+			internal Rpc CopyOwner; // the attempt (request) whose copy that is
 			internal long QueuedTicks; // when its part's current attempt was queued on a path (0: not yet); Volatile
 		}
 
@@ -213,23 +214,25 @@ namespace WTelegram
 		/// <summary>A copy of a file part queued on <paramref name="path"/> (it is now the request's carrier copy): counted in
 		/// that WAN's parts in flight (so the scheduler and the rescue rule see its load), one copy per part: a newer copy
 		/// on another WAN moves the count there. Until the part's lease is released, or the counted copy fails.</summary>
-		private void CountTransferCopy(Rpc rpc, TransportPath path)
+		/// <returns>The copy load counted before (to restore it if this copy is rolled back); Valid: this call changed it</returns>
+		private (WanStats Wan, Rpc Owner, bool Valid) CountTransferCopy(Rpc rpc, TransportPath path)
 		{
 			if (rpc.transferDir < 0 || rpc.lease is not TransferLease lease)
-				return;
+				return default;
 			var root = RootClient;
 			lock (root._transferLock)
 			{
 				if (Volatile.Read(ref lease.released) != 0)
-					return;
-				var w = Wan(WanKey(path));
-				if (lease.CopyWan == w)
-					return;
+					return default;
+				var prior = (lease.CopyWan, lease.CopyOwner, true);
 				UncountTransferCopyLocked(lease); // the previous copy no longer carries it
-				if (w == lease.Wan)
-					return; // a copy on its own WAN adds nothing to count
-				w.InFlight[lease.Dir]++;
-				lease.CopyWan = w;
+				var w = Wan(WanKey(path));
+				if (w != lease.Wan) // a copy on its own WAN adds nothing to count
+				{
+					w.InFlight[lease.Dir]++;
+					(lease.CopyWan, lease.CopyOwner) = (w, rpc);
+				}
+				return prior;
 			}
 		}
 
@@ -241,13 +244,33 @@ namespace WTelegram
 				Volatile.Write(ref lease.QueuedTicks, now); // read under _transferLock; no lock needed to publish it
 		}
 
-		/// <summary>Undoes <see cref="CountTransferCopy"/> (caller holds no transfer lock).</summary>
+		/// <summary>Undoes <see cref="CountTransferCopy"/> for a copy of this request (the lease is shared by every attempt
+		/// of the part: an older attempt's copy failing late must not uncount the current one's).</summary>
 		private void UncountTransferCopy(Rpc rpc)
 		{
 			if (rpc.lease is not TransferLease lease)
 				return;
 			lock (RootClient._transferLock)
-				UncountTransferCopyLocked(lease);
+				if (lease.CopyOwner == rpc)
+					UncountTransferCopyLocked(lease);
+		}
+
+		/// <summary>A copy rolled back before it was queued: the copy load counted before it is counted again (only if
+		/// <see cref="CountTransferCopy"/> ran for it and changed anything).</summary>
+		private void RestoreTransferCopy(Rpc rpc, (WanStats Wan, Rpc Owner, bool Valid) prior)
+		{
+			if (!prior.Valid || rpc.lease is not TransferLease lease)
+				return;
+			lock (RootClient._transferLock)
+			{
+				if (lease.CopyOwner == rpc)
+					UncountTransferCopyLocked(lease);
+				if (prior.Wan != null && lease.CopyWan == null && Volatile.Read(ref lease.released) == 0)
+				{
+					prior.Wan.InFlight[lease.Dir]++;
+					(lease.CopyWan, lease.CopyOwner) = (prior.Wan, prior.Owner);
+				}
+			}
 		}
 
 		private static void UncountTransferCopyLocked(TransferLease lease)
@@ -255,7 +278,7 @@ namespace WTelegram
 			if (lease.CopyWan is WanStats w)
 			{
 				w.InFlight[lease.Dir]--;
-				lease.CopyWan = null;
+				(lease.CopyWan, lease.CopyOwner) = (null, null);
 			}
 		}
 
