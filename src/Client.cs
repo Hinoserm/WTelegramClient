@@ -1338,12 +1338,18 @@ namespace WTelegram
 			if (stallMs <= 0)
 				return;
 			var now = Environment.TickCount64;
-			List<Rpc> stalled = null;
+			List<Rpc> stalled = null, transfers = null;
 			lock (_pendingRpcs)
 				foreach (var rpc in _pendingRpcs.Values)
-					if (!rpc.hedged && rpc.query != null && rpc.sentPathIndex >= 0 && rpc.writtenTicks > 0
-						&& now - rpc.writtenTicks > stallMs + Volatile.Read(ref rpc.stallExtraMs))
-						(stalled ??= []).Add(rpc); // from the write, not the registration: a part queued behind others is not stalled
+					if (!rpc.hedged && rpc.query != null && rpc.sentPathIndex >= 0 && rpc.writtenTicks > 0)
+						if (now - rpc.writtenTicks > stallMs + Volatile.Read(ref rpc.stallExtraMs))
+							(stalled ??= []).Add(rpc); // from the write, not the registration: a part queued behind others is not stalled
+						else if (rpc.transferDir >= 0)
+							(transfers ??= []).Add(rpc);
+			if (transfers != null) // judged outside the lock: it takes the path and transfer locks
+				foreach (var rpc in transfers)
+					if (TransferCopyDue(rpc, now))
+						(stalled ??= []).Add(rpc);
 			if (stalled == null)
 				return;
 			foreach (var rpc in stalled)

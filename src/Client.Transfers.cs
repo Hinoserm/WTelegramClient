@@ -131,11 +131,9 @@ namespace WTelegram
 							double bestEta = double.MaxValue;
 							foreach (var c in cands)
 							{
-								double bps = LiveBps(c.Wan, dir, now);
-								// not measured: only probed; but one whose probes never come back with a sample
-								// (answers routed to another connection) is assumed as fast as the best one
-								if (bps <= 0 && bestKnown > 0 && c.Wan.ProbesUnsampled[dir] >= 2)
-									bps = bestKnown;
+								// not measured yet: assumed fast (twice the best known), so it carries parts at once and
+								// gets measured; if it is slow, its first part in flight shows it within a second
+								double bps = LiveBps(c.Wan, dir, now, c.Wan.Bps[dir] > 0 ? c.Wan.Bps[dir] : bestKnown * 2);
 								if (bps <= 0)
 									continue;
 								double eta = (c.Wan.InFlight[dir] + 1) * (double)bytes / bps * 1000;
@@ -175,12 +173,11 @@ namespace WTelegram
 			}
 		}
 
-		/// <summary>The WAN's measured speed, unless its oldest part in flight shows it slower right now (bytes / age so
-		/// far): a WAN that just slowed down stops getting parts within a second, not after several slow answers.
-		/// 0 = not measured. Caller holds _transferLock.</summary>
-		private static double LiveBps(WanStats wan, int dir, long now)
+		/// <summary>The WAN's speed (<paramref name="bps"/>: measured, or assumed), unless a part in flight shows it slower
+		/// right now (bytes / age so far): a WAN that just slowed down stops getting parts within a second, not after
+		/// several slow answers. 0 = no estimate. Caller holds _transferLock.</summary>
+		private static double LiveBps(WanStats wan, int dir, long now, double bps)
 		{
-			double bps = wan.Bps[dir];
 			if (bps <= 0)
 				return bps;
 			foreach (var lease in wan.Active[dir])
@@ -227,6 +224,37 @@ namespace WTelegram
 			}
 			Helpers.Log(3, $"{_dcSession?.DcID}>FLOOD_WAIT {seconds}s on {(lease.Dir == TransferUp ? "upload" : "download")} via {lease.Wan.Address}: " +
 				$"that WAN rests {seconds}s, then takes {Cap(lease.Wan, lease.Dir, now)} part(s) at a time for 5 min");
+		}
+
+		/// <summary>A file part still unanswered on a WAN measured at under half the best other one, after three times
+		/// what that one would need (and at least 750 ms): it gets a copy there (see CopyStalledRpcsAsync), so a slow
+		/// WAN never holds up the end of a file.</summary>
+		private bool TransferCopyDue(Rpc rpc, long now)
+		{
+			if (rpc.transferDir < 0 || rpc.transferBytes <= 0)
+				return false;
+			long age = now - Volatile.Read(ref rpc.writtenTicks);
+			if (age < 750)
+				return false;
+			TransportPath[] paths;
+			lock (_pathsLock)
+				paths = _paths.Where(p => p.IsAlive && p.NetworkStream != null).ToArray();
+			var own = paths.FirstOrDefault(p => p.PathIndex == rpc.sentPathIndex);
+			if (own == null)
+				return false; // its path is gone: the rescue on path loss deals with it
+			var root = RootClient;
+			int dir = rpc.transferDir;
+			double ownBps, bestOther = 0;
+			lock (root._transferLock)
+			{
+				ownBps = Wan(WanKey(own)).Bps[dir];
+				foreach (var p in paths)
+					if (p != own && Wan(WanKey(p)) is var w && w != Wan(WanKey(own)) && w.FloodUntilTicks[dir] <= now)
+						bestOther = Math.Max(bestOther, w.Bps[dir]);
+			}
+			if (bestOther <= 0 || (ownBps > 0 && ownBps >= bestOther / 2))
+				return false;
+			return age > 3 * (rpc.transferBytes * 1000.0 / bestOther);
 		}
 
 		/// <summary>FLOOD_WAIT_X / FLOOD_PREMIUM_WAIT_X (error 420) on a file part.</summary>
