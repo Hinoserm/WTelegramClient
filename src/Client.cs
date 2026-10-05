@@ -321,8 +321,6 @@ namespace WTelegram
 		private const long ServerMsgIdWindowMs = 330_000;
 		// msg_id of each msgs_state_req we sent → the request it asks about
 		private readonly ConcurrentDictionary<long, Rpc> _stateChecks = new();
-		// msg_ids whose caller got an exception (ForgetPending): a late answer is dropped. Pruned with _settledHedged.
-		private readonly ConcurrentDictionary<long, long> _forgottenRpcs = new();
 		private const int MaxCopies = 8;
 		private long _pathGeneration; // source of TransportPath.Generation
 		// copies and state checks never wait longer than this for the send semaphore (a reconnect holds it)
@@ -987,7 +985,7 @@ namespace WTelegram
 			// before the write: the first answer can arrive before the copy is out, and the second one
 			// must then be dropped (see ReadRpcResult). Never reset: a stray mark only costs a dict entry.
 			rpc.copyAttempted = true;
-			long containerId, generation = -1;
+			long containerId, generation = -1, markedId = 0;
 			Task written = Task.CompletedTask;
 			var sem = _sendSemaphore;
 			try
@@ -1002,22 +1000,26 @@ namespace WTelegram
 					if (Environment.TickCount64 - rpc.sentTicks > CopyMaxAgeMs)
 						return false; // aged while waiting for the semaphore (the server would refuse it: BadMsg 16)
 					generation = path.Generation;
-					// registered before the write: a refusal (BadMsgNotification) can arrive before the write returns
+					var gen = generation;
+					// Registered and marked before the write can start: a refusal (BadMsgNotification) about it can arrive
+					// before the write returns, and must find it registered and counted as carrier.
 					containerId = QueueOnPath(path, new MsgContainer { messages = [new(rpc.msgId, rpc.seqno, rpc.query)] },
-						out written, beforeWrite: id => _copyContainers[id] = (rpc.msgId, Environment.TickCount64));
-					if (containerId != 0)
-						lock (rpc) // with CopyWrittenAsync's rollback
+						out written, beforeWrite: id =>
 						{
-							// it carries the request from now on (queued in order on its path); counted at once, so a
-							// concurrent caller cannot send another copy while this one waits to be written
-							rpc.hedgedGen = generation;
-							rpc.hedgedPathIndex = path.PathIndex;
-							rpc.hedgedContainerId = containerId;
-							rpc.hedged = true;
-							Interlocked.Increment(ref rpc.copies);
-						}
-					if (containerId != 0)
-						CountTransferCopy(rpc, path); // a file part's copy is load on its WAN, like a part
+							_copyContainers[id] = (rpc.msgId, Environment.TickCount64);
+							lock (rpc) // with UncountCopy
+							{
+								// it carries the request from now on (queued in order on its path); counted at once, so a
+								// concurrent caller cannot send another copy while this one waits to be written
+								rpc.hedgedGen = gen;
+								rpc.hedgedPathIndex = path.PathIndex;
+								rpc.hedgedContainerId = id;
+								rpc.hedged = true;
+								Interlocked.Increment(ref rpc.copies);
+							}
+							CountTransferCopy(rpc, path); // a file part's copy is load on its WAN, like a part
+							markedId = id;
+						});
 				}
 				finally
 				{
@@ -1027,6 +1029,8 @@ namespace WTelegram
 			catch (Exception ex)
 			{
 				Helpers.Log(2, $"{_dcSession?.DcID}>{reason}: copy of #{(short)rpc.msgId.GetHashCode():X4} on P{path.PathIndex} failed: {ex.Message}");
+				if (markedId != 0 && UncountCopy(rpc, markedId)) // marked, then failed before its write was queued
+					UncountTransferCopy(rpc);
 				return false;
 			}
 			if (containerId == 0)
@@ -1073,8 +1077,8 @@ namespace WTelegram
 			catch (Exception ex)
 			{
 				Helpers.Log(2, $"{_dcSession?.DcID}>{reason}: copy of #{(short)rpc.msgId.GetHashCode():X4} on P{path.PathIndex} failed: {ex.Message}");
-				UncountCopy(rpc, containerId);
-				UncountTransferCopy(rpc);
+				if (UncountCopy(rpc, containerId)) // only if it is still the counted copy (a newer one keeps its load)
+					UncountTransferCopy(rpc);
 				lock (_pathsLock)
 					if (path.Generation == generation)
 						path.NetworkStream?.Close();
@@ -1462,9 +1466,6 @@ namespace WTelegram
 			foreach (var kvp in _copyContainers)
 				if (now - kvp.Value.Ticks > 300_000)
 					_copyContainers.TryRemove(kvp.Key, out _);
-			foreach (var kvp in _forgottenRpcs)
-				if (now - kvp.Value > 300_000)
-					_forgottenRpcs.TryRemove(kvp.Key, out _);
 		}
 
 		/// <summary>Per-path RTT and liveness from a Pong. Telegram routes answers to ANY connection of the
@@ -1584,12 +1585,12 @@ namespace WTelegram
 
 		private async Task ReconnectPathAsync(TransportPath path, Exception cause = null)
 		{
-			// Prevent multiple concurrent reconnect loops for the same path (atomic guard)
-			if (Interlocked.CompareExchange(ref path._reconnecting, 1, 0) != 0)
-				return;
 			lock (_pathsLock)
 				if (!_paths.Contains(path))
 					return; // replaced by a full reset meanwhile (a late failure on its old connection): nothing to report
+			// Prevent multiple concurrent reconnect loops for the same path (atomic guard)
+			if (Interlocked.CompareExchange(ref path._reconnecting, 1, 0) != 0)
+				return;
 			// Notify subscribers that reconnect is now in progress (IsAlive=false, IsReconnecting=true).
 			// The IsAlive=false transition was already reported by whichever code path set it
 			// (Reactor error, health monitor, or send failure).
@@ -2333,7 +2334,7 @@ namespace WTelegram
 				if (_pendingRpcs.Remove(msgId, out rpc))
 					_settledHedged[msgId] = Environment.TickCount64;
 				else
-					settledBefore = _settledHedged.ContainsKey(msgId) || _forgottenRpcs.ContainsKey(msgId);
+					settledBefore = _settledHedged.ContainsKey(msgId);
 			}
 			PruneCopyState(); // at most every 10 s; this is the one path every client takes, single-path included
 			object result;
@@ -3925,9 +3926,9 @@ namespace WTelegram
 				if (_pendingRpcs.TryGetValue(rpc.msgId, out var current) && current == rpc)
 				{
 					_pendingRpcs.Remove(rpc.msgId);
-					// a copy already out may still be answered: dropped as a second answer. Kept apart from the
-					// answered ones, which a BadMsgNotification 32/33 must not treat as a reason for a session reset.
-					_forgottenRpcs[rpc.msgId] = Environment.TickCount64;
+					// settled, like an answered one: a copy already out may still be answered (dropped as a second
+					// answer), and a BadMsgNotification 32/33 about it is no reason for a session reset (nobody waits on it)
+					_settledHedged[rpc.msgId] = Environment.TickCount64;
 				}
 		}
 

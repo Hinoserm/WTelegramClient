@@ -59,7 +59,7 @@ namespace WTelegram
 			internal int Bytes;
 			internal int released;
 			internal WanStats CopyWan; // a copy of this part counted in that WAN's InFlight (one at most), until released
-			internal long QueuedTicks; // when its part was first queued on a path (0: not yet), under _transferLock
+			internal long QueuedTicks; // when its part's current attempt was queued on a path (0: not yet); Volatile
 		}
 
 		/// <summary>Per WAN (local address), per direction: measured speed, parts in flight, FLOOD_WAIT state.
@@ -192,16 +192,27 @@ namespace WTelegram
 		{
 			if (bps <= 0 || wan.Active[dir].Count == 0)
 				return bps;
-			var oldest = wan.Active[dir].Where(l => l.QueuedTicks > 0).MinBy(l => l.QueuedTicks); // not yet queued: no time on the WAN
+			var oldest = OldestQueued(wan, dir, out long queuedAt); // not yet queued: no time on the WAN
 			if (oldest == null)
 				return bps;
-			long age = now - oldest.QueuedTicks;
+			long age = now - queuedAt;
 			return age > 250 ? Math.Min(bps, oldest.Bytes * 1000.0 / age) : bps;
 		}
 
-		/// <summary>A copy of a file part queued on <paramref name="path"/>: counted in that WAN's parts in flight (so the
-		/// scheduler and the rescue rule see its load), once per part, until the part's lease is released or the copy's
-		/// write fails.</summary>
+		/// <summary>The WAN's part in flight queued first (null: none queued), and when. Caller holds _transferLock.</summary>
+		private static TransferLease OldestQueued(WanStats wan, int dir, out long queuedAt)
+		{
+			TransferLease oldest = null;
+			queuedAt = 0;
+			foreach (var l in wan.Active[dir])
+				if (Volatile.Read(ref l.QueuedTicks) is long q and > 0 && (oldest == null || q < queuedAt))
+					(oldest, queuedAt) = (l, q);
+			return oldest;
+		}
+
+		/// <summary>A copy of a file part queued on <paramref name="path"/> (it is now the request's carrier copy): counted in
+		/// that WAN's parts in flight (so the scheduler and the rescue rule see its load), one copy per part: a newer copy
+		/// on another WAN moves the count there. Until the part's lease is released, or the counted copy fails.</summary>
 		private void CountTransferCopy(Rpc rpc, TransportPath path)
 		{
 			if (rpc.transferDir < 0 || rpc.lease is not TransferLease lease)
@@ -209,9 +220,12 @@ namespace WTelegram
 			var root = RootClient;
 			lock (root._transferLock)
 			{
-				if (lease.CopyWan != null || Volatile.Read(ref lease.released) != 0)
+				if (Volatile.Read(ref lease.released) != 0)
 					return;
 				var w = Wan(WanKey(path));
+				if (lease.CopyWan == w)
+					return;
+				UncountTransferCopyLocked(lease); // the previous copy no longer carries it
 				if (w == lease.Wan)
 					return; // a copy on its own WAN adds nothing to count
 				w.InFlight[lease.Dir]++;
@@ -219,14 +233,12 @@ namespace WTelegram
 			}
 		}
 
-		/// <summary>A file part's frame was queued on a path: from now on its lease's age is transfer time.</summary>
-		private void MarkTransferQueued(Rpc rpc, long now)
+		/// <summary>A file part's frame was queued on a path: from now on its lease's age is transfer time. Set again for each
+		/// attempt (Invoke retries with a new request under the same lease: a failed attempt is no time on the WAN).</summary>
+		private static void MarkTransferQueued(Rpc rpc, long now)
 		{
-			if (rpc?.lease is not TransferLease lease)
-				return;
-			lock (RootClient._transferLock)
-				if (lease.QueuedTicks == 0)
-					lease.QueuedTicks = now;
+			if (rpc?.lease is TransferLease lease)
+				Volatile.Write(ref lease.QueuedTicks, now); // read under _transferLock; no lock needed to publish it
 		}
 
 		/// <summary>Undoes <see cref="CountTransferCopy"/> (caller holds no transfer lock).</summary>
@@ -375,14 +387,15 @@ namespace WTelegram
 				// that WAN's oldest part actually queued: its age is its own time, not a wait behind earlier parts
 				if (Wan(WanKey(sent)) != lease.Wan)
 					return;
-				if (lease.Wan.Active[rpc.transferDir].Where(l => l.QueuedTicks > 0).MinBy(l => l.QueuedTicks) != lease)
+				if (OldestQueued(lease.Wan, rpc.transferDir, out _) != lease)
 					return;
 			}
 			AddTransferSample(rpc.sentPathIndex, rpc.transferDir, rpc.transferBytes, Volatile.Read(ref rpc.queuedTicks), done: false);
 		}
 
-		/// <param name="done">An answered part: its time runs from its write, or from the WAN's previous answer if that
-		/// came later (parts queue behind each other on one connection). Otherwise a bound taken mid-way.</param>
+		/// <param name="done">An answered part: its time runs from <paramref name="start"/> (its queuing), or from the WAN's
+		/// previous answer if that came later (parts queue behind each other on one connection). Otherwise a ceiling taken
+		/// mid-way, which only ever lowers the estimate.</param>
 		private void AddTransferSample(int pathIndex, int dir, int bytes, long start, bool done)
 		{
 			if (pathIndex < 0 || start <= 0)
@@ -455,10 +468,11 @@ namespace WTelegram
 					var w = Wan(WanKey(p));
 					if (p == own || w == ownWan || w.FloodUntilTicks[dir] > now)
 						continue;
-					double bps = w.Bps[dir] > 0 ? LiveBps(w, dir, now, w.Bps[dir]) : ownBps * 2;
+					bool measured = w.Bps[dir] > 0;
+					double bps = measured ? LiveBps(w, dir, now, w.Bps[dir]) : ownBps * 2;
 					if (best.Path == null || bps > best.Bps || (bps == best.Bps
 						&& Volatile.Read(ref p.LatencyEwmaMs) < Volatile.Read(ref best.Path.LatencyEwmaMs)))
-						best = (p, bps, w.InFlight[dir]);
+						best = (p, bps, measured ? w.InFlight[dir] : 0); // an assumed speed has no load to go with it
 				}
 				return (best.Path, Math.Max(0, best.Bps), best.InFlight, ownBps);
 			}
