@@ -587,17 +587,23 @@ namespace WTelegram
 			if (_dcSession.DataCenter?.id == dcId)
 				return this;
 			Session.DCSession altSession;
+			bool created;
 			lock (_session)
 			{
 				var flags = _dcSession.DataCenter.flags;
 				if (dcId < 0)
 					flags = (flags & DcOption.Flags.ipv6) | DcOption.Flags.media_only;
+				bool known = _session.DCSessions.ContainsKey(dcId);
 				altSession = GetOrCreateDCSession(dcId, flags);
-				_session.Save();
 				if (altSession.Client?.Disconnected ?? false) { altSession.Client.Dispose(); altSession.Client = null; }
+				created = altSession.Client is null;
 				altSession.Client ??= new Client(this, altSession);
+				// Saved when something changed (a new DC session or client), not on every file transfer.
+				if (!known || created)
+					_session.Save();
 			}
-			Helpers.Log(2, $"Requested connection to DC {dcId}...");
+			// Every media transfer asks for its DC's client: worth a line only when a connection is made.
+			Helpers.Log(created ? 2 : 1, $"Requested connection to DC {dcId}{(created ? " (new connection)" : "")}...");
 			if (connect)
 			{
 				await _semaphore.WaitAsync();
