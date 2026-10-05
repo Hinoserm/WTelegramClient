@@ -901,7 +901,9 @@ namespace WTelegram
 		{
 			if (_disposed)
 				return; // disposed on purpose: nothing to tell the app, nothing to tear down
-			_connectionLost = true; // (a send waiting on the semaphore is then failed as a lost connection, not "cancelled")
+			// (a send waiting on the semaphore is then failed as a lost connection, not "cancelled". Disconnected still
+			// reads a half-published path's state until the teardown below; the app is told only after it)
+			_connectionLost = true;
 			// Pending requests fail at once, not after the teardown below (which can take seconds)
 			Rpc[] aborted;
 			lock (_pendingRpcs) // abort all pending requests
@@ -2947,8 +2949,12 @@ namespace WTelegram
 							catch (Exception ex) when (!(ex is ObjectDisposedException && _disposed))
 							{
 								// one message's failure never drops the rest of the container (an rpc result, an ack, an
-								// update behind it); the first is rethrown once they are all handled (and logged there)
-								failed ??= ex;
+								// update behind it); the first is rethrown once they are all handled (and logged there), any
+								// later one is logged here
+								if (failed == null)
+									failed = ex;
+								else
+									Helpers.Log(4, $"{_dcSession?.DcID}>Handling {msg.body.GetType().Name} in a container failed too: {ex}");
 							}
 						}
 					if (failed != null)
@@ -3045,18 +3051,21 @@ namespace WTelegram
 							}
 							else
 							{
-								await ResetAsync(false, false);
-								_dcSession.Renew();
 								try
 								{
+									await ResetAsync(false, false);
+									_dcSession.Renew();
 									await ConnectAsync();
 								}
 								catch (Exception renewEx)
 								{
-									// a connect that got part of the way (a path published, then auth or init failed) is torn
-									// down, and the failure recorded: the reactor's handler catch gives the connection up on it
+									// whichever step failed (the teardown, the renewal, a connect that got part of the way: a
+									// path published, then auth or init failed), what is left is torn down and the failure
+									// recorded: the reactor's handler catch gives the connection up on it. Only with a reactor
+									// to read it (HTTP mode has none: the caller of SendAsync gets this exception itself).
 									try { await ResetAsync(false, false); } catch { }
-									_renewalFailure = renewEx;
+									if (_httpClient == null)
+										_renewalFailure = renewEx;
 									throw;
 								}
 								retryAll = true; // new session: every pending msg_id is void
@@ -3342,6 +3351,7 @@ namespace WTelegram
 			{
 				await task;
 				_connectionLost = false; // connected again (Disconnected goes back to the paths' own state)
+				_renewalFailure = null; // a renewal failure nobody acted on is moot once connected
 			}
 			catch
 			{
@@ -3367,11 +3377,12 @@ namespace WTelegram
 			// Checked again once the new token source exists: DisposeAsync sets _disposed before it cancels _cts, so a
 			// dispose either is seen here or cancels this source.
 			ObjectDisposedException.ThrowIf(_disposed, this);
-			_cts = new();
+			var cts = new CancellationTokenSource();
+			Interlocked.Exchange(ref _cts, cts); // a full fence: the _disposed read below is not reordered before this store
 			if (_disposed)
 			{
-				_cts.Cancel();
-				ObjectDisposedException.ThrowIf(true, this);
+				cts.Cancel();
+				throw new ObjectDisposedException(nameof(Client));
 			}
 			IPEndPoint endpoint = null;
 			bool needMigrate = false;
@@ -3402,8 +3413,8 @@ namespace WTelegram
 				else if (secret.Length != 16)
 					throw new ArgumentException("Invalid/unsupported secret");
 				Helpers.Log(2, $"Connecting to DC {dcId} via MTProxy {server}:{port}...");
-				_tcpUsed = true;
 				_tcpClient = await TcpHandler(server, port);
+				_tcpUsed = true; // connected (a failed connect leaves HttpMode open: the fallback when TCP is blocked)
 				_networkStream = _tcpClient.GetStream();
 				if (tlsMode)
 					_networkStream = await TlsStream.HandshakeAsync(_networkStream, secret, secretBytes[17..], _cts.Token);
@@ -3420,7 +3431,6 @@ namespace WTelegram
 			{
 				endpoint = _dcSession?.EndPoint ?? GetDefaultEndpoint(out int defaultDc);
 
-				_tcpUsed = true;
 				Helpers.Log(2, $"Connecting to {endpoint}{(localEPs != null ? $" (multipath, {localEPs.Count} endpoints)" : "")}...");
 				TcpClient tcpClient = null;
 				try
@@ -3511,6 +3521,7 @@ namespace WTelegram
 					tcpClient?.Dispose();
 					throw;
 				}
+				_tcpUsed = true; // connected (a failed connect leaves HttpMode open: the fallback when TCP is blocked)
 
 				// Create primary path from the first connection
 				usingPaths = true;
@@ -4287,7 +4298,9 @@ namespace WTelegram
 				if (rpc != null)
 					ForgetPending(rpc); // the caller gets the exception: the request must not go out later as a copy
 				// a lost connection (given up, or being remade) cancels the send token: say so, not "cancelled" (which an
-				// app may take for its own cancellation)
+				// app may take for its own cancellation). Invoke retries it like any IOException while paths exist (a
+				// reconnect publishing its paths: up to 5 tries over 15 s); with none (given up, or a single-connection
+				// client), the caller gets it - as before it got the OperationCanceledException, now named for what it is.
 				if (ex is OperationCanceledException && _connectionLost && !_disposed)
 					throw new IOException("The Telegram connection is lost", ex);
 				throw;
