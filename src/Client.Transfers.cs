@@ -18,8 +18,8 @@ namespace WTelegram
 		/// <summary>Upload and download speed are measured per WAN (local address), separately, from the parts
 		/// themselves. Each part goes to the WAN expected to finish it first, counting what that WAN already has
 		/// in flight, so every healthy WAN carries parts at once (up to <see cref="Client.TransferPartsPerPath"/>
-		/// each) and a slow one gets none. A WAN that is not in use is re-measured now and then by sending a copy
-		/// of a part on it as well (the part itself never waits for it). FLOOD_WAIT is honoured per WAN.</summary>
+		/// each) and a slow one gets none. A WAN that is not in use is re-measured now and then by giving it a
+		/// part; a part that is slow on its WAN gets a copy on the fastest one. FLOOD_WAIT is honoured per WAN.</summary>
 		Throughput,
 	}
 
@@ -50,7 +50,6 @@ namespace WTelegram
 			internal int PathIndex = -1; // -1: no path chosen (no live path, or not multipath)
 			internal int Dir;
 			internal WanStats Wan;
-			internal TransportPath ProbePath; // also send a copy here, to measure it
 			internal long StallExtraMs;
 			internal long StartTicks; // when it was handed out
 			internal int Bytes;
@@ -68,7 +67,6 @@ namespace WTelegram
 			internal readonly long[] LastAckTicks = new long[2]; // last answer that gave a sample (queue start)
 			internal readonly long[] LastSampleTicks = new long[2];
 			internal readonly long[] LastProbeTicks = new long[2];
-			internal readonly int[] ProbesUnsampled = new int[2]; // probes since the last sample
 			internal readonly int[] InFlight = new int[2];
 			// the parts in flight, per direction: the oldest one's progress so far bounds the speed estimate
 			internal readonly System.Collections.Generic.List<TransferLease>[] Active = [new(), new()];
@@ -147,22 +145,25 @@ namespace WTelegram
 										: Volatile.Read(ref c.Path.LatencyEwmaMs) + Volatile.Read(ref c.Path.PenaltyMs)).First();
 								bestEta = 0;
 							}
+							// Probe: a WAN not measured for TransferProbeInterval, with nothing in flight, carries this part
+							// itself (a copy's answer cannot be told from the original's: Telegram answers on both
+							// connections). If it is slow, TransferCopyDue copies the part to the fast one in short order.
+							long probeMs = Math.Max(1, TransferProbeInterval) * 1000L;
+							foreach (var c in cands)
+								if (c.Wan != best.Wan && c.Wan.InFlight[dir] == 0 && now - c.Wan.LastSampleTicks[dir] >= probeMs
+									&& now - c.Wan.LastProbeTicks[dir] >= probeMs)
+								{
+									c.Wan.LastProbeTicks[dir] = now;
+									c.Wan.StatProbes[dir]++;
+									(best, bestEta) = (c, 0);
+									break;
+								}
 							if (best.Wan.InFlight[dir] < Cap(best.Wan, dir, now))
 							{
 								best.Wan.InFlight[dir]++;
 								var lease = new TransferLease { Client = client, PathIndex = best.Path.PathIndex, Dir = dir, Wan = best.Wan,
 									StallExtraMs = (long)Math.Min(2 * bestEta, 120_000), StartTicks = now, Bytes = bytes };
 								best.Wan.Active[dir].Add(lease);
-								long probeMs = Math.Max(1, TransferProbeInterval) * 1000L;
-								foreach (var c in cands)
-									if (c.Wan != best.Wan && now - c.Wan.LastSampleTicks[dir] >= probeMs && now - c.Wan.LastProbeTicks[dir] >= probeMs)
-									{
-										c.Wan.LastProbeTicks[dir] = now;
-										c.Wan.ProbesUnsampled[dir]++;
-										c.Wan.StatProbes[dir]++;
-										lease.ProbePath = c.Path;
-										break;
-									}
 								return lease;
 							}
 							// the best WAN is full: wait for one of its parts (or for a better estimate)
@@ -279,41 +280,58 @@ namespace WTelegram
 		private void RecordTransferSample(Rpc rpc, int recvPathIndex, int bytes)
 		{
 			int dir = rpc.transferDir;
-			if (dir < 0 || recvPathIndex < 0 || bytes < MinSampleBytes)
+			if (dir < 0 || bytes < MinSampleBytes)
 				return;
-			long start;
-			if (recvPathIndex == rpc.sentPathIndex && Interlocked.Exchange(ref rpc.sampledSent, 1) == 0)
-				start = Volatile.Read(ref rpc.writtenTicks);
-			else if (recvPathIndex == rpc.hedgedPathIndex && Interlocked.Exchange(ref rpc.sampledHedge, 1) == 0)
-				start = Volatile.Read(ref rpc.hedgedWrittenTicks);
-			else
-				return;
-			if (start <= 0)
+			// Telegram may answer on any connection, and answers a copied request on all of them, so only an
+			// unambiguous carrier gives a sample: an upload part never copied (the WAN it was written on), or
+			// download data (the WAN it arrived on, which is the one that carried it).
+			int carrier = dir == TransferUp ? (rpc.copyAttempted ? -1 : rpc.sentPathIndex)
+				: recvPathIndex >= 0 ? recvPathIndex : rpc.sentPathIndex;
+			AddTransferSample(carrier, dir, bytes, Volatile.Read(ref rpc.writtenTicks), done: true);
+		}
+
+		/// <summary>A file part being copied because its WAN is slow: what it moved so far is an upper bound of that
+		/// WAN's speed (bytes / time since written), so the scheduler learns it even though no answer will say so.</summary>
+		private void RecordSlowTransfer(Rpc rpc)
+		{
+			if (rpc.transferDir >= 0 && rpc.transferBytes >= MinSampleBytes)
+				AddTransferSample(rpc.sentPathIndex, rpc.transferDir, rpc.transferBytes, Volatile.Read(ref rpc.writtenTicks), done: false);
+		}
+
+		/// <param name="done">An answered part: its time runs from its write, or from the WAN's previous answer if that
+		/// came later (parts queue behind each other on one connection). Otherwise a bound taken mid-way.</param>
+		private void AddTransferSample(int pathIndex, int dir, int bytes, long start, bool done)
+		{
+			if (pathIndex < 0 || start <= 0)
 				return;
 			TransportPath path;
 			lock (_pathsLock)
-				path = _paths.FirstOrDefault(p => p.PathIndex == recvPathIndex);
+				path = _paths.FirstOrDefault(p => p.PathIndex == pathIndex);
 			if (path == null)
 				return;
 			var root = RootClient;
 			var w = Wan(WanKey(path));
 			long now = Environment.TickCount64;
+			double sample;
 			lock (root._transferLock)
 			{
-				long from = Math.Max(start, w.LastAckTicks[dir]);
-				w.LastAckTicks[dir] = now;
-				double sample = bytes * 1000.0 / Math.Max(1, now - from);
+				long from = done ? Math.Max(start, w.LastAckTicks[dir]) : start;
+				if (done)
+					w.LastAckTicks[dir] = now;
+				sample = bytes * 1000.0 / Math.Max(1, now - from);
 				// a slowdown counts at once, a recovery gradually: a WAN that just got slow must not keep taking parts
 				double weight = sample < w.Bps[dir] ? SlowSampleWeight : SampleWeight;
 				w.Bps[dir] = w.Samples[dir] == 0 ? sample : w.Bps[dir] * (1 - weight) + sample * weight;
 				w.Samples[dir]++;
 				w.LastSampleTicks[dir] = now;
-				w.ProbesUnsampled[dir] = 0;
-				w.StatParts[dir]++;
-				w.StatBytes[dir] += bytes;
+				if (done)
+				{
+					w.StatParts[dir]++;
+					w.StatBytes[dir] += bytes;
+				}
 			}
-			Helpers.Log(1, $"{_dcSession?.DcID}>{(dir == TransferUp ? "Up" : "Down")} {bytes / 1024} KB via {w.Address} [P{recvPathIndex}]: " +
-				$"{bytes * 1000.0 / Math.Max(1, now - start) / 1e6 * 8:F1} Mbit/s (EWMA {w.Bps[dir] / 1e6 * 8:F1})");
+			Helpers.Log(1, $"{_dcSession?.DcID}>{(dir == TransferUp ? "Up" : "Down")} {bytes / 1024} KB via {w.Address} [P{pathIndex}]" +
+				$"{(done ? "" : " (still going, copied)")}: {sample / 1e6 * 8:F1} Mbit/s (EWMA {w.Bps[dir] / 1e6 * 8:F1})");
 		}
 
 		/// <summary>For a stalled file part: the live path (other than <paramref name="avoidIndex"/>) on the WAN measured

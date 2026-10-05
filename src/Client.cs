@@ -321,8 +321,6 @@ namespace WTelegram
 		private const long ServerMsgIdWindowMs = 330_000;
 		// msg_id of each msgs_state_req we sent → the request it asks about
 		private readonly ConcurrentDictionary<long, Rpc> _stateChecks = new();
-		// file parts answered while a copy may still be answered too: that answer is a speed sample for its path
-		private readonly ConcurrentDictionary<long, (Rpc Rpc, long Ticks)> _settledTransfers = new();
 		private const int MaxCopies = 8;
 		private long _pathGeneration; // source of TransportPath.Generation
 		// copies and state checks never wait longer than this for the send semaphore (a reconnect holds it)
@@ -973,16 +971,13 @@ namespace WTelegram
 		/// <param name="sole">The copy is now the only live one (its original's path died): if no answer comes
 		/// within <see cref="CopyAnswerTimeoutMs"/>, fail it so Invoke retries with a new msg_id.</param>
 		/// <returns>false when nothing was sent: already answered, too old, copy budget spent, or no other path</returns>
-		/// <param name="target">This path (the transfer scheduler's probe), instead of the best other one</param>
-		private async Task<bool> SendCopyAsync(Rpc rpc, int avoidIndex, string reason, bool sole, TransportPath target = null)
+		private async Task<bool> SendCopyAsync(Rpc rpc, int avoidIndex, string reason, bool sole)
 		{
 			if (rpc.query == null || rpc.msgId == 0 || rpc == _bareRpc)
 				return false;
 			if (Environment.TickCount64 - rpc.sentTicks > CopyMaxAgeMs || Volatile.Read(ref rpc.copies) >= MaxCopies)
 				return false;
-			var path = target != null ? (target.IsAlive && target.PathIndex != avoidIndex ? target : null)
-				: rpc.transferDir >= 0 ? PickTransferCopyPath(avoidIndex, rpc.transferDir)
-				: PickOtherAlivePath(avoidIndex);
+			var path = rpc.transferDir >= 0 ? PickTransferCopyPath(avoidIndex, rpc.transferDir) : PickOtherAlivePath(avoidIndex);
 			if (path == null)
 				return false;
 			PruneCopyState();
@@ -1027,15 +1022,12 @@ namespace WTelegram
 				return false;
 			rpc.hedgedGen = generation;
 			rpc.hedgedPathIndex = path.PathIndex;
-			Volatile.Write(ref rpc.hedgedWrittenTicks, Environment.TickCount64);
 			rpc.hedged = true;
 			Interlocked.Increment(ref rpc.copies);
 			if (sole)
 				Interlocked.Increment(ref _statRescued);
 			else if (reason == "Hedge")
 				Interlocked.Increment(ref _statHedged);
-			else if (reason == "Probe")
-				{ } // counted by the transfer stats
 			else
 				Interlocked.Increment(ref _statStalled);
 			Helpers.Log(sole ? 2 : 1, $"{_dcSession.DcID}>{reason}: copied #{(short)rpc.msgId.GetHashCode():X4} {rpc.query.GetType().Name.TrimEnd('_')} to P{path.PathIndex}{(avoidIndex >= 0 ? $" (was P{avoidIndex})" : "")}");
@@ -1356,6 +1348,7 @@ namespace WTelegram
 			{
 				if (!await SendCopyAsync(rpc, rpc.sentPathIndex, $"Stalled >{PathRpcStallTimeout}s", sole: false))
 					continue;
+				RecordSlowTransfer(rpc); // a file part: its WAN's speed so far is a sample (no answer will be one)
 				lock (_pathsLock)
 					if (rpc.sentPathIndex < _paths.Count)
 					{
@@ -1396,9 +1389,6 @@ namespace WTelegram
 			foreach (var kvp in _copyContainers)
 				if (now - kvp.Value.Ticks > 300_000)
 					_copyContainers.TryRemove(kvp.Key, out _);
-			foreach (var kvp in _settledTransfers)
-				if (now - kvp.Value.Ticks > 120_000) // a copy's answer later than that is no speed sample anyway
-					_settledTransfers.TryRemove(kvp.Key, out _);
 		}
 
 		/// <summary>Per-path RTT and liveness from a Pong. Telegram routes answers to ANY connection of the
@@ -2107,9 +2097,6 @@ namespace WTelegram
 				if (!newMsg)
 				{
 					// routine with several paths: the server answers a copied request on both connections
-					// (often as this very frame again): for a file part, its arrival here is still a speed sample
-					if (!_settledTransfers.IsEmpty && pathIndex >= 0)
-						SampleDuplicateAnswer(reader, pathIndex);
 					Interlocked.Increment(ref _statDupFrames);
 					Helpers.Log(_paths.Count > 1 ? 1 : 3, $"{_dcSession.DcID}>Ignoring duplicate or old msg_id {msgId}{pathTag}");
 					return null;
@@ -2215,37 +2202,6 @@ namespace WTelegram
 			}));
 		}
 
-		/// <summary>A duplicate frame (dropped unread) answering a file part that had a copy: only the req_msg_ids of
-		/// its RpcResults are read (top level or in a container), each a speed sample for the path it arrived on.</summary>
-		private void SampleDuplicateAnswer(BinaryReader reader, int pathIndex)
-		{
-			try
-			{
-				var ctorNb = reader.ReadUInt32();
-				if (ctorNb == Layer.RpcResultCtor)
-					Sample(reader.ReadInt64());
-				else if (ctorNb == Layer.MsgContainerCtor)
-				{
-					int count = reader.ReadInt32();
-					for (int i = 0; i < count; i++)
-					{
-						reader.ReadInt64(); reader.ReadInt32(); // msg_id, seqno
-						int bytes = reader.ReadInt32();
-						long next = reader.BaseStream.Position + bytes;
-						if (bytes >= 12 && reader.ReadUInt32() == Layer.RpcResultCtor)
-							Sample(reader.ReadInt64());
-						reader.BaseStream.Position = next;
-					}
-				}
-			}
-			catch (Exception) { } // a malformed duplicate: nothing to sample
-			void Sample(long reqMsgId)
-			{
-				if (_settledTransfers.TryGetValue(reqMsgId, out var settled))
-					RecordTransferSample(settled.Rpc, pathIndex, settled.Rpc.transferBytes);
-			}
-		}
-
 		/// <param name="pathIndex">Path the frame arrived on (-1 = unknown)</param>
 		internal MsgContainer ReadMsgContainer(BinaryReader reader, int pathIndex = -1)
 		{
@@ -2291,11 +2247,7 @@ namespace WTelegram
 			lock (_pendingRpcs) // pull + settle mark atomically: two reactors may get the two answers at once
 			{
 				if (_pendingRpcs.Remove(msgId, out rpc))
-				{
 					_settledHedged[msgId] = Environment.TickCount64;
-					if (rpc.transferDir >= 0 && rpc.copyAttempted) // its copy's answer is a sample too
-						_settledTransfers[msgId] = (rpc, Environment.TickCount64);
-				}
 				else
 					settledBefore = _settledHedged.ContainsKey(msgId);
 			}
@@ -2304,8 +2256,6 @@ namespace WTelegram
 			if (settledBefore)
 			{
 				// second answer (to a copy, or re-delivered on another connection): already delivered once
-				if (_settledTransfers.TryGetValue(msgId, out var settled))
-					RecordTransferSample(settled.Rpc, pathIndex, settled.Rpc.transferBytes);
 				Interlocked.Increment(ref _statDupAnswers);
 				Helpers.Log(1, $"              → second answer for #{(short)msgId.GetHashCode():X4} dropped (already answered)");
 				return new RpcResult { req_msg_id = msgId };
@@ -2420,10 +2370,7 @@ namespace WTelegram
 			internal TransferLease lease;
 			internal int transferDir = -1; // TransferUp / TransferDown; -1 = not a file part
 			internal int transferBytes; // part size (upload), or the requested limit (download)
-			internal long hedgedWrittenTicks; // when the copy (hedged*) was written
-			internal int sampledSent, sampledHedge; // 1 once that write's answer has given a speed sample
 			internal long stallExtraMs; // added to PathRpcStallTimeout: the time its path is expected to need
-			internal int probeSent; // 1 once the scheduler's probe copy went out
 			public Task<object> Task => tcs.Task;
 		}
 
@@ -3870,11 +3817,6 @@ namespace WTelegram
 		/// File parts are left alone here; they are copied only if they stall.</summary>
 		private void HedgeIfWanted(Rpc rpc)
 		{
-			// A file part the scheduler chose as a probe also goes, as a copy, on the path being measured:
-			// the part itself is never held up by that path, and its answer there gives a speed sample.
-			if (rpc?.lease?.ProbePath is TransportPath probe && rpc.sentPathIndex >= 0 && rpc.query != null
-				&& probe.PathIndex != rpc.sentPathIndex && Interlocked.Exchange(ref rpc.probeSent, 1) == 0)
-				_ = SendCopyAsync(rpc, rpc.sentPathIndex, "Probe", sole: false, target: probe);
 			if (rpc?.query == null || rpc.bulk || rpc.hedged || rpc.sentPathIndex < 0)
 				return;
 			if (!HedgeAllRequests || _parentClient != null || _paths.Count < 2)
