@@ -38,6 +38,7 @@ namespace WTelegram
 		internal const int TransferUp = 0, TransferDown = 1;
 		private const int MinSampleBytes = 64 * 1024; // smaller parts (a file's last one) time mostly latency
 		private const double SampleWeight = 0.3; // EWMA weight of a new speed sample
+		private const double SlowSampleWeight = 0.6; // ... of one slower than the average
 
 		/// <summary>The lease of the part being sent from this async flow: Invoke reads it (see UploadFileAsync).</summary>
 		private static readonly AsyncLocal<TransferLease> CurrentTransfer = new();
@@ -51,6 +52,8 @@ namespace WTelegram
 			internal WanStats Wan;
 			internal TransportPath ProbePath; // also send a copy here, to measure it
 			internal long StallExtraMs;
+			internal long StartTicks; // when it was handed out
+			internal int Bytes;
 			internal int released;
 		}
 
@@ -67,6 +70,8 @@ namespace WTelegram
 			internal readonly long[] LastProbeTicks = new long[2];
 			internal readonly int[] ProbesUnsampled = new int[2]; // probes since the last sample
 			internal readonly int[] InFlight = new int[2];
+			// the parts in flight, per direction: the oldest one's progress so far bounds the speed estimate
+			internal readonly System.Collections.Generic.List<TransferLease>[] Active = [new(), new()];
 			internal readonly long[] FloodUntilTicks = new long[2];
 			internal readonly int[] CapCut = new int[2]; // parts taken off TransferPartsPerPath after a FLOOD_WAIT
 			internal readonly long[] CapCutUntilTicks = new long[2];
@@ -126,7 +131,7 @@ namespace WTelegram
 							double bestEta = double.MaxValue;
 							foreach (var c in cands)
 							{
-								double bps = c.Wan.Bps[dir];
+								double bps = LiveBps(c.Wan, dir, now);
 								// not measured: only probed; but one whose probes never come back with a sample
 								// (answers routed to another connection) is assumed as fast as the best one
 								if (bps <= 0 && bestKnown > 0 && c.Wan.ProbesUnsampled[dir] >= 2)
@@ -147,7 +152,8 @@ namespace WTelegram
 							{
 								best.Wan.InFlight[dir]++;
 								var lease = new TransferLease { Client = client, PathIndex = best.Path.PathIndex, Dir = dir, Wan = best.Wan,
-									StallExtraMs = (long)Math.Min(2 * bestEta, 120_000) };
+									StallExtraMs = (long)Math.Min(2 * bestEta, 120_000), StartTicks = now, Bytes = bytes };
+								best.Wan.Active[dir].Add(lease);
 								long probeMs = Math.Max(1, TransferProbeInterval) * 1000L;
 								foreach (var c in cands)
 									if (c.Wan != best.Wan && now - c.Wan.LastSampleTicks[dir] >= probeMs && now - c.Wan.LastProbeTicks[dir] >= probeMs)
@@ -168,6 +174,23 @@ namespace WTelegram
 			}
 		}
 
+		/// <summary>The WAN's measured speed, unless its oldest part in flight shows it slower right now (bytes / age so
+		/// far): a WAN that just slowed down stops getting parts within a second, not after several slow answers.
+		/// 0 = not measured. Caller holds _transferLock.</summary>
+		private static double LiveBps(WanStats wan, int dir, long now)
+		{
+			double bps = wan.Bps[dir];
+			if (bps <= 0)
+				return bps;
+			foreach (var lease in wan.Active[dir])
+			{
+				long age = now - lease.StartTicks;
+				if (age > 250 && lease.Bytes * 1000.0 / age < bps)
+					bps = lease.Bytes * 1000.0 / age;
+			}
+			return bps;
+		}
+
 		private int Cap(WanStats wan, int dir, long now)
 			=> Math.Max(1, TransferPartsPerPath - (wan.CapCutUntilTicks[dir] > now ? wan.CapCut[dir] : 0));
 
@@ -180,6 +203,7 @@ namespace WTelegram
 			lock (root._transferLock)
 			{
 				lease.Wan.InFlight[lease.Dir]--;
+				lease.Wan.Active[lease.Dir].Remove(lease);
 				pulse = root._transferPulse;
 				root._transferPulse = new(TaskCreationOptions.RunContinuationsAsynchronously);
 			}
@@ -250,7 +274,9 @@ namespace WTelegram
 				long from = Math.Max(start, w.LastAckTicks[dir]);
 				w.LastAckTicks[dir] = now;
 				double sample = bytes * 1000.0 / Math.Max(1, now - from);
-				w.Bps[dir] = w.Samples[dir] == 0 ? sample : w.Bps[dir] * (1 - SampleWeight) + sample * SampleWeight;
+				// a slowdown counts at once, a recovery gradually: a WAN that just got slow must not keep taking parts
+				double weight = sample < w.Bps[dir] ? SlowSampleWeight : SampleWeight;
+				w.Bps[dir] = w.Samples[dir] == 0 ? sample : w.Bps[dir] * (1 - weight) + sample * weight;
 				w.Samples[dir]++;
 				w.LastSampleTicks[dir] = now;
 				w.ProbesUnsampled[dir] = 0;
