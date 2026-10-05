@@ -44,31 +44,47 @@ namespace WTelegram
 				int file_part = 0, read;
 				var tasks = new Dictionary<int, Task>();
 				bool abort = false;
+				bool scheduled = TransferMode == PathTransferMode.Throughput;
 				for (long bytesLeft = hasLength ? length : long.MaxValue; !abort && bytesLeft != 0; file_part++)
 				{
 					var bytes = new byte[Math.Min(FilePartSize, bytesLeft)];
 					read = await stream.FullReadAsync(bytes, bytes.Length, default);
-					await _parallelTransfers.WaitAsync();
 					bytesLeft -= read;
 					if (!hasLength && read < bytes.Length)
 					{
 						file_total_parts = file_part;
 						if (read == 0) break; else file_total_parts++;
-						bytes = bytes[..read]; 
-						bytesLeft = 0; 
+						bytes = bytes[..read];
+						bytesLeft = 0;
 					}
-					var task = SavePart(file_part, bytes);
+					// Throughput: a WAN chosen for this part (waits while the best one is full); otherwise the global cap
+					var lease = scheduled ? await AcquireTransferAsync(client, TransferUp, bytes.Length) : null;
+					if (!scheduled)
+						await _parallelTransfers.WaitAsync();
+					var task = SavePart(file_part, bytes, lease);
 					lock (tasks) tasks[file_part] = task;
 					if (read < FilePartSize && bytesLeft != 0) throw new WTException($"Failed to fully read stream ({read},{bytesLeft})");
 
-					async Task SavePart(int file_part, byte[] bytes)
+					async Task SavePart(int file_part, byte[] bytes, TransferLease lease)
 					{
 						try
 						{
-							if (isBig)
-								await client.Upload_SaveBigFilePart(file_id, file_part, file_total_parts, bytes);
-							else
-								await client.Upload_SaveFilePart(file_id, file_part, bytes);
+							while (true)
+							{
+								CurrentTransfer.Value = lease; // read by Invoke: this part goes on the lease's path
+								try
+								{
+									if (isBig)
+										await client.Upload_SaveBigFilePart(file_id, file_part, file_total_parts, bytes);
+									else
+										await client.Upload_SaveFilePart(file_id, file_part, bytes);
+									break;
+								}
+								catch (RpcException ex) when (lease != null && IsTransferFlood(ex))
+								{
+									lease = await AfterTransferFloodAsync(client, lease, ex, bytes.Length);
+								}
+							}
 							lock (tasks) { transmitted += bytes.Length; tasks.Remove(file_part); }
 							progress?.Invoke(transmitted, length);
 						}
@@ -79,7 +95,10 @@ namespace WTelegram
 						}
 						finally
 						{
-							_parallelTransfers.Release();
+							if (scheduled)
+								ReleaseTransfer(lease);
+							else
+								_parallelTransfers.Release();
 						}
 					}
 				}
@@ -392,10 +411,14 @@ namespace WTelegram
 			var tasks = new Dictionary<long, Task>();
 			progress?.Invoke(0, fileSize);
 			bool abort = false;
+			bool scheduled = TransferMode == PathTransferMode.Throughput;
 			while (!abort)
 			{
-				await _parallelTransfers.WaitAsync();
-				var task = LoadPart(fileOffset);
+				// Throughput: a WAN chosen for this part (waits while the best one is full); otherwise the global cap
+				var lease = scheduled ? await AcquireTransferAsync(client, TransferDown, FilePartSize) : null;
+				if (!scheduled)
+					await _parallelTransfers.WaitAsync();
+				var task = LoadPart(fileOffset, lease);
 				lock (tasks) tasks[fileOffset] = task;
 				if (dc_id == 0) { await task; dc_id = client._dcSession.DcID; }
 				if (!canSeek) await task;
@@ -407,17 +430,32 @@ namespace WTelegram
 					break;
 				}
 
-				async Task<int> LoadPart(long offset)
+				async Task<int> LoadPart(long offset, TransferLease lease)
 				{
 					Upload_FileBase fileBase;
 					try
 					{
-						fileBase = await client.Upload_GetFile(fileLocation, offset, FilePartSize);
-					}
-					catch (RpcException ex) when (ex.Code == 303 && ex.Message == "FILE_MIGRATE_X")
-					{
-						client = await GetClientForDC(-ex.X, true);
-						fileBase = await client.Upload_GetFile(fileLocation, offset, FilePartSize);
+						while (true)
+						{
+							CurrentTransfer.Value = lease; // read by Invoke: this request goes on the lease's path
+							try
+							{
+								try
+								{
+									fileBase = await client.Upload_GetFile(fileLocation, offset, FilePartSize);
+								}
+								catch (RpcException ex) when (ex.Code == 303 && ex.Message == "FILE_MIGRATE_X")
+								{
+									client = await GetClientForDC(-ex.X, true);
+									fileBase = await client.Upload_GetFile(fileLocation, offset, FilePartSize);
+								}
+								break;
+							}
+							catch (RpcException ex) when (lease != null && IsTransferFlood(ex))
+							{
+								lease = await AfterTransferFloodAsync(client, lease, ex, FilePartSize);
+							}
+						}
 					}
 					catch (RpcException ex) when (ex.Code == 400 && ex.Message == "OFFSET_INVALID")
 					{
@@ -431,7 +469,10 @@ namespace WTelegram
 					}
 					finally
 					{
-						_parallelTransfers.Release();
+						if (scheduled)
+							ReleaseTransfer(lease);
+						else
+							_parallelTransfers.Release();
 					}
 					if (fileBase is not Upload_File fileData)
 						throw new WTException("Upload_GetFile returned unsupported " + fileBase?.GetType().Name);
