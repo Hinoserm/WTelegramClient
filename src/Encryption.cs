@@ -370,9 +370,21 @@ j4WcDuXc2CTHgH8gFTNhp/Y8/SpDOhvn9QIDAQAB
 				recvKey = sha256.Hash;
 			}
 			var sendCtr = new AesCtr(sendKey, sendIV);
-			var recvCtr = new AesCtr(recvKey, recvIV);
-			var encrypted = (byte[])preamble.Clone();
-			sendCtr.EncryptDecrypt(encrypted);
+			AesCtr recvCtr = null;
+			byte[] encrypted;
+			try
+			{
+				recvCtr = new AesCtr(recvKey, recvIV);
+				encrypted = (byte[])preamble.Clone();
+				sendCtr.EncryptDecrypt(encrypted);
+			}
+			catch
+			{
+				// both ciphers or none: the caller never sees these
+				sendCtr.Dispose();
+				recvCtr?.Dispose();
+				throw;
+			}
 			for (int i = 56; i < 64; i++)
 				preamble[i] = encrypted[i];
 			return (sendCtr, recvCtr, preamble);

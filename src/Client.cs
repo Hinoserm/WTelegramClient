@@ -10,6 +10,7 @@ using System.Net;
 using System.Net.Http;
 using System.Net.Sockets;
 using System.Reflection;
+using System.Runtime.ExceptionServices;
 using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
@@ -662,16 +663,29 @@ namespace WTelegram
 
 		private Task Reactor(Stream stream, CancellationToken ct) => Reactor(null, stream, ct);
 
+		/// <summary>Starts a path's reactor. Its receive hash and cipher are checked here, synchronously: a path started
+		/// without them (a bug) fails its caller's connect or reconnect, never silently inside the reactor's task</summary>
+		private Task StartPathReactor(TransportPath path, Stream stream, CancellationToken ct)
+		{
+			if (path.Sha256Recv == null)
+				throw new InvalidOperationException($"Path {path.PathIndex} has no receive hash");
+#if OBFUSCATION
+			if (path.RecvCtr == null)
+				throw new InvalidOperationException($"Path {path.PathIndex} has no receive cipher");
+#endif
+			return Reactor(path, stream, ct);
+		}
+
 		private async Task Reactor(TransportPath path, Stream stream, CancellationToken ct)
 		{
 			const int MinBufferSize = 1024;
 			var data = new byte[MinBufferSize];
-			// a path's own parts, never the legacy connection's (a path started without them is a bug: fail loudly)
-			var sha256Recv = path == null ? _sha256Recv : path.Sha256Recv ?? throw new InvalidOperationException($"Path {path.PathIndex} has no receive hash");
+			// a path's own parts (checked present by StartPathReactor), never the legacy connection's
+			var sha256Recv = path == null ? _sha256Recv : path.Sha256Recv;
 			var paddedMode = path?.PaddedMode ?? _paddedMode;
 			long generation = path != null ? Interlocked.Read(ref path.Generation) : 0; // the connection this reactor reads
 #if OBFUSCATION
-			var recvCtr = path == null ? _recvCtr : path.RecvCtr ?? throw new InvalidOperationException($"Path {path.PathIndex} has no receive cipher");
+			var recvCtr = path == null ? _recvCtr : path.RecvCtr;
 #endif
 			while (!ct.IsCancellationRequested)
 			{
@@ -1791,7 +1805,7 @@ namespace WTelegram
 						Helpers.Log(2, $"{_dcSession.DcID}>Reconnecting path {path.PathIndex} (attempt {attempt})...");
 						tcpClient = await ConnectPathAsync(endpoint, path.LocalEndPoint); // bounded: a blackholed WAN retries sooner
 
-						// TcpHandler doesn't check CTS — re-check after it returns
+						// the connect does not watch _cts: re-check after it returns
 						if (_cts?.IsCancellationRequested == true)
 							return;
 						lock (_pathsLock)
@@ -1855,7 +1869,7 @@ namespace WTelegram
 								_pendingPings.TryRemove(kvp.Key, out _);
 						// Start reactor BEFORE ping (it needs to receive the Pong),
 						// but do NOT set IsAlive until Telegram has answered the registration ping.
-						path.ReactorTask = Reactor(path, networkStream, linkedToken); // not path.Cts: a reset's Dispose may take it
+						path.ReactorTask = StartPathReactor(path, networkStream, linkedToken); // not path.Cts: a reset's Dispose may take it
 						if (!await RegisterPathAsync(path))
 							throw new WTException($"registration ping unanswered after {Math.Max(PathDeadTimeout, 1)}s");
 
@@ -2702,8 +2716,8 @@ namespace WTelegram
 			public TcpClient TcpClient;
 			public Stream NetworkStream;
 			public Task ReactorTask;
-			// set with the connection (last in its initializer, or published by a reconnect): a path that never got
-			// one (a dead path awaiting its reconnect) owns none to leak
+			// set with the connection (assigned one by one by the connect code, or published by a reconnect): a path
+			// that never got one (a dead path awaiting its reconnect) owns none to leak
 			public SHA256 Sha256Send;
 			public SHA256 Sha256Recv;
 #if OBFUSCATION
@@ -3032,20 +3046,74 @@ namespace WTelegram
 			}
 		}
 
-		/// <summary>A path's TCP connect, bounded by PathConnectTimeout. On timeout the connect itself goes on: a client
-		/// it still produces is nobody's, disposed when it arrives (DisposeWhenDone)</summary>
+		/// <summary>A path's TCP connect, bounded by PathConnectTimeout (1..300 s), failing with a TimeoutException. The
+		/// default handler's connect is aborted at the timeout (nothing left half-open); a custom handler's goes on, and
+		/// a client it still produces is nobody's, disposed when it arrives (DisposeWhenDone)</summary>
 		private async Task<TcpClient> ConnectPathAsync(IPEndPoint endpoint, IPEndPoint localEP)
 		{
+			var timeout = TimeSpan.FromSeconds(Math.Clamp(PathConnectTimeout, 1, 300));
+			if (TcpHandler == (TcpFactory)DefaultTcpHandler)
+			{
+				using var cts = new CancellationTokenSource(timeout);
+				try
+				{
+					return await DefaultTcpConnectAsync(endpoint.Address.ToString(), endpoint.Port, localEP, cts.Token);
+				}
+				catch (OperationCanceledException) when (cts.IsCancellationRequested)
+				{
+					throw new TimeoutException($"Connect to {endpoint} timed out after {timeout.TotalSeconds:0}s");
+				}
+			}
 			var connect = TcpHandler(endpoint.Address.ToString(), endpoint.Port, localEP);
 			try
 			{
-				return await connect.WaitAsync(TimeSpan.FromSeconds(PathConnectTimeout));
+				return await connect.WaitAsync(timeout);
 			}
-			catch (TimeoutException)
+			catch
 			{
-				DisposeWhenDone(connect);
+				DisposeWhenDone(connect); // whatever ended the wait: a late client is disposed, a late failure observed
 				throw;
 			}
+		}
+
+		/// <summary>Connects to <paramref name="endpoint"/> from every local address at once (each bounded, ConnectPathAsync):
+		/// the first to connect wins, the others are disposed when they arrive. When all fail: a SocketException if the last
+		/// failure was a timeout (callers treat it as an unreachable address), else that failure as thrown</summary>
+		private async Task<(TcpClient client, int epIdx)> RaceConnectAsync(IPEndPoint endpoint, List<IPEndPoint> localEPs)
+		{
+			var connectTasks = new List<(Task<TcpClient> task, int epIdx)>();
+			for (int i = 0; i < localEPs.Count; i++)
+				connectTasks.Add((ConnectPathAsync(endpoint, localEPs[i]), i));
+			Exception lastEx = null;
+			try
+			{
+				while (connectTasks.Count > 0)
+				{
+					var completedTask = await Task.WhenAny(connectTasks.Select(x => x.task));
+					var entry = connectTasks.First(x => x.task == completedTask);
+					connectTasks.Remove(entry);
+					try
+					{
+						var client = await entry.task;
+						Helpers.Log(2, $"Primary connected to {endpoint} via {localEPs[entry.epIdx].Address}.");
+						return (client, entry.epIdx);
+					}
+					catch (Exception ex)
+					{
+						Helpers.Log(3, $"Connect to {endpoint} via {localEPs[entry.epIdx].Address} failed: {ex.Message}");
+						lastEx = ex;
+					}
+				}
+			}
+			finally
+			{
+				foreach (var remaining in connectTasks) // the losers, still connecting: not ours to keep
+					DisposeWhenDone(remaining.task);
+			}
+			if (lastEx is TimeoutException)
+				throw new SocketException(10060); // WSAETIMEDOUT
+			ExceptionDispatchInfo.Capture(lastEx).Throw();
+			throw lastEx; // not reached
 		}
 
 		/// <summary>A connect whose result nobody will take: its client is disposed when it arrives, a failure observed</summary>
@@ -3058,12 +3126,15 @@ namespace WTelegram
 					t.Result?.Dispose();
 			}, TaskScheduler.Default);
 
-		static async Task<TcpClient> DefaultTcpHandler(string host, int port, IPEndPoint localEndPoint = null)
+		static Task<TcpClient> DefaultTcpHandler(string host, int port, IPEndPoint localEndPoint = null)
+			=> DefaultTcpConnectAsync(host, port, localEndPoint, default);
+
+		static async Task<TcpClient> DefaultTcpConnectAsync(string host, int port, IPEndPoint localEndPoint, CancellationToken ct)
 		{
 			var tcpClient = localEndPoint != null ? new TcpClient(localEndPoint) : new TcpClient();
 			try
 			{
-				await tcpClient.ConnectAsync(host, port);
+				await tcpClient.ConnectAsync(host, port, ct);
 			}
 			catch
 			{
@@ -3170,6 +3241,7 @@ namespace WTelegram
 						{
 							// PreferredOrder: connect sequentially so address[0] is always Path 0.
 							// This ensures the preferred path matches the first address in the config.
+							Exception lastEx = null;
 							for (int i = 0; i < localEPs.Count; i++)
 							{
 								try
@@ -3183,50 +3255,23 @@ namespace WTelegram
 								catch (Exception ex)
 								{
 									Helpers.Log(3, $"Connect via {localEPs[i].Address} failed: {ex.Message}");
-								}
-							}
-							if (tcpClient == null)
-							throw new SocketException(10060); // all endpoints failed
-						}
-						else if (localEPs != null && localEPs.Count > 1)
-						{
-							// RoundRobin/StickyFailover: race ALL endpoints in parallel — first one wins.
-							// This avoids wasting 10s per dead interface in sequential attempts.
-							var connectTasks = new List<(Task<TcpClient> task, int epIdx)>();
-							for (int i = 0; i < localEPs.Count; i++)
-							{
-								int idx = i;
-								connectTasks.Add((ConnectPathAsync(endpoint, localEPs[idx]), idx));
-							}
-
-							Exception lastEx = null;
-							while (connectTasks.Count > 0 && tcpClient == null)
-							{
-								var completedTask = await Task.WhenAny(connectTasks.Select(x => x.task));
-								var entry = connectTasks.First(x => x.task == completedTask);
-								connectTasks.Remove(entry);
-								try
-								{
-									tcpClient = await entry.task;
-									primaryEPIndex = entry.epIdx;
-									_lastConnectedEPIndex = entry.epIdx;
-									Helpers.Log(2, $"Primary connected via {localEPs[entry.epIdx].Address}.");
-								}
-								catch (Exception ex)
-								{
-									Helpers.Log(3, $"Connect via {localEPs[entry.epIdx].Address} failed: {ex.Message}");
 									lastEx = ex;
 								}
 							}
-
-							// Dispose any late-arriving connections we don't need
-							foreach (var remaining in connectTasks)
-								DisposeWhenDone(remaining.task);
-
-							// every endpoint failed: a SocketException, as in PreferredOrder, so the alternate-address
-							// fallback below runs even when the last failure was a timeout (each failure was logged above)
-							if (tcpClient == null && lastEx != null)
-								throw lastEx as SocketException ?? new SocketException(10060);
+							// all endpoints failed: as in RaceConnectAsync, a timeout or socket error is an unreachable
+							// address (the fallback below runs), anything else is thrown as it was
+							if (tcpClient == null)
+								if (lastEx is TimeoutException or SocketException)
+									throw new SocketException(10060);
+								else
+									ExceptionDispatchInfo.Capture(lastEx).Throw();
+						}
+						else if (localEPs != null && localEPs.Count > 1)
+						{
+							// RoundRobin/StickyFailover/LowestLatency: race ALL endpoints in parallel — first one wins.
+							// This avoids wasting 10s per dead interface in sequential attempts.
+							(tcpClient, primaryEPIndex) = await RaceConnectAsync(endpoint, localEPs);
+							_lastConnectedEPIndex = primaryEPIndex;
 						}
 						else
 						{
@@ -3251,7 +3296,7 @@ namespace WTelegram
 								Helpers.Log(2, $"Connecting to {endpoint}...");
 								try
 								{
-									tcpClient = await TcpHandler(endpoint.Address.ToString(), endpoint.Port, localEPs?[primaryEPIndex]);
+									tcpClient = await FallbackConnectAsync(endpoint);
 									_dcSession.DataCenter = dcOption;
 									break;
 								}
@@ -3273,8 +3318,21 @@ namespace WTelegram
 							_dcSession.Client = this;
 							_dcSession.DataCenter = null;
 							Helpers.Log(2, $"Connecting to {endpoint}...");
-							tcpClient = await TcpHandler(endpoint.Address.ToString(), endpoint.Port, localEPs?[primaryEPIndex]);
+							tcpClient = await FallbackConnectAsync(endpoint);
 						}
+					}
+
+					// The alternate-address fallback's connects: with several local addresses, from all of them at once and
+					// bounded (a WAN outage fails in PathConnectTimeout per address, never the OS connect timeout, and never
+					// only through the address that just failed); with one or none, as it always was
+					async Task<TcpClient> FallbackConnectAsync(IPEndPoint alternate)
+					{
+						if (localEPs is not { Count: > 1 })
+							return await TcpHandler(alternate.Address.ToString(), alternate.Port, localEPs?[primaryEPIndex]);
+						var (client, epIdx) = await RaceConnectAsync(alternate, localEPs);
+						primaryEPIndex = epIdx;
+						_lastConnectedEPIndex = epIdx;
+						return client;
 					}
 				}
 				catch
@@ -3309,6 +3367,7 @@ namespace WTelegram
 					preamble = new byte[] { protocolId, protocolId, protocolId, protocolId };
 #endif
 					await primaryPath.NetworkStream.WriteAsync(preamble, 0, preamble.Length, _cts.Token);
+					primaryPath.ReactorTask = StartPathReactor(primaryPath, primaryPath.NetworkStream, primaryPath.Cts.Token);
 				}
 				catch
 				{
@@ -3319,7 +3378,6 @@ namespace WTelegram
 						tcpClient.Dispose();
 					throw;
 				}
-				primaryPath.ReactorTask = Reactor(primaryPath, primaryPath.NetworkStream, primaryPath.Cts.Token);
 				primaryPath.IsAlive = true;
 				primaryPath.ConnectedSinceTicks = Environment.TickCount64;
 				primaryPath.LastRecvTicks = primaryPath.ConnectedSinceTicks;
@@ -3467,7 +3525,7 @@ namespace WTelegram
 					preamble = new byte[] { protocolId2, protocolId2, protocolId2, protocolId2 };
 #endif
 					await path.NetworkStream.WriteAsync(preamble, 0, preamble.Length, _cts.Token);
-					path.ReactorTask = Reactor(path, path.NetworkStream, path.Cts.Token);
+					path.ReactorTask = StartPathReactor(path, path.NetworkStream, path.Cts.Token);
 					path.LastRecvTicks = Environment.TickCount64;
 					lock (_pathsLock)
 						_paths.Add(path); // not alive yet: nothing is sent on it before Telegram answers its registration ping
