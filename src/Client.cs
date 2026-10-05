@@ -44,7 +44,9 @@ namespace WTelegram
 		public int DcId { get; init; }
 		/// <summary>True if this is a media-only DC (used for file transfers).</summary>
 		public bool IsMediaDc { get; init; }
-		/// <summary>Index of this path (matches LocalEndPoints order).</summary>
+		/// <summary>Index of this path: 0 is the primary connection (whichever local address it went out on), then the other
+		/// local addresses in LocalEndPoints order, skipping any that cannot reach the DC (another address family).
+		/// Identify a path's address by <see cref="LocalEndPoint"/>, not by this index.</summary>
 		public int PathIndex { get; init; }
 		/// <summary>Local endpoint this path is bound to (null for legacy single-path).</summary>
 		public IPEndPoint LocalEndPoint { get; init; }
@@ -273,7 +275,6 @@ namespace WTelegram
 		private readonly List<TransportPath> _paths = new();
 		private readonly object _pathsLock = new();
 		private volatile int _primaryPathIndex;
-		private volatile int _lastConnectedEPIndex;
 		private bool _fullReconnectStarted;
 		private Task _secondaryPathsTask;
 		private readonly ConcurrentDictionary<long, (int PathIndex, long SentTicks)> _pendingPings = new();
@@ -3139,17 +3140,23 @@ namespace WTelegram
 				}
 				finally
 				{
-					race.Cancel();
-					foreach (var remaining in connectTasks) // the losers: cancelled, and not ours to keep if one still connects
+					foreach (var remaining in connectTasks) // the losers: not ours to keep if one still connects
 						DisposeWhenDone(remaining.task);
+					try { race.Cancel(); } // then cancelled: a throwing callback cannot skip the handoff above
+					catch (Exception ex) { Helpers.Log(3, $"Connect race cancellation failed: {ex.Message}"); }
 				}
 			}
 			if (winner != null)
+				return (winner, winnerIdx); // logged by the caller, once it owns it
+			// none connected: unreachable from here. The last failure kept as it was when it was a socket error, else its
+			// kind (a timeout, an address family) as the error code and the failure itself as the message
+			throw lastEx switch
 			{
-				Helpers.Log(2, $"Connected to {endpoint}{Via(winnerIdx)}.");
-				return (winner, winnerIdx);
-			}
-			throw lastEx as SocketException ?? new SocketException((int)SocketError.TimedOut);
+				SocketException socketEx => socketEx,
+				TimeoutException => new SocketException((int)SocketError.TimedOut),
+				NotSupportedException => new SocketException((int)SocketError.AddressFamilyNotSupported, lastEx.Message),
+				_ => new SocketException((int)SocketError.SocketError, $"{lastEx.GetType().Name}: {lastEx.Message}"),
+			};
 		}
 
 		/// <summary>A connect whose result nobody will take: its client is disposed when it arrives, a failure observed</summary>
@@ -3328,7 +3335,6 @@ namespace WTelegram
 					{
 						var (client, epIdx) = await ConnectToAsync(target, localEPs, SendMode == PathSendMode.PreferredOrder);
 						primaryEPIndex = epIdx;
-						_lastConnectedEPIndex = epIdx;
 						return client;
 					}
 				}
@@ -3343,6 +3349,8 @@ namespace WTelegram
 				TransportPath primaryPath = null;
 				try
 				{
+					// logged here, where tcpClient is already owned (the catch below disposes it)
+					Helpers.Log(2, $"Primary connected to {endpoint}{(localEPs?.Count > 0 ? $" via {localEPs[primaryEPIndex].Address}" : "")}.");
 					ConfigureKeepalive(tcpClient);
 					// built with nothing that can throw, then given its parts one by one: once it exists it owns whatever
 					// it holds, so a failure below disposes exactly that (DisposeQuietly in the catch)
