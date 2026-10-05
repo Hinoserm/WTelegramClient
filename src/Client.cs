@@ -2101,6 +2101,9 @@ namespace WTelegram
 				if (!newMsg)
 				{
 					// routine with several paths: the server answers a copied request on both connections
+					// (often as this very frame again): for a file part, its arrival here is still a speed sample
+					if (!_settledTransfers.IsEmpty && pathIndex >= 0)
+						SampleDuplicateAnswer(reader, pathIndex);
 					Interlocked.Increment(ref _statDupFrames);
 					Helpers.Log(_paths.Count > 1 ? 1 : 3, $"{_dcSession.DcID}>Ignoring duplicate or old msg_id {msgId}{pathTag}");
 					return null;
@@ -2204,6 +2207,37 @@ namespace WTelegram
 					_session.Save();
 				}
 			}));
+		}
+
+		/// <summary>A duplicate frame (dropped unread) answering a file part that had a copy: only the req_msg_ids of
+		/// its RpcResults are read (top level or in a container), each a speed sample for the path it arrived on.</summary>
+		private void SampleDuplicateAnswer(BinaryReader reader, int pathIndex)
+		{
+			try
+			{
+				var ctorNb = reader.ReadUInt32();
+				if (ctorNb == Layer.RpcResultCtor)
+					Sample(reader.ReadInt64());
+				else if (ctorNb == Layer.MsgContainerCtor)
+				{
+					int count = reader.ReadInt32();
+					for (int i = 0; i < count; i++)
+					{
+						reader.ReadInt64(); reader.ReadInt32(); // msg_id, seqno
+						int bytes = reader.ReadInt32();
+						long next = reader.BaseStream.Position + bytes;
+						if (bytes >= 12 && reader.ReadUInt32() == Layer.RpcResultCtor)
+							Sample(reader.ReadInt64());
+						reader.BaseStream.Position = next;
+					}
+				}
+			}
+			catch (Exception) { } // a malformed duplicate: nothing to sample
+			void Sample(long reqMsgId)
+			{
+				if (_settledTransfers.TryGetValue(reqMsgId, out var settled))
+					RecordTransferSample(settled.Rpc, pathIndex, settled.Rpc.transferBytes);
+			}
 		}
 
 		/// <param name="pathIndex">Path the frame arrived on (-1 = unknown)</param>
