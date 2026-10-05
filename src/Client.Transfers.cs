@@ -211,25 +211,48 @@ namespace WTelegram
 			return oldest;
 		}
 
-		/// <summary>A copy of a file part queued on <paramref name="path"/> (it is now the request's carrier copy): counted in
-		/// that WAN's parts in flight (so the scheduler and the rescue rule see its load), one copy per part: a newer copy
-		/// on another WAN moves the count there. Until the part's lease is released, or the counted copy fails.</summary>
-		private void CountTransferCopy(Rpc rpc, TransportPath path)
+		/// <summary>A file part's copy load, made to match its request's live copies (after any change to them): the newest
+		/// live copy, if on another WAN than the part's own, is counted in that WAN's parts in flight (so the scheduler and
+		/// the rescue rule see its load), once per part. Nothing for a request already answered or given up on. The lease is
+		/// shared by every attempt of the part: a newer attempt's copy load is never replaced by an older attempt's. A sync
+		/// older than one already applied (two can race outside the locks) changes nothing.</summary>
+		private void SyncTransferCopy(Rpc rpc)
 		{
 			if (rpc.transferDir < 0 || rpc.lease is not TransferLease lease)
 				return;
-			var root = RootClient;
-			var w = Wan(WanKey(path)); // before the lock and any change: nothing below can fail half-way
-			lock (root._transferLock)
+			bool pending;
+			lock (_pendingRpcs)
+				pending = _pendingRpcs.TryGetValue(rpc.msgId, out var current) && current == rpc;
+			TransportPath newest = null;
+			int version;
+			lock (rpc)
 			{
-				if (Volatile.Read(ref lease.released) != 0)
+				version = rpc.copySyncVersion;
+				if (pending && rpc.liveCopies.Count > 0)
+					newest = rpc.liveCopies[rpc.liveCopies.Keys.Max()].Path; // msg_ids grow: the newest copy
+			}
+			var w = newest != null ? Wan(WanKey(newest)) : null; // before the lock: nothing below can fail half-way
+			lock (RootClient._transferLock)
+			{
+				if (version < rpc.copySyncApplied)
 					return;
-				UncountTransferCopyLocked(lease); // the previous copy no longer carries it
-				if (w != lease.Wan) // a copy on its own WAN adds nothing to count
+				rpc.copySyncApplied = version;
+				if (Volatile.Read(ref lease.released) != 0)
+					return; // ReleaseTransfer has uncounted it
+				bool mine = lease.CopyOwner == rpc;
+				if (w == null || w == lease.Wan) // no live copy, or one on the part's own WAN (nothing to count)
 				{
-					w.InFlight[lease.Dir]++;
-					(lease.CopyWan, lease.CopyOwner) = (w, rpc);
+					if (mine)
+						UncountTransferCopyLocked(lease);
+					return;
 				}
+				if (!mine && lease.CopyOwner is Rpc other && other.msgId > rpc.msgId)
+					return; // a newer attempt's copy holds the count
+				if (lease.CopyWan == w && mine)
+					return;
+				UncountTransferCopyLocked(lease);
+				w.InFlight[lease.Dir]++;
+				(lease.CopyWan, lease.CopyOwner) = (w, rpc);
 			}
 		}
 
@@ -239,17 +262,6 @@ namespace WTelegram
 		{
 			if (rpc?.lease is TransferLease lease)
 				Volatile.Write(ref lease.QueuedTicks, now); // read under _transferLock; no lock needed to publish it
-		}
-
-		/// <summary>Undoes <see cref="CountTransferCopy"/> for a copy of this request (the lease is shared by every attempt
-		/// of the part: an older attempt's copy failing late must not uncount the current one's).</summary>
-		private void UncountTransferCopy(Rpc rpc)
-		{
-			if (rpc.lease is not TransferLease lease)
-				return;
-			lock (RootClient._transferLock)
-				if (lease.CopyOwner == rpc)
-					UncountTransferCopyLocked(lease);
 		}
 
 		private static void UncountTransferCopyLocked(TransferLease lease)
