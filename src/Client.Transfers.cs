@@ -211,25 +211,38 @@ namespace WTelegram
 			return oldest;
 		}
 
-		/// <summary>A file part's copy load, made to match its request's live copies (after any change to them): the newest
-		/// live copy, if on another WAN than the part's own, is counted in that WAN's parts in flight (so the scheduler and
-		/// the rescue rule see its load), once per part. Nothing for a request already answered or given up on. The lease is
-		/// shared by every attempt of the part: a newer attempt's copy load is never replaced by an older attempt's. A sync
-		/// older than one already applied (two can race outside the locks) changes nothing.</summary>
+		/// <summary>A file part's request was answered, given up on, or forgotten (called after its removal from the pending
+		/// requests): its copy load goes. The version is bumped after the removal, so any sync that reads this version also
+		/// reads the request as settled, and a sync that still read it as pending has an older version and is dropped.</summary>
+		private void SettledTransfer(Rpc rpc)
+		{
+			if (rpc.transferDir < 0 || rpc.lease == null)
+				return;
+			lock (rpc)
+				rpc.copySyncVersion++;
+			SyncTransferCopy(rpc);
+		}
+
+		/// <summary>A file part's copy load, made to match its request's live copies (after any change to them, or its
+		/// settling): the newest live copy, if on another WAN than the part's own, is counted in that WAN's parts in flight
+		/// (so the scheduler and the rescue rule see its load), once per part. Nothing for a request already answered or
+		/// given up on. The lease is shared by every attempt of the part: a newer attempt's copy load is never replaced by
+		/// an older attempt's, but a settled attempt's is released. A sync older than one already applied (two can race
+		/// outside the locks) changes nothing.</summary>
 		private void SyncTransferCopy(Rpc rpc)
 		{
 			if (rpc.transferDir < 0 || rpc.lease is not TransferLease lease)
 				return;
 			bool pending;
-			lock (_pendingRpcs)
-				pending = _pendingRpcs.TryGetValue(rpc.msgId, out var current) && current == rpc;
 			TransportPath newest = null;
 			int version;
-			lock (rpc)
+			lock (rpc) // the version first, then whether it is pending (see SettledTransfer); _pendingRpcs never nests the other way
 			{
 				version = rpc.copySyncVersion;
+				lock (_pendingRpcs)
+					pending = _pendingRpcs.TryGetValue(rpc.msgId, out var current) && current == rpc;
 				if (pending && rpc.liveCopies.Count > 0)
-					newest = rpc.liveCopies[rpc.liveCopies.Keys.Max()].Path; // msg_ids grow: the newest copy
+					newest = rpc.liveCopies.Values.MaxBy(c => c.Seq).Path; // the copy that went live last
 			}
 			var w = newest != null ? Wan(WanKey(newest)) : null; // before the lock: nothing below can fail half-way
 			lock (RootClient._transferLock)
@@ -246,8 +259,8 @@ namespace WTelegram
 						UncountTransferCopyLocked(lease);
 					return;
 				}
-				if (!mine && lease.CopyOwner is Rpc other && other.msgId > rpc.msgId)
-					return; // a newer attempt's copy holds the count
+				if (!mine && lease.CopyOwner is Rpc other && other.msgId > rpc.msgId && !other.tcs.Task.IsCompleted)
+					return; // a newer attempt's copy holds the count (a settled one's does not)
 				if (lease.CopyWan == w && mine)
 					return;
 				UncountTransferCopyLocked(lease);

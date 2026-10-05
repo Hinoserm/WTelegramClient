@@ -989,7 +989,8 @@ namespace WTelegram
 			// before the write: the first answer can arrive before the copy is out, and the second one
 			// must then be dropped (see ReadRpcResult). Never reset: a stray mark only costs a dict entry.
 			rpc.copyAttempted = true;
-			long containerId, generation = -1, registeredId = 0;
+			long containerId = 0, generation = -1, registeredId = 0;
+			bool live = false;
 			Task written = Task.CompletedTask;
 			var sem = _sendSemaphore;
 			try
@@ -1004,12 +1005,13 @@ namespace WTelegram
 					if (Environment.TickCount64 - rpc.sentTicks > CopyMaxAgeMs)
 						return false; // aged while waiting for the semaphore (the server would refuse it: BadMsg 16)
 					lock (rpc) // judged again here: callers decided outside the semaphore
-						if (rpc.copies >= MaxCopies || (onlyIfUnhedged && rpc.hedged))
+						if (rpc.copies >= MaxCopies || (onlyIfUnhedged && CarriedByCopy(rpc)))
 							return false;
 					generation = path.Generation;
+					var gen = generation;
 					// Registered right before the frame is queued (QueueOnPath calls this after everything that can fail): a
-					// refusal (BadMsgNotification) about it can arrive before the write returns. Pending, and counted against
-					// the budget, until marked live just below.
+					// refusal (BadMsgNotification) about it can arrive before the write returns. Pending (already a carrier
+					// for HasLiveCarrier and the check above), and counted against the budget, until marked live below.
 					containerId = QueueOnPath(path, new MsgContainer { messages = [new(rpc.msgId, rpc.seqno, rpc.query)] },
 						out written, beforeWrite: id =>
 						{
@@ -1017,10 +1019,14 @@ namespace WTelegram
 							_copyContainers[id] = (rpc.msgId, Environment.TickCount64);
 							lock (rpc)
 							{
-								rpc.pendingCopies.Add(id);
+								rpc.pendingCopies[id] = (path, gen);
 								rpc.copies++;
 							}
 						});
+					// Queued: it carries the request from now on (in order on its path), unless refused meanwhile. Marked
+					// still under the semaphore: the next caller sees it as a carrier, not as a copy in between.
+					if (containerId != 0)
+						live = MarkCopy(rpc, containerId);
 				}
 				finally
 				{
@@ -1030,7 +1036,7 @@ namespace WTelegram
 			catch (Exception ex)
 			{
 				Helpers.Log(2, $"{_dcSession?.DcID}>{reason}: copy of #{(short)rpc.msgId.GetHashCode():X4} on P{path.PathIndex} failed: {ex.Message}");
-				if (registeredId != 0) // registered, then failed before its frame was queued: never sent
+				if (registeredId != 0 && containerId == 0) // registered, then failed before its frame was queued: never sent
 				{
 					_copyContainers.TryRemove(registeredId, out _);
 					lock (rpc)
@@ -1040,36 +1046,70 @@ namespace WTelegram
 							rpc.copies--;
 						}
 				}
-				return false;
+				if (containerId == 0)
+					return false;
+				// queued, then something after failed: the frame is out, so its write is still followed below
 			}
 			if (containerId == 0)
 				return false;
-			// Queued: it carries the request from now on (in order on its path), unless already refused meanwhile.
-			MarkCopy(rpc, containerId, path, generation);
 			// not awaited: the callers include the path monitors, which serve every path and must not wait on a slow one
-			_ = CopyWrittenAsync(written, rpc, path, generation, containerId, reason, sole, avoidIndex, afterWritten);
-			return true;
+			_ = CopyWrittenAsync(written, rpc, path, generation, containerId, reason, sole, avoidIndex, afterWritten, live);
+			return live;
 		}
 
 		/// <summary>A queued copy becomes live (a carrier of its request), unless the server refused it while it was being
 		/// queued. All copy state changes under lock(rpc), here and in <see cref="CopyGone"/>, so no refusal is ever lost
 		/// between the two. The file part's copy load follows (<see cref="SyncTransferCopy"/>).</summary>
-		private void MarkCopy(Rpc rpc, long containerId, TransportPath path, long generation)
+		/// <returns>false if it was refused before it went live</returns>
+		private bool MarkCopy(Rpc rpc, long containerId)
 		{
 			lock (rpc)
 			{
-				if (!rpc.pendingCopies.Remove(containerId))
-					return; // gone already (refused and accounted for)
+				if (!rpc.pendingCopies.Remove(containerId, out var where))
+					return false; // gone already (refused and accounted for)
 				if (rpc.refusedPending.Remove(containerId))
 				{
 					rpc.copies--; // refused before it went live: it never carried anything
-					return;
+					return false;
 				}
-				rpc.liveCopies[containerId] = (path, generation);
+				rpc.liveCopies[containerId] = (where.Path, where.Gen, ++rpc.copySeq);
 				rpc.hedged = true;
 				rpc.copySyncVersion++;
 			}
 			SyncTransferCopy(rpc);
+			return true;
+		}
+
+		/// <summary>A copy carries the request, or is being queued to (and not refused). Caller holds lock(rpc).</summary>
+		private static bool CarriedByCopy(Rpc rpc) => rpc.hedged || rpc.pendingCopies.Count > rpc.refusedPending.Count;
+
+		/// <summary>Copies that went out on a connection now gone (its path down or reconnected since) carry nothing: they stop
+		/// counting as carriers and give their budget slots back. Run before each look at whether a request is carried.</summary>
+		private void DropDeadCopies(Rpc rpc)
+		{
+			TransportPath[] current;
+			lock (_pathsLock)
+				current = [.. _paths];
+			bool changed = false;
+			lock (rpc)
+			{
+				if (rpc.liveCopies.Count == 0)
+					return;
+				foreach (var (id, copy) in rpc.liveCopies.ToArray())
+					if (!copy.Path.IsAlive || Volatile.Read(ref copy.Path.Generation) != copy.Gen || Array.IndexOf(current, copy.Path) < 0)
+					{
+						rpc.liveCopies.Remove(id);
+						rpc.copies--;
+						changed = true;
+					}
+				if (changed)
+				{
+					rpc.hedged = rpc.liveCopies.Count > 0;
+					rpc.copySyncVersion++;
+				}
+			}
+			if (changed)
+				SyncTransferCopy(rpc);
 		}
 
 		/// <summary>A copy carries nothing (any more): its write failed, its queuing failed, or the server refused it. A live
@@ -1088,7 +1128,7 @@ namespace WTelegram
 					rpc.hedged = rpc.liveCopies.Count > 0;
 					rpc.copySyncVersion++;
 				}
-				else if (rpc.pendingCopies.Contains(containerId))
+				else if (rpc.pendingCopies.ContainsKey(containerId))
 					rpc.refusedPending.Add(containerId);
 			}
 			if (wasLive)
@@ -1096,19 +1136,22 @@ namespace WTelegram
 			return wasLive;
 		}
 
-		/// <summary>The live copies of a request (path, connection), read together.</summary>
-		private static (TransportPath Path, long Gen)[] LiveCopies(Rpc rpc)
+		/// <summary>The copies carrying a request (path, connection): the live ones and the ones being queued (not refused),
+		/// read together.</summary>
+		private static (TransportPath Path, long Gen)[] CarrierCopies(Rpc rpc)
 		{
 			lock (rpc)
-				return [.. rpc.liveCopies.Values];
+				return [.. rpc.liveCopies.Values.Select(c => (c.Path, c.Gen)),
+					.. rpc.pendingCopies.Where(p => !rpc.refusedPending.Contains(p.Key)).Select(p => p.Value)];
 		}
 
 		/// <summary>Once a copy is written: counted, logged, and (a copy that is now the only carrier) watched for its answer
 		/// from then on, not from its queuing. If its write failed it carries nothing: the request is open to another copy
 		/// (its budget slot back), and the connection (its CTR state past a partial frame) is closed for its reactor to
 		/// reconnect, unless a newer connection was swapped in meanwhile.</summary>
+		/// <param name="live">false: refused before it went live (only its write is followed, for the connection's sake)</param>
 		private async Task CopyWrittenAsync(Task written, Rpc rpc, TransportPath path, long generation, long containerId, string reason,
-			bool sole, int avoidIndex, Action afterWritten)
+			bool sole, int avoidIndex, Action afterWritten, bool live)
 		{
 			try
 			{
@@ -1123,6 +1166,8 @@ namespace WTelegram
 						path.NetworkStream?.Close();
 				return;
 			}
+			if (!live)
+				return; // refused before it went live: carries nothing, nothing to count or watch
 			if (sole) // first: nothing below may keep the only carrier from being watched
 				_ = CopyAnswerWatchdog(rpc, Interlocked.Increment(ref rpc.soleCopies));
 			try
@@ -1278,7 +1323,8 @@ namespace WTelegram
 		/// Compares connection generations, not path indices: a reconnected path is a new connection.</summary>
 		private bool HasLiveCarrier(Rpc rpc)
 		{
-			var copies = LiveCopies(rpc); // taken before _pathsLock: never nested
+			DropDeadCopies(rpc);
+			var copies = CarrierCopies(rpc); // taken before _pathsLock: never nested
 			lock (_pathsLock)
 			{
 				if (IsLive(rpc.sentPathIndex, rpc.sentGen))
@@ -1307,6 +1353,7 @@ namespace WTelegram
 				_pendingRpcs.Remove(rpc.msgId);
 				_settledHedged[rpc.msgId] = Environment.TickCount64;
 			}
+			SettledTransfer(rpc);
 			if (exception != null)
 			{
 				Helpers.Log(4, $"{_dcSession?.DcID}>Giving up on #{(short)rpc.msgId.GetHashCode():X4} {rpc.query?.GetType().Name.TrimEnd('_')}: {why}");
@@ -1446,6 +1493,11 @@ namespace WTelegram
 				return;
 			var now = Environment.TickCount64;
 			List<Rpc> stalled = null, transfers = null;
+			Rpc[] hedgedNow;
+			lock (_pendingRpcs)
+				hedgedNow = [.. _pendingRpcs.Values.Where(r => r.hedged)];
+			foreach (var rpc in hedgedNow) // a copy on a connection gone since carries nothing: not hedged any more
+				DropDeadCopies(rpc);
 			lock (_pendingRpcs)
 				foreach (var rpc in _pendingRpcs.Values)
 					if (!rpc.hedged && rpc.query != null && rpc.sentPathIndex >= 0)
@@ -2386,6 +2438,8 @@ namespace WTelegram
 				else
 					settledBefore = _settledHedged.ContainsKey(msgId);
 			}
+			if (rpc != null)
+				SettledTransfer(rpc);
 			PruneCopyState(); // at most every 10 s; this is the one path every client takes, single-path included
 			object result;
 			if (settledBefore)
@@ -2495,8 +2549,9 @@ namespace WTelegram
 			// Copies of this request, all changed under lock(rpc) (see MarkCopy / CopyGone): the ones queued and not known
 			// to have failed or been refused (by container id, with the path and connection they went out on), the ones
 			// registered but not yet queued, and of those the ones the server refused meanwhile.
-			internal readonly Dictionary<long, (TransportPath Path, long Gen)> liveCopies = [];
-			internal readonly HashSet<long> pendingCopies = [];
+			internal readonly Dictionary<long, (TransportPath Path, long Gen, long Seq)> liveCopies = [];
+			internal readonly Dictionary<long, (TransportPath Path, long Gen)> pendingCopies = [];
+			internal long copySeq; // order the copies went live in (msg_ids can go backwards after a time resync)
 			internal readonly HashSet<long> refusedPending = [];
 			internal volatile bool hedged; // liveCopies is not empty (kept in step with it)
 			internal int copies; // copies counted against the budget: live ones and ones still being queued
@@ -3977,6 +4032,7 @@ namespace WTelegram
 		/// <summary>Removes a request whose caller is getting an exception, unless it was already answered.</summary>
 		private void ForgetPending(Rpc rpc)
 		{
+			bool forgotten = false;
 			lock (_pendingRpcs)
 				if (_pendingRpcs.TryGetValue(rpc.msgId, out var current) && current == rpc)
 				{
@@ -3984,7 +4040,10 @@ namespace WTelegram
 					// settled, like an answered one: a copy already out may still be answered (dropped as a second
 					// answer), and a BadMsgNotification 32/33 about it is no reason for a session reset (nobody waits on it)
 					_settledHedged[rpc.msgId] = Environment.TickCount64;
+					forgotten = true;
 				}
+			if (forgotten)
+				SettledTransfer(rpc);
 		}
 
 		/// <summary>Main client with several paths: every request also goes out on the next best path at once
