@@ -364,15 +364,26 @@ namespace WTelegram
 				$"{(done ? "" : " (still going, copied)")}: {sample / 1e6 * 8:F1} Mbit/s (EWMA {w.Bps[dir] / 1e6 * 8:F1})");
 		}
 
-		/// <summary>For a stalled file part: the live path (other than <paramref name="avoidIndex"/>) on the WAN measured
-		/// fastest in its direction; not measured counts as slowest, then lowest latency.</summary>
+		/// <summary>For a stalled file part: the live path (other than <paramref name="avoidIndex"/>) on the WAN fastest in its
+		/// direction right now: measured speed bounded by its oldest part in flight, so a WAN whose parts are stuck (gone
+		/// dark, not yet detected) is not picked; not measured counts as slowest, then lowest latency.</summary>
 		private TransportPath PickTransferCopyPath(int avoidIndex, int dir)
 		{
 			TransportPath[] paths;
 			lock (_pathsLock)
 				paths = _paths.Where(p => p.IsAlive && p.PathIndex != avoidIndex && p.NetworkStream != null).ToArray();
-			return paths.OrderByDescending(p => MeasuredBps(p, dir))
-				.ThenBy(p => Volatile.Read(ref p.LatencyEwmaMs)).FirstOrDefault();
+			if (paths.Length <= 1)
+				return paths.FirstOrDefault();
+			var root = RootClient;
+			long now = Environment.TickCount64;
+			var speed = new System.Collections.Generic.Dictionary<TransportPath, double>();
+			lock (root._transferLock)
+				foreach (var p in paths)
+				{
+					var w = Wan(WanKey(p));
+					speed[p] = LiveBps(w, dir, now, w.Bps[dir]);
+				}
+			return paths.OrderByDescending(p => speed[p]).ThenBy(p => Volatile.Read(ref p.LatencyEwmaMs)).FirstOrDefault();
 		}
 
 		/// <summary>Once a minute on the main client, if any part moved: per WAN and direction, parts, bytes, measured
