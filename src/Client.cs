@@ -1338,6 +1338,12 @@ namespace WTelegram
 			{
 				switch (state & 7)
 				{
+					case 2 or 3 when rpc.seqnoRefused:
+						// not received, and its message refused for its seqno (after a session's connections were all
+						// replaced, its seqno is behind): re-sending it is refused every time, and it can never run.
+						// A new msg_id is safe, and the only way it ever gets answered.
+						FailForRetry(rpc, new IOException($"Telegram has not got #{(short)rpc.msgId.GetHashCode():X4} {query} and refuses its msg_seqno"));
+						return; // settled: nothing to re-check
 					case 2 or 3:
 						Helpers.Log(2, $"{_dcSession.DcID}>Telegram has not got #{(short)rpc.msgId.GetHashCode():X4} {query}; re-sending it");
 						await SendCopyAsync(rpc, -1, "not received", sole: false);
@@ -2702,6 +2708,11 @@ namespace WTelegram
 			internal int stateChecks; // msgs_state_req asked about this msg_id so far
 			internal int stateCheckInFlight; // 1 while a state request (or its re-check delay) is outstanding
 			internal volatile bool serverHasIt; // a state answer said "received": never a new msg_id after that
+			// a BadMsgNotification 32/33 named this request's own msg_id (not a copy's container: that is the container's
+			// seqno): every copy carries the same message, msg_id and seqno, and the server's record only grows, so it can
+			// never be accepted. Once a state answer also says "not received", it never ran and never will, and a new
+			// msg_id is safe (OnMsgStateAsync)
+			internal volatile bool seqnoRefused;
 			// File transfer part (TransferMode Throughput): the scheduler's choice of path, and what is
 			// needed to measure the transfer speed of whichever path(s) carried it
 			internal TransferLease lease;
@@ -2902,7 +2913,10 @@ namespace WTelegram
 						if (copiedRpc?.copyAttempted == true || _settledHedged.ContainsKey(badMsgId))
 						{
 							if (copiedRpc != null) // only if the copy does not answer it promptly: ask the server
+							{
+								copiedRpc.seqnoRefused = true; // its copies carry the same message: refused alike
 								_ = CheckIfUnansweredAsync(copiedRpc, 3000, $"BadMsgNotification {badMsgNotification.error_code} on the original");
+							}
 							break;
 						}
 					}
