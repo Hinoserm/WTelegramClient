@@ -128,8 +128,8 @@ namespace WTelegram
 				lock (_pathsLock)
 					if (_paths.Count > 0)
 						return !_paths.Any(p => p.IsAlive);
-				if (_tcpClient != null)
-					return !(_tcpClient.Client?.Connected ?? false);
+				if (_tcpClient is { } tcp) // read once: a reset nulls it
+					return !(tcp.Client?.Connected ?? false);
 				return _connectionLost || _disposed;
 			}
 		}
@@ -592,6 +592,7 @@ namespace WTelegram
 			_pendingPings.Clear();
 			_networkStream?.Close();
 			_tcpClient?.Dispose();
+			_tcpClient = null; // gone: a reset single-connection (MTProxy) client has no transport, like a multipath one
 #if OBFUSCATION
 			_sendCtr?.Dispose();
 			_recvCtr?.Dispose();
@@ -807,6 +808,11 @@ namespace WTelegram
 					{
 						lock (_msgsToAck) _msgsToAck.Clear();
 						await ResetAsync(false, false);
+						// no transport until ConnectAsync succeeds (as in a full reconnect): Disconnected says so - for the root
+						// client (the app's gates read it). Not for an alt-DC clone: GetClientForDC would dispose it mid-reconnect,
+						// failing the transfers its reconnect is about to re-send
+						if (_parentClient == null)
+							_connectionLost = true;
 						_reactorReconnects = (_reactorReconnects + 1) % MaxAutoReconnects;
 						if (disconnectedAltDC && _pendingRpcs.Count <= 1)
 							if (_pendingRpcs.Values.FirstOrDefault() is not Rpc rpc || rpc.type == typeof(Pong))
@@ -840,7 +846,7 @@ namespace WTelegram
 					}
 					catch (Exception e) when (!(e is ObjectDisposedException && _disposed)) // disposed: the end, not a loss
 					{
-						GiveUpConnection(reactorError, ex);
+						await GiveUpConnection(reactorError, ex); // tears down what the failed reconnect left, then tells the app
 					}
 					finally
 					{
@@ -860,12 +866,14 @@ namespace WTelegram
 						// One that reset the connection and could not make it again (a 32/33 session renewal while the
 						// network is down) left no transport: that is a lost connection like the reactor's own.
 						Helpers.Log(4, $"{_dcSession?.DcID}>Handling {obj.GetType().Name} failed: {ex}");
+						// (a 32/33 renewal that failed tears down whatever it half-made, so "no transport" is exact here;
+						// a full reconnect under way also has none for a while, but it is not lost: never given up on)
 						bool noTransport;
 						lock (_pathsLock)
-							noTransport = _paths.Count == 0 && _tcpClient == null && _httpClient == null;
+							noTransport = _paths.Count == 0 && _tcpClient == null && _httpClient == null && !_fullReconnectStarted;
 						if (noTransport)
 						{
-							GiveUpConnection(new ReactorError { Exception = ex }, ex);
+							await GiveUpConnection(new ReactorError { Exception = ex }, ex);
 							return; // a reconnect starts a new reactor
 						}
 					}
@@ -875,8 +883,15 @@ namespace WTelegram
 
 		/// <summary>The connection is lost and this client will not make it again by itself: marked (Disconnected reads it),
 		/// the app told (ReactorError, main DC), every pending request failed with <paramref name="ex"/></summary>
-		private void GiveUpConnection(ReactorError reactorError, Exception ex)
+		private async Task GiveUpConnection(ReactorError reactorError, Exception ex)
 		{
+			if (_disposed)
+				return; // disposed on purpose: nothing to tell the app, nothing to tear down
+			// Whatever is left goes first (a connect that got as far as publishing a path before failing, a reconnect whose
+			// follow-up failed): the app is told the connection is lost, so it must BE lost - no transport, Disconnected
+			// true, no reactor still reading - or the app trusts Disconnected and never reconnects. Also clears _connecting.
+			try { await ResetAsync(false, false); }
+			catch (Exception resetEx) { Helpers.Log(3, $"{_dcSession?.DcID}>Reset while giving up: {resetEx.Message}"); }
 			_connectionLost = true; // before the app hears of it: it reads Disconnected to decide to reconnect
 			if (IsMainDC)
 				RaiseUpdates(reactorError);
@@ -2217,6 +2232,7 @@ namespace WTelegram
 					// We do NOT acquire the semaphore here — that would deadlock because it starts at 0.
 
 					await Task.Delay(Math.Max(1000, Math.Min(attempt * 2000, PathReconnectMaxBackoff * 1000))); // backoff: 2s, 4s, 6s, ... up to 30s (min 1s)
+					ObjectDisposedException.ThrowIf(_disposed, this); // disposed meanwhile: ends the loop (caught below)
 					await ConnectAsync();
 
 					// Success — same session, so pending RPCs are re-sent with their own msg_id
@@ -2238,6 +2254,13 @@ namespace WTelegram
 					lock (_pathsLock)
 						_fullReconnectStarted = false;
 					throw;
+				}
+				catch (Exception) when (_disposed)
+				{
+					// disposed during an attempt (whatever the failure looked like): over, never another attempt
+					lock (_pathsLock)
+						_fullReconnectStarted = false;
+					return;
 				}
 				catch (Exception ex)
 				{
@@ -2900,12 +2923,25 @@ namespace WTelegram
 			switch (obj)
 			{
 				case MsgContainer container:
+					Exception failed = null;
 					foreach (var msg in container.messages)
 						if (msg.body != null)
 						{
 							_frameMsgId.Value = msg.msg_id;
-							await HandleMessageAsync(msg.body);
+							try
+							{
+								await HandleMessageAsync(msg.body);
+							}
+							catch (Exception ex) when (!(ex is ObjectDisposedException && _disposed))
+							{
+								// one message's failure never drops the rest of the container (an rpc result, an ack, an
+								// update behind it); the first is reported once they are all handled
+								Helpers.Log(4, $"{_dcSession?.DcID}>Handling {msg.body.GetType().Name} in a container failed: {ex.Message}");
+								failed ??= ex;
+							}
 						}
+					if (failed != null)
+						System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw(failed); // keeps its stack
 					break;
 				case MsgCopy msgCopy:
 					if (msgCopy?.orig_message?.body != null)
@@ -3000,7 +3036,17 @@ namespace WTelegram
 							{
 								await ResetAsync(false, false);
 								_dcSession.Renew();
-								await ConnectAsync();
+								try
+								{
+									await ConnectAsync();
+								}
+								catch
+								{
+									// a connect that got part of the way (a path published, then auth or init failed) is torn
+									// down: no transport left, so the reactor's handler catch gives the connection up
+									try { await ResetAsync(false, false); } catch { }
+									throw;
+								}
 								retryAll = true; // new session: every pending msg_id is void
 							}
 							break;
@@ -3305,6 +3351,8 @@ namespace WTelegram
 
 		private async Task DoConnectAsync(bool quickResume)
 		{
+			// a reconnect (reactor's, full, a 32/33 renewal) racing DisposeAsync must not bring a disposed client back
+			ObjectDisposedException.ThrowIf(_disposed, this);
 			_cts = new();
 			IPEndPoint endpoint = null;
 			bool needMigrate = false;
@@ -3416,8 +3464,11 @@ namespace WTelegram
 							{
 								// The default address's session as it was, unless someone changed it meanwhile (then theirs
 								// stands); its previous client only if it is still alive. Then this client back on its own.
-								if (ReferenceEquals(defaultSession.Client, this) && defaultSession.DataCenter == null)
-									(defaultSession.DataCenter, defaultSession.Client) = (defaultDataCenter, defaultClient is { _disposed: false } ? defaultClient : null);
+								// (each field on its own: one changed meanwhile never leaves the other pointing at this client)
+								if (ReferenceEquals(defaultSession.Client, this))
+									defaultSession.Client = defaultClient is { _disposed: false } ? defaultClient : null;
+								if (defaultSession.DataCenter == null)
+									defaultSession.DataCenter = defaultDataCenter;
 								(_dcSession, ownSession.DataCenter, ownSession.Client) = (ownSession, ownDataCenter, this);
 								throw;
 							}
@@ -4631,6 +4682,8 @@ namespace WTelegram
 					// request that keeps failing that way fails its caller instead of retrying forever
 					if (++reactorRetries > MaxReactorRetries)
 						throw new WTException($"{query.GetType().Name} could not be delivered after {MaxReactorRetries} retries: {reactorError.Exception?.Message}", reactorError.Exception);
+					if (reactorRetries > 1) // the first at once (the usual single loss); repeats spaced, up to 2 s
+						await Task.Delay(Math.Min((reactorRetries - 1) * 200, 2000));
 					goto retry;
 				default:
 					throw new WTException($"{query.GetType().Name} call got a result of type {result.GetType().Name} instead of {typeof(T).Name}");
