@@ -255,13 +255,19 @@ namespace WTelegram
 			get => _parallelTransfers.CurrentCount;
 			set
 			{
-				int delta = value - _parallelTransfers.CurrentCount;
-				for (; delta < 0; delta++)
-					_parallelTransfers.Wait();
-				if (delta > 0)
-					_parallelTransfers.Release(delta);
+				// one setter at a time (its own lock, never the connect lock: it may wait for a permit): two at once each
+				// read the same count and both took permits away, down to none - every transfer then waited forever
+				lock (_parallelTransfersSetLock)
+				{
+					int delta = value - _parallelTransfers.CurrentCount;
+					for (; delta < 0; delta++)
+						_parallelTransfers.Wait();
+					if (delta > 0)
+						_parallelTransfers.Release(delta);
+				}
 			}
 		}
+		private readonly object _parallelTransfersSetLock = new();
 
 		private Func<string, string> _config;
 		private readonly Session _session;
@@ -491,7 +497,7 @@ namespace WTelegram
 		{
 			Helpers.Log(2, $"{_dcSession.DcID}>Disposing the client");
 			await ResetAsync(false, root).ConfigureAwait(false);
-			var ex = new ObjectDisposedException(nameof(Client), "WTelegram.Client was disposed");
+			var ex = new ObjectDisposedException(typeof(Client).FullName, "WTelegram.Client was disposed");
 			Rpc[] aborted;
 			lock (_pendingRpcs) // abort all pending requests
 			{
@@ -2263,7 +2269,7 @@ namespace WTelegram
 
 					await Task.Delay(Math.Max(1000, Math.Min(attempt * 2000, PathReconnectMaxBackoff * 1000))); // backoff: 2s, 4s, 6s, ... up to 30s (min 1s)
 					if (_disposed) // disposed meanwhile: ends the loop (caught below)
-						throw new ObjectDisposedException(nameof(Client), "WTelegram.Client was disposed");
+						throw new ObjectDisposedException(typeof(Client).FullName, "WTelegram.Client was disposed");
 					await ConnectAsync();
 
 					// Success — same session, so pending RPCs are re-sent with their own msg_id
@@ -3403,13 +3409,13 @@ namespace WTelegram
 			// Checked again once the new token source exists: DisposeAsync sets _disposed before it cancels _cts, so a
 			// dispose either is seen here or cancels this source.
 			if (_disposed)
-				throw new ObjectDisposedException(nameof(Client), "WTelegram.Client was disposed");
+				throw new ObjectDisposedException(typeof(Client).FullName, "WTelegram.Client was disposed");
 			var cts = new CancellationTokenSource();
 			Interlocked.Exchange(ref _cts, cts); // a full fence: the _disposed read below is not reordered before this store
 			if (_disposed)
 			{
 				cts.Cancel();
-				throw new ObjectDisposedException(nameof(Client), "WTelegram.Client was disposed");
+				throw new ObjectDisposedException(typeof(Client).FullName, "WTelegram.Client was disposed");
 			}
 			IPEndPoint endpoint = null;
 			bool needMigrate = false;
