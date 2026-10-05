@@ -214,25 +214,22 @@ namespace WTelegram
 		/// <summary>A copy of a file part queued on <paramref name="path"/> (it is now the request's carrier copy): counted in
 		/// that WAN's parts in flight (so the scheduler and the rescue rule see its load), one copy per part: a newer copy
 		/// on another WAN moves the count there. Until the part's lease is released, or the counted copy fails.</summary>
-		/// <returns>The copy load counted before (to restore it if this copy is rolled back); Valid: this call changed it</returns>
-		private (WanStats Wan, Rpc Owner, bool Valid) CountTransferCopy(Rpc rpc, TransportPath path)
+		private void CountTransferCopy(Rpc rpc, TransportPath path)
 		{
 			if (rpc.transferDir < 0 || rpc.lease is not TransferLease lease)
-				return default;
+				return;
 			var root = RootClient;
+			var w = Wan(WanKey(path)); // before the lock and any change: nothing below can fail half-way
 			lock (root._transferLock)
 			{
 				if (Volatile.Read(ref lease.released) != 0)
-					return default;
-				var prior = (lease.CopyWan, lease.CopyOwner, true);
+					return;
 				UncountTransferCopyLocked(lease); // the previous copy no longer carries it
-				var w = Wan(WanKey(path));
 				if (w != lease.Wan) // a copy on its own WAN adds nothing to count
 				{
 					w.InFlight[lease.Dir]++;
 					(lease.CopyWan, lease.CopyOwner) = (w, rpc);
 				}
-				return prior;
 			}
 		}
 
@@ -253,24 +250,6 @@ namespace WTelegram
 			lock (RootClient._transferLock)
 				if (lease.CopyOwner == rpc)
 					UncountTransferCopyLocked(lease);
-		}
-
-		/// <summary>A copy rolled back before it was queued: the copy load counted before it is counted again (only if
-		/// <see cref="CountTransferCopy"/> ran for it and changed anything).</summary>
-		private void RestoreTransferCopy(Rpc rpc, (WanStats Wan, Rpc Owner, bool Valid) prior)
-		{
-			if (!prior.Valid || rpc.lease is not TransferLease lease)
-				return;
-			lock (RootClient._transferLock)
-			{
-				if (lease.CopyOwner == rpc)
-					UncountTransferCopyLocked(lease);
-				if (prior.Wan != null && lease.CopyWan == null && Volatile.Read(ref lease.released) == 0)
-				{
-					prior.Wan.InFlight[lease.Dir]++;
-					(lease.CopyWan, lease.CopyOwner) = (prior.Wan, prior.Owner);
-				}
-			}
 		}
 
 		private static void UncountTransferCopyLocked(TransferLease lease)

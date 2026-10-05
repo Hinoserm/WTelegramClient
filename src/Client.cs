@@ -311,6 +311,8 @@ namespace WTelegram
 		// container msg_id of each copy → msg_id of the request inside it, so a BadMsgNotification
 		// about a copy is not mistaken for one about the original. Pruned with _settledHedged.
 		private readonly ConcurrentDictionary<long, (long RpcMsgId, long Ticks)> _copyContainers = new();
+		// containers of copies refused before SendCopyAsync marked them as carrier (see HandleRefusedCopy). Pruned likewise.
+		private readonly ConcurrentDictionary<long, long> _refusedCopies = new();
 		// ping_id → waiter, for registration pings that must be answered before a path is marked alive.
 		private readonly ConcurrentDictionary<long, TaskCompletionSource<bool>> _pingWaiters = new();
 		// msg_id of the frame (or container entry) being handled on this reactor, for Pong.msg_id.
@@ -987,9 +989,7 @@ namespace WTelegram
 			// before the write: the first answer can arrive before the copy is out, and the second one
 			// must then be dropped (see ReadRpcResult). Never reset: a stray mark only costs a dict entry.
 			rpc.copyAttempted = true;
-			long containerId, generation = -1, markedId = 0;
-			(bool, int, long, long) prior = default; // the carrier fields before this copy marked itself
-			(WanStats Wan, Rpc Owner, bool Valid) priorLoad = default; // and the counted copy load
+			long containerId, generation = -1, registeredId = 0;
 			Task written = Task.CompletedTask;
 			var sem = _sendSemaphore;
 			try
@@ -1004,28 +1004,32 @@ namespace WTelegram
 					if (Environment.TickCount64 - rpc.sentTicks > CopyMaxAgeMs)
 						return false; // aged while waiting for the semaphore (the server would refuse it: BadMsg 16)
 					generation = path.Generation;
-					var gen = generation;
-					// Registered and marked right before the frame is queued (QueueOnPath calls this after everything that can
-					// fail): a refusal (BadMsgNotification) about it can arrive before the write returns, and must find it
-					// registered and counted as carrier.
+					// registered right before the frame is queued (QueueOnPath calls this after everything that can fail):
+					// a refusal (BadMsgNotification) about it can arrive before the write returns
 					containerId = QueueOnPath(path, new MsgContainer { messages = [new(rpc.msgId, rpc.seqno, rpc.query)] },
 						out written, beforeWrite: id =>
 						{
+							registeredId = id;
 							_copyContainers[id] = (rpc.msgId, Environment.TickCount64);
-							lock (rpc) // with UncountCopy
-							{
-								prior = (rpc.hedged, rpc.hedgedPathIndex, rpc.hedgedGen, rpc.hedgedContainerId);
-								// it carries the request from now on (queued in order on its path); counted at once, so a
-								// concurrent caller cannot send another copy while this one waits to be written
-								rpc.hedgedGen = gen;
-								rpc.hedgedPathIndex = path.PathIndex;
-								rpc.hedgedContainerId = id;
-								rpc.hedged = true;
-								Interlocked.Increment(ref rpc.copies);
-							}
-							markedId = id; // before anything else can throw: the rollback below needs it
-							priorLoad = CountTransferCopy(rpc, path); // a file part's copy is load on its WAN, like a part
 						});
+					if (containerId != 0)
+					{
+						// Queued: it carries the request from now on (in order on its path). Marked and counted here, only
+						// once it is queued, so a copy that failed to queue is never marked (nothing to roll back), and still
+						// under the semaphore, so a concurrent caller cannot send another copy meanwhile.
+						lock (rpc) // with UncountCopy
+						{
+							rpc.hedgedGen = generation;
+							rpc.hedgedPathIndex = path.PathIndex;
+							rpc.hedgedContainerId = containerId;
+							rpc.hedged = true;
+							Interlocked.Increment(ref rpc.copies);
+						}
+						CountTransferCopy(rpc, path); // a file part's copy is load on its WAN, like a part
+						// refused already (a round trip within these microseconds; HandleRefusedCopy found nothing to undo)
+						if (_refusedCopies.TryRemove(containerId, out _) && UncountCopy(rpc, containerId))
+							UncountTransferCopy(rpc);
+					}
 				}
 				finally
 				{
@@ -1035,17 +1039,8 @@ namespace WTelegram
 			catch (Exception ex)
 			{
 				Helpers.Log(2, $"{_dcSession?.DcID}>{reason}: copy of #{(short)rpc.msgId.GetHashCode():X4} on P{path.PathIndex} failed: {ex.Message}");
-				if (markedId != 0) // marked, then failed before its frame was queued: everything back as it was
-				{
-					_copyContainers.TryRemove(markedId, out _);
-					lock (rpc)
-						if (rpc.hedgedContainerId == markedId)
-						{
-							(rpc.hedged, rpc.hedgedPathIndex, rpc.hedgedGen, rpc.hedgedContainerId) = prior;
-							Interlocked.Decrement(ref rpc.copies);
-						}
-					RestoreTransferCopy(rpc, priorLoad);
-				}
+				if (registeredId != 0) // registered, then failed before its frame was queued: never sent, nothing marked
+					_copyContainers.TryRemove(registeredId, out _);
 				return false;
 			}
 			if (containerId == 0)
@@ -1303,6 +1298,8 @@ namespace WTelegram
 			// copy again if nothing else carries it, else (or if that fails) ask the server about it.
 			if (UncountCopy(rpc, containerId))
 				UncountTransferCopy(rpc);
+			else // not (yet) marked: SendCopyAsync marks a copy just after queuing it, and undoes it if it finds this
+				_refusedCopies[containerId] = Environment.TickCount64;
 			if (errorCode == 20 || HasLiveCarrier(rpc))
 			{
 				if (errorCode == 20)
@@ -1481,6 +1478,9 @@ namespace WTelegram
 			foreach (var kvp in _copyContainers)
 				if (now - kvp.Value.Ticks > 300_000)
 					_copyContainers.TryRemove(kvp.Key, out _);
+			foreach (var kvp in _refusedCopies)
+				if (now - kvp.Value > 300_000)
+					_refusedCopies.TryRemove(kvp.Key, out _);
 		}
 
 		/// <summary>Per-path RTT and liveness from a Pong. Telegram routes answers to ANY connection of the
@@ -2019,10 +2019,13 @@ namespace WTelegram
 
 		/// <summary>Queue a raw message directly on a specific transport path (bypassing primary path selection).
 		/// Caller holds the send semaphore, and awaits <paramref name="written"/> only after releasing it.</summary>
-		/// <param name="registering">The path is not alive yet: this is its registration ping</param>
+		/// <param name="path">The path to queue it on</param>
+		/// <param name="msg">The message (a service message: no seqno content bit)</param>
 		/// <param name="written">Completes once the frame is written; fails only with an IOException</param>
+		/// <param name="registering">The path is not alive yet: this is its registration ping</param>
+		/// <param name="beforeWrite">Called with the msg_id right before the frame is queued, after everything that can fail
+		/// (to register for its answer)</param>
 		/// <returns>The msg_id it was sent with, or 0 when the path cannot take it (<paramref name="written"/> is then complete)</returns>
-		/// <param name="beforeWrite">Called with the msg_id before the frame is written (to register for its answer)</param>
 		private long QueueOnPath(TransportPath path, IObject msg, out Task written, bool registering = false, Action<long> beforeWrite = null)
 		{
 			written = Task.CompletedTask;
