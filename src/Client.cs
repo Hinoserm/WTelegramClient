@@ -116,10 +116,24 @@ namespace WTelegram
 		/// <summary>Is this Client instance the main or a secondary DC session</summary>
 		public bool IsMainDC => _dcSession?.DataCenter?.flags.HasFlag(DcOption.Flags.media_only) != true
 			&& (_dcSession?.DataCenter?.id - _session.MainDC) is null or 0;
-		/// <summary>Has this Client established connection been disconnected?</summary>
-		public bool Disconnected => _paths.Count > 0
-			? !_paths.Any(p => p.IsAlive)
-			: (_tcpClient != null && !(_tcpClient.Client?.Connected ?? false));
+		/// <summary>Has this Client established connection been disconnected? Also true once its own reconnect has given
+		/// up (ReactorError raised, reactor ended): a multipath client is then left with no paths and no single TCP client,
+		/// which used to read as connected, so an app reconnecting on ReactorError when Disconnected never did. A client
+		/// not yet connected (or connecting) is not "disconnected", as before (GetClientForDC relies on it).</summary>
+		public bool Disconnected
+		{
+			get
+			{
+				if (_connectionLost)
+					return true;
+				lock (_pathsLock)
+					if (_paths.Count > 0)
+						return !_paths.Any(p => p.IsAlive);
+				return _tcpClient != null && !(_tcpClient.Client?.Connected ?? false);
+			}
+		}
+		/// <summary>Set when the reactor's reconnect gave up (it raised a ReactorError and ended); cleared by a successful connect</summary>
+		private volatile bool _connectionLost;
 		/// <summary>Returns a snapshot of per-path transport statistics for THIS client's DC. Empty array if not using multipath.</summary>
 		public PathStats[] GetPathStatistics()
 		{
@@ -806,6 +820,7 @@ namespace WTelegram
 					}
 					catch (Exception e) when (e is not ObjectDisposedException)
 					{
+						_connectionLost = true; // before the app hears of it: it reads Disconnected to decide to reconnect
 						if (IsMainDC)
 							RaiseUpdates(reactorError);
 						Rpc[] aborted;
@@ -3222,6 +3237,7 @@ namespace WTelegram
 			try
 			{
 				await task;
+				_connectionLost = false; // connected again (Disconnected goes back to the paths' own state)
 			}
 			catch
 			{
