@@ -528,6 +528,9 @@ namespace WTelegram
 		{
 			if (_tcpUsed) // (not _tcpClient: a reset nulls it, and multipath never sets it)
 				throw new InvalidOperationException("Cannot switch to HTTP after TCP connection");
+			lock (this) // nor while a connect is under way (it would end up with TCP paths beside HTTP mode)
+				if (_connecting is { IsCompleted: false })
+					throw new InvalidOperationException("Cannot switch to HTTP while connecting");
 			_httpClient = httpClient ?? new();
 			_httpWait = defaultHttpWait;
 			ParallelTransfers = 1;
@@ -3382,7 +3385,7 @@ namespace WTelegram
 			if (_disposed)
 			{
 				cts.Cancel();
-				throw new ObjectDisposedException(nameof(Client));
+				throw new ObjectDisposedException("WTelegram.Client was disposed");
 			}
 			IPEndPoint endpoint = null;
 			bool needMigrate = false;
