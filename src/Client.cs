@@ -1054,15 +1054,15 @@ namespace WTelegram
 						path.NetworkStream?.Close();
 				return;
 			}
+			if (sole) // first: nothing below may keep the only carrier from being watched
+				_ = CopyAnswerWatchdog(rpc, Interlocked.Increment(ref rpc.soleCopies));
 			if (sole)
 				Interlocked.Increment(ref _statRescued);
 			else if (reason == "Hedge")
 				Interlocked.Increment(ref _statHedged);
 			else
 				Interlocked.Increment(ref _statStalled);
-			Helpers.Log(sole ? 2 : 1, $"{_dcSession.DcID}>{reason}: copied #{(short)rpc.msgId.GetHashCode():X4} {rpc.query.GetType().Name.TrimEnd('_')} to P{path.PathIndex}{(avoidIndex >= 0 ? $" (was P{avoidIndex})" : "")}");
-			if (sole)
-				_ = CopyAnswerWatchdog(rpc, Interlocked.Increment(ref rpc.soleCopies));
+			Helpers.Log(sole ? 2 : 1, $"{_dcSession?.DcID}>{reason}: copied #{(short)rpc.msgId.GetHashCode():X4} {rpc.query?.GetType().Name.TrimEnd('_')} to P{path.PathIndex}{(avoidIndex >= 0 ? $" (was P{avoidIndex})" : "")}");
 		}
 
 		/// <summary>A copy that replaced a lost original gets <see cref="CopyAnswerTimeoutMs"/> to be answered,

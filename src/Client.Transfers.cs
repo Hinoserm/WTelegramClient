@@ -233,8 +233,9 @@ namespace WTelegram
 		}
 
 		/// <summary>A file part (at least 750 ms after queuing) on a WAN measured under <see cref="RescueRatio"/> of the best
-		/// other one, older than three times what that one would need for it: it gets a copy there (see
-		/// CopyStalledRpcsAsync), so a slow WAN never holds up the end of a file.</summary>
+		/// other one (or not measured itself), older than three times what that one would need for it: it gets a copy
+		/// there (see CopyStalledRpcsAsync), so a slow WAN never holds up the end of a file. Another WAN not measured yet
+		/// counts as twice as fast as this one; with nothing measured at all, a part 2 s old is copied.</summary>
 		private bool TransferCopyDue(Rpc rpc, long now)
 		{
 			if (rpc.transferDir < 0 || rpc.transferBytes <= 0)
@@ -314,15 +315,19 @@ namespace WTelegram
 			AddTransferSample(carrier, dir, bytes, Volatile.Read(ref rpc.writtenTicks), done: true);
 		}
 
-		/// <summary>A file part being copied because its WAN is slow: its size over the time since it was queued there, a
-		/// pessimistic ceiling of that WAN's speed (it counts the wait behind earlier parts), which only ever lowers the
-		/// estimate (see AddTransferSample), so the scheduler learns the WAN is slow even though no answer will say so.
-		/// (Not from the write: on a slow uplink even the first part's write takes seconds. Not over the parts ahead:
-		/// the measured speed reads high on a lossy link, and that made the slow WAN look fine; tested.)</summary>
+		/// <summary>A file part being copied because its WAN is slow: if it is that WAN's oldest part in flight, its size over
+		/// the time since it was queued is a ceiling of the WAN's speed, which only ever lowers an existing estimate (see
+		/// AddTransferSample), so the scheduler learns the WAN is slow even though no answer will say so. (Not from the
+		/// write: on a slow uplink even the first part's write takes seconds.)</summary>
 		private void RecordSlowTransfer(Rpc rpc)
 		{
-			if (rpc.transferDir >= 0 && rpc.transferBytes >= MinSampleBytes && Volatile.Read(ref rpc.queuedTicks) > 0)
-				AddTransferSample(rpc.sentPathIndex, rpc.transferDir, rpc.transferBytes, Volatile.Read(ref rpc.queuedTicks), done: false);
+			if (rpc.transferDir < 0 || rpc.transferBytes < MinSampleBytes || Volatile.Read(ref rpc.queuedTicks) <= 0 || rpc.lease is not TransferLease lease)
+				return;
+			// only the WAN's oldest part in flight: its age is its own time, not a wait behind earlier parts
+			lock (RootClient._transferLock)
+				if (lease.Wan.Active[rpc.transferDir].MinBy(l => l.StartTicks) != lease)
+					return;
+			AddTransferSample(rpc.sentPathIndex, rpc.transferDir, rpc.transferBytes, Volatile.Read(ref rpc.queuedTicks), done: false);
 		}
 
 		/// <param name="done">An answered part: its time runs from its write, or from the WAN's previous answer if that
@@ -346,8 +351,8 @@ namespace WTelegram
 				if (done)
 					w.LastAckTicks[dir] = now;
 				sample = bytes * 1000.0 / Math.Max(1, now - from);
-				// a bound taken mid-way is a ceiling: it can only lower the estimate, never raise it
-				if (!done && w.Bps[dir] > 0 && sample >= w.Bps[dir])
+				// a bound taken mid-way is a ceiling: it can only lower an estimate, never raise one or be the first
+				if (!done && (w.Samples[dir] == 0 || sample >= w.Bps[dir]))
 					return;
 				// a slowdown counts at once, a recovery gradually: a WAN that just got slow must not keep taking parts
 				double weight = sample < w.Bps[dir] ? SlowSampleWeight : SampleWeight;
