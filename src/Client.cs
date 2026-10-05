@@ -321,6 +321,8 @@ namespace WTelegram
 		private const long ServerMsgIdWindowMs = 330_000;
 		// msg_id of each msgs_state_req we sent → the request it asks about
 		private readonly ConcurrentDictionary<long, Rpc> _stateChecks = new();
+		// msg_ids whose caller got an exception (ForgetPending): a late answer is dropped. Pruned with _settledHedged.
+		private readonly ConcurrentDictionary<long, long> _forgottenRpcs = new();
 		private const int MaxCopies = 8;
 		private long _pathGeneration; // source of TransportPath.Generation
 		// copies and state checks never wait longer than this for the send semaphore (a reconnect holds it)
@@ -971,7 +973,8 @@ namespace WTelegram
 		/// <param name="sole">The copy is now the only live one (its original's path died): if no answer comes
 		/// within <see cref="CopyAnswerTimeoutMs"/>, fail it so Invoke retries with a new msg_id.</param>
 		/// <returns>false when nothing was sent: already answered, too old, copy budget spent, or no other path</returns>
-		private async Task<bool> SendCopyAsync(Rpc rpc, int avoidIndex, string reason, bool sole)
+		/// <param name="afterWritten">Run once the copy is written (not when queued)</param>
+		private async Task<bool> SendCopyAsync(Rpc rpc, int avoidIndex, string reason, bool sole, Action afterWritten = null)
 		{
 			if (rpc.query == null || rpc.msgId == 0 || rpc == _bareRpc)
 				return false;
@@ -1009,9 +1012,12 @@ namespace WTelegram
 							// concurrent caller cannot send another copy while this one waits to be written
 							rpc.hedgedGen = generation;
 							rpc.hedgedPathIndex = path.PathIndex;
+							rpc.hedgedContainerId = containerId;
 							rpc.hedged = true;
 							Interlocked.Increment(ref rpc.copies);
 						}
+					if (containerId != 0)
+						CountTransferCopy(rpc, path); // a file part's copy is load on its WAN, like a part
 				}
 				finally
 				{
@@ -1026,15 +1032,39 @@ namespace WTelegram
 			if (containerId == 0)
 				return false;
 			// not awaited: the callers include the path monitors, which serve every path and must not wait on a slow one
-			_ = CopyWrittenAsync(written, rpc, path, generation, reason, sole, avoidIndex);
+			_ = CopyWrittenAsync(written, rpc, path, generation, containerId, reason, sole, avoidIndex, afterWritten);
 			return true;
+		}
+
+		/// <summary>A copy carries nothing any more (its write failed, or the server refused it): if it is the one counted
+		/// as carrier, the request is no longer hedged and its budget slot is given back. Matched by the copy's own
+		/// container, so a newer copy (even on the same path and connection) is never undone.</summary>
+		/// <returns>true if that copy was the counted carrier</returns>
+		private static bool UncountCopy(Rpc rpc, long containerId)
+		{
+			lock (rpc)
+			{
+				if (!rpc.hedged || rpc.hedgedContainerId != containerId)
+					return false;
+				rpc.hedged = false;
+				Interlocked.Decrement(ref rpc.copies);
+				return true;
+			}
+		}
+
+		/// <summary>The carrier fields (hedged*), read together.</summary>
+		private static (bool Hedged, int PathIndex, long Gen) HedgeSnapshot(Rpc rpc)
+		{
+			lock (rpc)
+				return (rpc.hedged, rpc.hedgedPathIndex, rpc.hedgedGen);
 		}
 
 		/// <summary>Once a copy is written: counted, logged, and (a copy that is now the only carrier) watched for its answer
 		/// from then on, not from its queuing. If its write failed it carries nothing: the request is open to another copy
 		/// (its budget slot back), and the connection (its CTR state past a partial frame) is closed for its reactor to
 		/// reconnect, unless a newer connection was swapped in meanwhile.</summary>
-		private async Task CopyWrittenAsync(Task written, Rpc rpc, TransportPath path, long generation, string reason, bool sole, int avoidIndex)
+		private async Task CopyWrittenAsync(Task written, Rpc rpc, TransportPath path, long generation, long containerId, string reason,
+			bool sole, int avoidIndex, Action afterWritten)
 		{
 			try
 			{
@@ -1043,12 +1073,8 @@ namespace WTelegram
 			catch (Exception ex)
 			{
 				Helpers.Log(2, $"{_dcSession?.DcID}>{reason}: copy of #{(short)rpc.msgId.GetHashCode():X4} on P{path.PathIndex} failed: {ex.Message}");
-				lock (rpc)
-					if (rpc.hedged && rpc.hedgedPathIndex == path.PathIndex && rpc.hedgedGen == generation)
-					{
-						rpc.hedged = false;
-						Interlocked.Decrement(ref rpc.copies);
-					}
+				UncountCopy(rpc, containerId);
+				UncountTransferCopy(rpc);
 				lock (_pathsLock)
 					if (path.Generation == generation)
 						path.NetworkStream?.Close();
@@ -1056,6 +1082,14 @@ namespace WTelegram
 			}
 			if (sole) // first: nothing below may keep the only carrier from being watched
 				_ = CopyAnswerWatchdog(rpc, Interlocked.Increment(ref rpc.soleCopies));
+			try
+			{
+				afterWritten?.Invoke();
+			}
+			catch (Exception ex)
+			{
+				Helpers.Log(3, $"{_dcSession?.DcID}>{reason}: after copying #{(short)rpc.msgId.GetHashCode():X4}: {ex.Message}");
+			}
 			if (sole)
 				Interlocked.Increment(ref _statRescued);
 			else if (reason == "Hedge")
@@ -1201,8 +1235,9 @@ namespace WTelegram
 		/// Compares connection generations, not path indices: a reconnected path is a new connection.</summary>
 		private bool HasLiveCarrier(Rpc rpc)
 		{
+			var copy = HedgeSnapshot(rpc); // the copy's three fields together (taken before _pathsLock: never nested)
 			lock (_pathsLock)
-				return IsLive(rpc.sentPathIndex, rpc.sentGen) || (rpc.hedged && IsLive(rpc.hedgedPathIndex, rpc.hedgedGen));
+				return IsLive(rpc.sentPathIndex, rpc.sentGen) || (copy.Hedged && IsLive(copy.PathIndex, copy.Gen));
 			bool IsLive(int index, long generation) => index >= 0 && index < _paths.Count && _paths[index].IsAlive && _paths[index].Generation == generation;
 		}
 
@@ -1237,7 +1272,8 @@ namespace WTelegram
 		/// nothing any more: if the original's connection is still up, the stall check may copy again;
 		/// otherwise a fresh copy goes out now, so a request whose only live copy was refused never waits
 		/// for the 30 s watchdog. Code 20 (too old to verify) means a new msg_id, per the protocol.</summary>
-		private void HandleRefusedCopy(long rpcMsgId, int errorCode)
+		/// <param name="containerId">The refused copy's container: only that copy stops counting as a carrier</param>
+		private void HandleRefusedCopy(long rpcMsgId, long containerId, int errorCode)
 		{
 			Rpc rpc;
 			lock (_pendingRpcs)
@@ -1246,7 +1282,8 @@ namespace WTelegram
 				return;
 			// Only the copy was refused; the original may well have run. Never a new msg_id from here:
 			// copy again if nothing else carries it, else (or if that fails) ask the server about it.
-			rpc.hedged = false;
+			if (UncountCopy(rpc, containerId))
+				UncountTransferCopy(rpc);
 			if (errorCode == 20 || HasLiveCarrier(rpc))
 			{
 				if (errorCode == 20)
@@ -1376,20 +1413,24 @@ namespace WTelegram
 			foreach (var rpc in stalled)
 			{
 				bool timedOut = rpc.writtenTicks > 0 && now - rpc.writtenTicks > stallMs + Volatile.Read(ref rpc.stallExtraMs);
-				if (!await SendCopyAsync(rpc, rpc.sentPathIndex, timedOut ? $"Stalled >{PathRpcStallTimeout}s" : "Slow WAN", sole: false))
-					continue;
-				RecordSlowTransfer(rpc); // a file part: its WAN's speed so far is a sample (no answer will be one)
-				if (!timedOut)
-					continue; // a slow WAN for file parts: its latency (what the penalty steers) is fine
-				lock (_pathsLock)
-					if (rpc.sentPathIndex < _paths.Count)
-					{
-						var path = _paths[rpc.sentPathIndex];
-						AddPenalty(path, 1000); // steer new traffic away while it is slow; decays
-						if (probe)
-							path.LastProbeTicks = 0; // probe it on the next monitor pass
-					}
+				// what a copy says about the original's path counts once the copy is written, not when queued
+				await SendCopyAsync(rpc, rpc.sentPathIndex, timedOut ? $"Stalled >{PathRpcStallTimeout}s" : "Slow WAN", sole: false,
+					afterWritten: () => AfterStallCopy(rpc, timedOut, probe));
 			}
+		}
+
+		private void AfterStallCopy(Rpc rpc, bool timedOut, bool probe)
+		{
+			RecordSlowTransfer(rpc); // a file part: its WAN's speed so far is a sample (no answer will be one)
+			if (!timedOut)
+				return; // a slow WAN for file parts: its latency (what the penalty steers) is fine
+			lock (_pathsLock)
+				if (_paths.FirstOrDefault(p => p.PathIndex == rpc.sentPathIndex) is TransportPath path)
+				{
+					AddPenalty(path, 1000); // steer new traffic away while it is slow; decays
+					if (probe)
+						path.LastProbeTicks = 0; // probe it on the next monitor pass
+				}
 		}
 
 		/// <summary>Once a minute, if anything happened: how many requests were copied and why, and how many
@@ -1421,6 +1462,9 @@ namespace WTelegram
 			foreach (var kvp in _copyContainers)
 				if (now - kvp.Value.Ticks > 300_000)
 					_copyContainers.TryRemove(kvp.Key, out _);
+			foreach (var kvp in _forgottenRpcs)
+				if (now - kvp.Value > 300_000)
+					_forgottenRpcs.TryRemove(kvp.Key, out _);
 		}
 
 		/// <summary>Per-path RTT and liveness from a Pong. Telegram routes answers to ANY connection of the
@@ -1543,6 +1587,9 @@ namespace WTelegram
 			// Prevent multiple concurrent reconnect loops for the same path (atomic guard)
 			if (Interlocked.CompareExchange(ref path._reconnecting, 1, 0) != 0)
 				return;
+			lock (_pathsLock)
+				if (!_paths.Contains(path))
+					return; // replaced by a full reset meanwhile (a late failure on its old connection): nothing to report
 			// Notify subscribers that reconnect is now in progress (IsAlive=false, IsReconnecting=true).
 			// The IsAlive=false transition was already reported by whichever code path set it
 			// (Reactor error, health monitor, or send failure).
@@ -2286,7 +2333,7 @@ namespace WTelegram
 				if (_pendingRpcs.Remove(msgId, out rpc))
 					_settledHedged[msgId] = Environment.TickCount64;
 				else
-					settledBefore = _settledHedged.ContainsKey(msgId);
+					settledBefore = _settledHedged.ContainsKey(msgId) || _forgottenRpcs.ContainsKey(msgId);
 			}
 			PruneCopyState(); // at most every 10 s; this is the one path every client takes, single-path included
 			object result;
@@ -2410,6 +2457,7 @@ namespace WTelegram
 			internal long stallExtraMs; // added to PathRpcStallTimeout: the time its path is expected to need
 			internal long queuedTicks; // when its frame was queued on a path (it may wait there behind slow writes)
 			internal int hedgeStarted; // 1 once HedgeIfWanted sent (or is sending) its copy
+			internal long hedgedContainerId; // container of the copy now counted as carrier (hedged*); under lock(rpc)
 			public Task<object> Task => tcs.Task;
 		}
 
@@ -2561,7 +2609,7 @@ namespace WTelegram
 						// the other copy normally gets the request answered within a round trip.
 						if (aboutCopy)
 						{
-							HandleRefusedCopy(copyOf.RpcMsgId, badMsgNotification.error_code);
+							HandleRefusedCopy(copyOf.RpcMsgId, badMsgId, badMsgNotification.error_code);
 							break;
 						}
 						Rpc copiedRpc;
@@ -2624,7 +2672,7 @@ namespace WTelegram
 						RaiseUpdates(badMsgNotification);
 					}
 					else if (aboutCopy)
-						HandleRefusedCopy(copyOf.RpcMsgId, badMsgNotification.error_code); // time/salt fixed above
+						HandleRefusedCopy(copyOf.RpcMsgId, badMsgId, badMsgNotification.error_code); // time/salt fixed above
 					else
 					{
 						// Only the refused message (or the container it went out in) is re-sent. The other
@@ -3634,10 +3682,7 @@ namespace WTelegram
 					}
 					catch when (rpc != null)
 					{
-						// not sent (and not copied): drop it so it cannot linger beside Invoke's retry
-						lock (_pendingRpcs)
-							if (_pendingRpcs.TryGetValue(msgId, out var current) && current == rpc)
-								_pendingRpcs.Remove(msgId);
+						ForgetPending(rpc); // not answered: drop it so it cannot linger beside Invoke's retry
 						throw;
 					}
 					HedgeIfWanted(rpc);
@@ -3757,7 +3802,11 @@ namespace WTelegram
 					writeLength = frameLength;
 					writeGeneration = path.Generation;
 					if ((rpc ?? containedRpc) is Rpc queued)
-						Volatile.Write(ref queued.queuedTicks, Environment.TickCount64);
+					{
+						long queuedAt = Environment.TickCount64;
+						Volatile.Write(ref queued.queuedTicks, queuedAt);
+						MarkTransferQueued(queued, queuedAt);
+					}
 					pathWrite = path.NetworkStream is Stream stream
 						? QueueFrameWrite(path, stream, buffer, frameLength)
 						: Task.FromException(new IOException($"Path {path.PathIndex} has no connection"));
@@ -3876,7 +3925,9 @@ namespace WTelegram
 				if (_pendingRpcs.TryGetValue(rpc.msgId, out var current) && current == rpc)
 				{
 					_pendingRpcs.Remove(rpc.msgId);
-					_settledHedged[rpc.msgId] = Environment.TickCount64; // a copy already out may still be answered: dropped
+					// a copy already out may still be answered: dropped as a second answer. Kept apart from the
+					// answered ones, which a BadMsgNotification 32/33 must not treat as a reason for a session reset.
+					_forgottenRpcs[rpc.msgId] = Environment.TickCount64;
 				}
 		}
 
