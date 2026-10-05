@@ -39,6 +39,8 @@ namespace WTelegram
 		private const int MinSampleBytes = 64 * 1024; // smaller parts (a file's last one) time mostly latency
 		private const double SampleWeight = 0.3; // EWMA weight of a new speed sample
 		private const double SlowSampleWeight = 0.6; // ... of one slower than the average
+		private const double BenchRatio = 0.5; // a WAN under this share of the best one's speed takes no parts (but probes)
+		private const double RescueRatio = 0.75; // a part on a WAN under this share of the best one's speed may get a copy
 
 		/// <summary>The lease of the part being sent from this async flow: Invoke reads it (see UploadFileAsync).</summary>
 		private static readonly AsyncLocal<TransferLease> CurrentTransfer = new();
@@ -132,7 +134,9 @@ namespace WTelegram
 								// not measured yet: assumed fast (twice the best known), so it carries parts at once and
 								// gets measured; if it is slow, its first part in flight shows it within a second
 								double bps = LiveBps(c.Wan, dir, now, c.Wan.Bps[dir] > 0 ? c.Wan.Bps[dir] : bestKnown * 2);
-								if (bps <= 0)
+								// benched: under half the best WAN's speed, its parts would set the end of every file
+								// (the probe below still measures it now and then)
+								if (bps <= 0 || (c.Wan.Bps[dir] > 0 && c.Wan.Bps[dir] < bestKnown * BenchRatio))
 									continue;
 								double eta = (c.Wan.InFlight[dir] + 1) * (double)bytes / bps * 1000;
 								if (eta < bestEta)
@@ -227,7 +231,7 @@ namespace WTelegram
 				$"that WAN rests {seconds}s, then takes {Cap(lease.Wan, lease.Dir, now)} part(s) at a time for 5 min");
 		}
 
-		/// <summary>A file part still unanswered on a WAN measured at under half the best other one, after three times
+		/// <summary>A file part still unanswered on a WAN measured under <see cref="RescueRatio"/> of the best other one, after three times
 		/// what that one would need (and at least 750 ms): it gets a copy there (see CopyStalledRpcsAsync), so a slow
 		/// WAN never holds up the end of a file.</summary>
 		private bool TransferCopyDue(Rpc rpc, long now)
@@ -253,7 +257,7 @@ namespace WTelegram
 					if (p != own && Wan(WanKey(p)) is var w && w != Wan(WanKey(own)) && w.FloodUntilTicks[dir] <= now)
 						bestOther = Math.Max(bestOther, w.Bps[dir]);
 			}
-			if (bestOther <= 0 || (ownBps > 0 && ownBps >= bestOther / 2))
+			if (bestOther <= 0 || (ownBps > 0 && ownBps >= bestOther * RescueRatio))
 				return false;
 			return age > 3 * (rpc.transferBytes * 1000.0 / bestOther);
 		}
