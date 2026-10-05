@@ -1333,11 +1333,11 @@ namespace WTelegram
 			List<Rpc> stalled = null, transfers = null;
 			lock (_pendingRpcs)
 				foreach (var rpc in _pendingRpcs.Values)
-					if (!rpc.hedged && rpc.query != null && rpc.sentPathIndex >= 0 && rpc.writtenTicks > 0)
-						if (now - rpc.writtenTicks > stallMs + Volatile.Read(ref rpc.stallExtraMs))
+					if (!rpc.hedged && rpc.query != null && rpc.sentPathIndex >= 0)
+						if (rpc.writtenTicks > 0 && now - rpc.writtenTicks > stallMs + Volatile.Read(ref rpc.stallExtraMs))
 							(stalled ??= []).Add(rpc); // from the write, not the registration: a part queued behind others is not stalled
-						else if (rpc.transferDir >= 0)
-							(transfers ??= []).Add(rpc);
+						else if (rpc.transferDir >= 0 && Volatile.Read(ref rpc.queuedTicks) > 0)
+							(transfers ??= []).Add(rpc); // judged from its queuing: it may be stuck behind its path's slow writes
 			if (transfers != null) // judged outside the lock: it takes the path and transfer locks
 				foreach (var rpc in transfers)
 					if (TransferCopyDue(rpc, now))
@@ -2371,6 +2371,7 @@ namespace WTelegram
 			internal int transferDir = -1; // TransferUp / TransferDown; -1 = not a file part
 			internal int transferBytes; // part size (upload), or the requested limit (download)
 			internal long stallExtraMs; // added to PathRpcStallTimeout: the time its path is expected to need
+			internal long queuedTicks; // when its frame was queued on a path (it may wait there behind slow writes)
 			public Task<object> Task => tcs.Task;
 		}
 
@@ -3715,6 +3716,8 @@ namespace WTelegram
 					// semaphore is released, so a path that is slow to drain holds up only its own frames
 					writePath = path;
 					writeLength = frameLength;
+					if ((rpc ?? containedRpc) is Rpc queued)
+						Volatile.Write(ref queued.queuedTicks, Environment.TickCount64);
 					pathWrite = path.NetworkStream is Stream stream
 						? QueueFrameWrite(path, stream, buffer, frameLength)
 						: Task.FromException(new IOException($"Path {path.PathIndex} has no connection"));

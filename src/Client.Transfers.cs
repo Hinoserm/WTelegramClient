@@ -238,7 +238,8 @@ namespace WTelegram
 		{
 			if (rpc.transferDir < 0 || rpc.transferBytes <= 0)
 				return false;
-			long age = now - Volatile.Read(ref rpc.writtenTicks);
+			// from its queuing: on a slow uplink a part can wait seconds behind the path's earlier writes
+			long age = now - Volatile.Read(ref rpc.queuedTicks);
 			if (age < 750)
 				return false;
 			TransportPath[] paths;
@@ -304,12 +305,12 @@ namespace WTelegram
 			AddTransferSample(carrier, dir, bytes, Volatile.Read(ref rpc.writtenTicks), done: true);
 		}
 
-		/// <summary>A file part being copied because its WAN is slow: what it moved so far is an upper bound of that
-		/// WAN's speed (bytes / time since written), so the scheduler learns it even though no answer will say so.</summary>
+		/// <summary>A file part being copied because its WAN is slow: an upper bound of that WAN's speed (bytes / time
+		/// since it was queued there), so the scheduler learns it even though no answer will say so.</summary>
 		private void RecordSlowTransfer(Rpc rpc)
 		{
 			if (rpc.transferDir >= 0 && rpc.transferBytes >= MinSampleBytes)
-				AddTransferSample(rpc.sentPathIndex, rpc.transferDir, rpc.transferBytes, Volatile.Read(ref rpc.writtenTicks), done: false);
+				AddTransferSample(rpc.sentPathIndex, rpc.transferDir, rpc.transferBytes, Volatile.Read(ref rpc.queuedTicks), done: false);
 		}
 
 		/// <param name="done">An answered part: its time runs from its write, or from the WAN's previous answer if that
