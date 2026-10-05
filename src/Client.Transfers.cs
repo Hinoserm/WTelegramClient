@@ -142,10 +142,11 @@ namespace WTelegram
 								if (eta < bestEta)
 									(best, bestEta) = (c, eta);
 							}
-							if (best.Path == null) // nothing measured yet: the lowest-latency path, the others probed
-							{
-								best = cands.OrderBy(c => Volatile.Read(ref c.Path.LatencyEwmaMs) == long.MaxValue ? long.MaxValue
-									: Volatile.Read(ref c.Path.LatencyEwmaMs) + Volatile.Read(ref c.Path.PenaltyMs)).First();
+							if (best.Path == null) // nothing measured yet: spread (fewest parts in flight, then lowest latency),
+							{                      // so every WAN carries one and is measured from the first file
+								best = cands.OrderBy(c => c.Wan.InFlight[dir])
+									.ThenBy(c => Volatile.Read(ref c.Path.LatencyEwmaMs) == long.MaxValue ? long.MaxValue
+										: Volatile.Read(ref c.Path.LatencyEwmaMs) + Volatile.Read(ref c.Path.PenaltyMs)).First();
 								bestEta = 0;
 							}
 							if (best.Wan.InFlight[dir] < Cap(best.Wan, dir, now))
