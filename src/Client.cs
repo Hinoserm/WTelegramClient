@@ -448,9 +448,16 @@ namespace WTelegram
 			Helpers.Log(2, $"{_dcSession.DcID}>Disposing the client");
 			await ResetAsync(false, IsMainDC).ConfigureAwait(false);
 			var ex = new ObjectDisposedException("WTelegram.Client was disposed");
+			Rpc[] aborted;
 			lock (_pendingRpcs) // abort all pending requests
-				foreach (var rpc in _pendingRpcs.Values)
+			{
+				aborted = [.. _pendingRpcs.Values];
+				foreach (var rpc in aborted)
 					rpc.tcs.TrySetException(ex);
+				_pendingRpcs.Clear(); // settled: a late answer must not complete them again
+			}
+			foreach (var rpc in aborted)
+				SettledTransfer(rpc);
 			_sendSemaphore.Dispose();
 			_httpClient?.Dispose();
 			lock (_pathsLock)
@@ -1013,15 +1020,15 @@ namespace WTelegram
 					lock (rpc) // judged again here: callers decided outside the semaphore
 						if (rpc.copies >= MaxCopies || (onlyIfUnhedged && CarriedByCopy(rpc)))
 							return false;
-					generation = path.Generation;
 					// Registered right before the frame is queued (QueueOnPath calls this after everything that can fail): a
 					// refusal (BadMsgNotification) about it can arrive before the write returns. Pending (a carrier for
 					// HasLiveCarrier, which can look meanwhile from another thread), and counted against the budget, until
-					// marked live just below.
+					// marked live just below. With the generation of the connection it really goes out on.
 					containerId = QueueOnPath(path, new MsgContainer { messages = [new(rpc.msgId, rpc.seqno, rpc.query)] },
-						out written, beforeWrite: id =>
+						out written, beforeWrite: (id, connection) =>
 						{
 							registeredId = id;
+							generation = connection;
 							_copyContainers[id] = (rpc.msgId, Environment.TickCount64);
 							lock (rpc)
 							{
@@ -1244,7 +1251,7 @@ namespace WTelegram
 							generation = path.Generation;
 							Interlocked.Increment(ref rpc.stateChecks);
 							// registered before the write: the answer can arrive before the write completes
-							reqId = QueueOnPath(path, new MsgsStateReq { msg_ids = [rpc.msgId] }, out written, beforeWrite: id => _stateChecks[id] = rpc);
+							reqId = QueueOnPath(path, new MsgsStateReq { msg_ids = [rpc.msgId] }, out written, beforeWrite: (id, _) => _stateChecks[id] = rpc);
 						}
 						finally
 						{
@@ -1336,7 +1343,7 @@ namespace WTelegram
 		private bool HasLiveCarrier(Rpc rpc)
 		{
 			DropDeadCopies(rpc);
-			var copies = CarrierCopies(rpc); // taken before _pathsLock: never nested
+			var copies = CarrierCopies(rpc); // under lock(rpc), released before _pathsLock below (see the LOCK ORDER on Rpc)
 			lock (_pathsLock)
 			{
 				if (IsLive(rpc.sentPathIndex, rpc.sentGen))
@@ -2119,13 +2126,16 @@ namespace WTelegram
 		/// <param name="msg">The message (a service message: no seqno content bit)</param>
 		/// <param name="written">Completes once the frame is written; fails only with an IOException</param>
 		/// <param name="registering">The path is not alive yet: this is its registration ping</param>
-		/// <param name="beforeWrite">Called with the msg_id right before the frame is queued, after everything that can fail
-		/// (to register for its answer)</param>
+		/// <param name="beforeWrite">Called with the msg_id and the generation of the connection it goes out on, right before
+		/// the frame is queued, after everything that can fail (to register for its answer)</param>
 		/// <returns>The msg_id it was sent with, or 0 when the path cannot take it (<paramref name="written"/> is then complete)</returns>
-		private long QueueOnPath(TransportPath path, IObject msg, out Task written, bool registering = false, Action<long> beforeWrite = null)
+		private long QueueOnPath(TransportPath path, IObject msg, out Task written, bool registering = false, Action<long, long> beforeWrite = null)
 		{
 			written = Task.CompletedTask;
-			var stream = path.NetworkStream;
+			Stream stream;
+			long connection; // the generation of the connection this stream is, read with it (a reconnect swaps both)
+			lock (_pathsLock)
+				(stream, connection) = (path.NetworkStream, path.Generation);
 			if ((!path.IsAlive && !registering) || stream == null || _dcSession.authKeyID == 0)
 				return 0;
 			var (msgId, seqno) = NewMsgId(false);
@@ -2170,7 +2180,7 @@ namespace WTelegram
 			BinaryPrimitives.WriteInt32LittleEndian(buffer, frameLength - 4);
 			// after everything that can fail (salt, serialisation, encryption), right before the frame is queued: what it
 			// registers or marks is never left behind for a frame that was not sent
-			beforeWrite?.Invoke(msgId);
+			beforeWrite?.Invoke(msgId, connection);
 			written = WrittenAsync(QueueFrameWrite(path, stream, buffer, frameLength));
 			return msgId;
 
@@ -2502,11 +2512,11 @@ namespace WTelegram
 						RecordTransferSample(rpc, pathIndex, rpc.transferBytes);
 					}
 
-					rpc.tcs.SetResult(result);
+					rpc.tcs.TrySetResult(result); // Try: a client being disposed may have failed it already
 				}
 				catch (Exception ex)
 				{
-					rpc.tcs.SetException(ex);
+					rpc.tcs.TrySetException(ex);
 					throw;
 				}
 				finally
@@ -2566,6 +2576,8 @@ namespace WTelegram
 			// known to have failed or been refused (by container id, with the path and connection they went out on); the
 			// pending ones, registered and being queued but not marked live yet (only inside SendCopyAsync's semaphore
 			// section; HasLiveCarrier can see them from another thread); and of those the ones the server refused meanwhile.
+			// LOCK ORDER: lock(rpc) may nest _pendingRpcs or _pathsLock (SyncTransferCopy, DropDeadCopies), never the other
+			// way: no _pendingRpcs or _pathsLock section takes lock(rpc). _transferLock is taken after releasing lock(rpc).
 			internal readonly Dictionary<long, (TransportPath Path, long Gen, long Seq)> liveCopies = [];
 			internal readonly Dictionary<long, (TransportPath Path, long Gen)> pendingCopies = [];
 			internal long copySeq; // order the copies went live in (msg_ids can go backwards after a time resync)
@@ -2651,9 +2663,7 @@ namespace WTelegram
 			lock (_pendingRpcs)
 				if (_pendingRpcs.TryGetValue(msgId, out request))
 					_pendingRpcs.Remove(msgId);
-			if (request != null)
-				SettledTransfer(request); // (a bare request is never a file part: returns at once)
-			return request;
+			return request; // (bare requests, Pongs and FutureSalts only: never a file part, no transfer to settle)
 		}
 
 		private async Task HandleMessageAsync(IObject obj)
@@ -3950,11 +3960,8 @@ namespace WTelegram
 				{
 					// Multipath mode but all paths are dead — don't fall through to HTTP.
 					// Clean up the RPC since we can't send it.
-					if (rpc != null)
-					{
+					if (rpc != null) // just created by Invoke, never copied: no transfer to settle
 						lock (_pendingRpcs) _pendingRpcs.Remove(rpc.msgId);
-						SettledTransfer(rpc);
-					}
 					throw new IOException("All transport paths are currently dead");
 				}
 				else if (_networkStream != null)
