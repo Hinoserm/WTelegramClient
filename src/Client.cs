@@ -3387,9 +3387,10 @@ namespace WTelegram
 					path.LastRecvTicks = Environment.TickCount64;
 					lock (_pathsLock)
 						_paths.Add(path); // not alive yet: nothing is sent on it before Telegram answers its registration ping
-					(path, tcpClient2) = (null, null); // _paths owns it now
+					var added = path;
+					(path, tcpClient2) = (null, null); // _paths owns it now: the catch below must not dispose it
 
-					_ = RegisterSecondaryPathAsync(path, dcId); // in the background: connecting never waits for it
+					_ = RegisterSecondaryPathAsync(added, dcId); // in the background: connecting never waits for it
 				}
 				catch (Exception ex)
 				{
