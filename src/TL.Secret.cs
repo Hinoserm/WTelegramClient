@@ -8,7 +8,7 @@ namespace TL
 	{
 		/// <summary>Flags, see <a href="https://corefork.telegram.org/mtproto/TL-combinators#conditional-fields">TL conditional fields</a> (added in layer 45)</summary>
 		public virtual uint FFlags => default;
-		/// <summary>Random message ID, assigned by the author of message.<br/>Must be equal to the ID passed to sending method.</summary>
+		/// <summary>Random message ID, assigned by the author of message.<br/>Must be equal to the ID passed to sending method. See <a href="https://corefork.telegram.org/api/updates#updatemessageid-updates">here »</a> for more info on random ID deduplication and updateMessageID mapping.</summary>
 		public virtual long RandomId => default;
 		/// <summary>Message lifetime. Has higher priority than <see cref="Layer8.DecryptedMessageActionSetMessageTTL"/>.<br/>Parameter added in Layer 17.</summary>
 		public virtual int Ttl => default;
@@ -57,7 +57,7 @@ namespace TL
 		[TLDef(0x1F814F1F)]
 		public sealed partial class DecryptedMessage : DecryptedMessageBase
 		{
-			/// <summary>Random message ID, assigned by the author of message.<br/>Must be equal to the ID passed to sending method.</summary>
+			/// <summary>Random message ID, assigned by the author of message.<br/>Must be equal to the ID passed to sending method. See <a href="https://corefork.telegram.org/api/updates#updatemessageid-updates">here »</a> for more info on random ID deduplication and updateMessageID mapping.</summary>
 			public long random_id;
 			/// <summary>Random bytes, removed in layer 17.</summary>
 			public byte[] random_bytes;
@@ -66,7 +66,7 @@ namespace TL
 			/// <summary>Media content</summary>
 			public DecryptedMessageMedia media;
 
-			/// <summary>Random message ID, assigned by the author of message.<br/>Must be equal to the ID passed to sending method.</summary>
+			/// <summary>Random message ID, assigned by the author of message.<br/>Must be equal to the ID passed to sending method. See <a href="https://corefork.telegram.org/api/updates#updatemessageid-updates">here »</a> for more info on random ID deduplication and updateMessageID mapping.</summary>
 			public override long RandomId => random_id;
 			/// <summary>Message text</summary>
 			public override string Message => message;
@@ -79,14 +79,14 @@ namespace TL
 		[TLDef(0xAA48327D)]
 		public sealed partial class DecryptedMessageService : DecryptedMessageBase
 		{
-			/// <summary>Random message ID, assigned by the message author.<br/>Must be equal to the ID passed to the sending method.</summary>
+			/// <summary>Random message ID, assigned by the message author.<br/>Must be equal to the ID passed to the sending method. See <a href="https://corefork.telegram.org/api/updates#updatemessageid-updates">here »</a> for more info on random ID deduplication and updateMessageID mapping.</summary>
 			public long random_id;
 			/// <summary>Random bytes, removed in Layer 17.</summary>
 			public byte[] random_bytes;
 			/// <summary>Action relevant to the service message</summary>
 			public DecryptedMessageAction action;
 
-			/// <summary>Random message ID, assigned by the message author.<br/>Must be equal to the ID passed to the sending method.</summary>
+			/// <summary>Random message ID, assigned by the message author.<br/>Must be equal to the ID passed to the sending method. See <a href="https://corefork.telegram.org/api/updates#updatemessageid-updates">here »</a> for more info on random ID deduplication and updateMessageID mapping.</summary>
 			public override long RandomId => random_id;
 			/// <summary>Random bytes, removed in Layer 17.</summary>
 			public override byte[] RandomBytes => random_bytes;
@@ -246,7 +246,7 @@ namespace TL
 		[TLDef(0x77BFB61B)]
 		public sealed partial class PhotoSize : PhotoSizeBase
 		{
-			/// <summary><a href="https://corefork.telegram.org/api/files#image-thumbnail-types">Thumbnail type »</a></summary>
+			/// <summary><a href="https://corefork.telegram.org/api/files#photosizetype-values">PhotoSize.type value »</a></summary>
 			public string type;
 			public FileLocationBase location;
 			/// <summary>Image width</summary>
@@ -256,14 +256,14 @@ namespace TL
 			/// <summary>File size</summary>
 			public int size;
 
-			/// <summary><a href="https://corefork.telegram.org/api/files#image-thumbnail-types">Thumbnail type »</a></summary>
+			/// <summary><a href="https://corefork.telegram.org/api/files#photosizetype-values">PhotoSize.type value »</a></summary>
 			public override string Type => type;
 		}
 		/// <summary>Description of an image and its content.		<para>See <a href="https://corefork.telegram.org/constructor/photoCachedSize"/></para></summary>
 		[TLDef(0xE9A734FA)]
 		public sealed partial class PhotoCachedSize : PhotoSizeBase
 		{
-			/// <summary>Thumbnail type</summary>
+			/// <summary><a href="https://corefork.telegram.org/api/files#photosizetype-values">PhotoSize.type value »</a></summary>
 			public string type;
 			public FileLocationBase location;
 			/// <summary>Image width</summary>
@@ -273,7 +273,7 @@ namespace TL
 			/// <summary>Binary data, file content</summary>
 			public byte[] bytes;
 
-			/// <summary>Thumbnail type</summary>
+			/// <summary><a href="https://corefork.telegram.org/api/files#photosizetype-values">PhotoSize.type value »</a></summary>
 			public override string Type => type;
 		}
 
@@ -316,7 +316,7 @@ namespace TL
 		[TLDef(0x204D3878)]
 		public sealed partial class DecryptedMessage : DecryptedMessageBase
 		{
-			/// <summary>Random message ID, assigned by the author of message.<br/>Must be equal to the ID passed to sending method.</summary>
+			/// <summary>Random message ID, assigned by the author of message.<br/>Must be equal to the ID passed to sending method. See <a href="https://corefork.telegram.org/api/updates#updatemessageid-updates">here »</a> for more info on random ID deduplication and updateMessageID mapping.</summary>
 			public long random_id;
 			/// <summary>Message lifetime. Has higher priority than <see cref="Layer8.DecryptedMessageActionSetMessageTTL"/>.<br/>Parameter added in Layer 17.</summary>
 			public int ttl;
@@ -325,7 +325,7 @@ namespace TL
 			/// <summary>Media content</summary>
 			public DecryptedMessageMedia media;
 
-			/// <summary>Random message ID, assigned by the author of message.<br/>Must be equal to the ID passed to sending method.</summary>
+			/// <summary>Random message ID, assigned by the author of message.<br/>Must be equal to the ID passed to sending method. See <a href="https://corefork.telegram.org/api/updates#updatemessageid-updates">here »</a> for more info on random ID deduplication and updateMessageID mapping.</summary>
 			public override long RandomId => random_id;
 			/// <summary>Message lifetime. Has higher priority than <see cref="Layer8.DecryptedMessageActionSetMessageTTL"/>.<br/>Parameter added in Layer 17.</summary>
 			public override int Ttl => ttl;
@@ -338,12 +338,12 @@ namespace TL
 		[TLDef(0x73164160)]
 		public sealed partial class DecryptedMessageService : DecryptedMessageBase
 		{
-			/// <summary>Random message ID, assigned by the message author.<br/>Must be equal to the ID passed to the sending method.</summary>
+			/// <summary>Random message ID, assigned by the message author.<br/>Must be equal to the ID passed to the sending method. See <a href="https://corefork.telegram.org/api/updates#updatemessageid-updates">here »</a> for more info on random ID deduplication and updateMessageID mapping.</summary>
 			public long random_id;
 			/// <summary>Action relevant to the service message</summary>
 			public DecryptedMessageAction action;
 
-			/// <summary>Random message ID, assigned by the message author.<br/>Must be equal to the ID passed to the sending method.</summary>
+			/// <summary>Random message ID, assigned by the message author.<br/>Must be equal to the ID passed to the sending method. See <a href="https://corefork.telegram.org/api/updates#updatemessageid-updates">here »</a> for more info on random ID deduplication and updateMessageID mapping.</summary>
 			public override long RandomId => random_id;
 			/// <summary>Action relevant to the service message</summary>
 			public override DecryptedMessageAction Action => action;
@@ -571,7 +571,7 @@ namespace TL
 		}
 
 		/// <summary>Message entity representing a <a href="https://corefork.telegram.org/api/mentions">user mention</a>: for <em>creating</em> a mention use <see cref="InputMessageEntityMentionName"/>.		<para>See <a href="https://corefork.telegram.org/constructor/messageEntityMentionName"/></para></summary>
-		[TLDef(0x352DCA58, inheritBefore = true)]
+		[TLDef(0x352DCA58, inheritAt = 0)]
 		public sealed partial class MessageEntityMentionName : MessageEntity
 		{
 			/// <summary>Identifier of the user that was mentioned</summary>
@@ -584,7 +584,7 @@ namespace TL
 		{
 			/// <summary>Extra bits of information, use <c>flags.HasFlag(...)</c> to test for those</summary>
 			public Flags flags;
-			/// <summary>Random message ID, assigned by the author of message.<br/>Must be equal to the ID passed to sending method.</summary>
+			/// <summary>Random message ID, assigned by the author of message.<br/>Must be equal to the ID passed to sending method. See <a href="https://corefork.telegram.org/api/updates#updatemessageid-updates">here »</a> for more info on random ID deduplication and updateMessageID mapping.</summary>
 			public long random_id;
 			/// <summary>Message lifetime. Has higher priority than <see cref="Layer8.DecryptedMessageActionSetMessageTTL"/>.<br/>Parameter added in Layer 17.</summary>
 			public int ttl;
@@ -613,7 +613,7 @@ namespace TL
 
 			/// <summary>Flags, see <a href="https://corefork.telegram.org/mtproto/TL-combinators#conditional-fields">TL conditional fields</a> (added in layer 45)</summary>
 			public override uint FFlags => (uint)flags;
-			/// <summary>Random message ID, assigned by the author of message.<br/>Must be equal to the ID passed to sending method.</summary>
+			/// <summary>Random message ID, assigned by the author of message.<br/>Must be equal to the ID passed to sending method. See <a href="https://corefork.telegram.org/api/updates#updatemessageid-updates">here »</a> for more info on random ID deduplication and updateMessageID mapping.</summary>
 			public override long RandomId => random_id;
 			/// <summary>Message lifetime. Has higher priority than <see cref="Layer8.DecryptedMessageActionSetMessageTTL"/>.<br/>Parameter added in Layer 17.</summary>
 			public override int Ttl => ttl;
@@ -776,7 +776,7 @@ namespace TL
 		{
 			/// <summary>Extra bits of information, use <c>flags.HasFlag(...)</c> to test for those</summary>
 			public Flags flags;
-			/// <summary>Random message ID, assigned by the author of message.<br/>Must be equal to the ID passed to sending method.</summary>
+			/// <summary>Random message ID, assigned by the author of message.<br/>Must be equal to the ID passed to sending method. See <a href="https://corefork.telegram.org/api/updates#updatemessageid-updates">here »</a> for more info on random ID deduplication and updateMessageID mapping.</summary>
 			public long random_id;
 			/// <summary>Message lifetime. Has higher priority than <see cref="Layer8.DecryptedMessageActionSetMessageTTL"/>.<br/>Parameter added in Layer 17.</summary>
 			public int ttl;
@@ -810,7 +810,7 @@ namespace TL
 
 			/// <summary>Flags, see <a href="https://corefork.telegram.org/mtproto/TL-combinators#conditional-fields">TL conditional fields</a> (added in layer 45)</summary>
 			public override uint FFlags => (uint)flags;
-			/// <summary>Random message ID, assigned by the author of message.<br/>Must be equal to the ID passed to sending method.</summary>
+			/// <summary>Random message ID, assigned by the author of message.<br/>Must be equal to the ID passed to sending method. See <a href="https://corefork.telegram.org/api/updates#updatemessageid-updates">here »</a> for more info on random ID deduplication and updateMessageID mapping.</summary>
 			public override long RandomId => random_id;
 			/// <summary>Message lifetime. Has higher priority than <see cref="Layer8.DecryptedMessageActionSetMessageTTL"/>.<br/>Parameter added in Layer 17.</summary>
 			public override int Ttl => ttl;

@@ -1,4 +1,5 @@
-﻿[![API Layer](https://img.shields.io/badge/API_Layer-221-blueviolet)](https://corefork.telegram.org/methods)
+﻿[![Latest API Layer](https://img.shields.io/badge/Latest_API_Layer-on_Patreon-darkgreen)](https://www.patreon.com/wizou)
+[![API Layer](https://img.shields.io/badge/API_Layer-229-blueviolet)](https://corefork.telegram.org/methods)
 [![NuGet version](https://img.shields.io/nuget/v/WTelegramClient?color=00508F)](https://www.nuget.org/packages/WTelegramClient/)
 [![NuGet prerelease](https://img.shields.io/nuget/vpre/WTelegramClient?color=C09030&label=dev+nuget)](https://www.nuget.org/packages/WTelegramClient/absoluteLatest)
 [![Donate](https://img.shields.io/badge/Help_this_project:-Donate-ff4444)](https://buymeacoffee.com/wizou)
@@ -125,7 +126,7 @@ or start typing the call arguments to see a tooltip displaying their description
 The Telegram [API object classes](https://corefork.telegram.org/schema) are defined in the `TL` namespace,
 and the [API functions](https://corefork.telegram.org/methods) are available as async methods of `Client`.
 
-Below is an example of calling the [messages.getAllChats](https://corefork.telegram.org/method/messages.getAllChats) API function,
+Below is an example of calling the `Messages_GetAllChats` API method,
 enumerating the various groups/channels the user is in, and then using `client.SendMessageAsync` helper function to easily send a message:
 ```csharp
 using TL;

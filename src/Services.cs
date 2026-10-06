@@ -131,10 +131,9 @@ namespace TL
 		/// <summary>Converts a <a href="https://core.telegram.org/bots/api/#markdownv2-style">Markdown text</a> into the (plain text + entities) format used by Telegram messages</summary>
 		/// <param name="_">not used anymore, you can pass null</param>
 		/// <param name="text">[in] The Markdown text<br/>[out] The same (plain) text, stripped of all Markdown notation</param>
-		/// <param name="premium">Generate premium entities if any</param>
 		/// <param name="users">Dictionary used for <c>tg://user?id=</c> notation</param>
 		/// <returns>The array of formatting entities that you can pass (along with the plain text) to <see cref="Client.SendMessageAsync">SendMessageAsync</see> or  <see cref="Client.SendMediaAsync">SendMediaAsync</see></returns>
-		public static MessageEntity[] MarkdownToEntities(this Client _, ref string text, bool premium = false, IReadOnlyDictionary<long, User> users = null)
+		public static MessageEntity[] MarkdownToEntities(this Client _, ref string text, IReadOnlyDictionary<long, User> users = null)
 		{
 			var entities = new List<MessageEntity>();
 			MessageEntityBlockquote lastBlockQuote = null;
@@ -217,12 +216,18 @@ namespace TL
 									else if (c == ')') break;
 								}
 								textUrl.url = sb.ToString(offset + 2, offset2 - offset - 3);
+								sb.Remove(offset, offset2 - offset);
 								if (textUrl.url.StartsWith("tg://user?id=") && long.TryParse(textUrl.url[13..], out var id) && users?.GetValueOrDefault(id)?.access_hash is long hash)
 									entities[lastIndex] = new InputMessageEntityMentionName { offset = textUrl.offset, length = textUrl.length, user_id = new InputUser(id, hash) };
-								else if ((textUrl.url.StartsWith("tg://emoji?id=") || textUrl.url.StartsWith("emoji?id=")) && long.TryParse(textUrl.url[(textUrl.url.IndexOf('=') + 1)..], out id))
-									if (premium) entities[lastIndex] = new MessageEntityCustomEmoji { offset = textUrl.offset, length = textUrl.length, document_id = id };
-									else entities.RemoveAt(lastIndex);
-								sb.Remove(offset, offset2 - offset);
+								else if (textUrl.url.StartsWith("tg://emoji?id=") && long.TryParse(textUrl.url[14..], out id))
+									entities[lastIndex] = new MessageEntityCustomEmoji { offset = textUrl.offset, length = textUrl.length, document_id = id };
+								else if (textUrl.url.StartsWith("tg://time?unix=") && textUrl.url.IndexOf("&format=", 15) is { } idxFormat)
+									entities[lastIndex] = new MessageEntityFormattedDate
+									{
+										offset = textUrl.offset, length = textUrl.length,
+										date = new DateTime((long.Parse(idxFormat < 0 ? textUrl.url[15..] : textUrl.url[15..idxFormat]) + 62135596800L) * 10000000, DateTimeKind.Utc),
+										flags = idxFormat < 0 ? 0 : HtmlText.ToDateFlags(textUrl.url[(idxFormat + 8)..])
+									};
 								break;
 							}
 						}
@@ -264,9 +269,8 @@ namespace TL
 		/// <param name="client">Client, used only for getting current user ID in case of <c>InputMessageEntityMentionName+InputUserSelf</c></param>
 		/// <param name="message">The plain text, typically obtained from <see cref="Message.message"/></param>
 		/// <param name="entities">The array of formatting entities, typically obtained from <see cref="Message.entities"/></param>
-		/// <param name="premium">Convert premium entities (might lead to non-standard markdown)</param>
 		/// <returns>The message text with MarkdownV2 formattings</returns>
-		public static string EntitiesToMarkdown(this Client client, string message, MessageEntity[] entities, bool premium = false)
+		public static string EntitiesToMarkdown(this Client client, string message, MessageEntity[] entities)
 		{
 			if (entities == null || entities.Length == 0) return Escape(message);
 			var closings = new List<(int offset, string md)>();
@@ -301,8 +305,9 @@ namespace TL
 							else if (nextEntity is InputMessageEntityMentionName imemn)
 								closing.md = $"](tg://user?id={imemn.user_id.UserId ?? client.UserId})";
 							else if (nextEntity is MessageEntityCustomEmoji mecu)
-								if (premium) closing.md = $"](tg://emoji?id={mecu.document_id})";
-								else continue;
+								closing.md = $"](tg://emoji?id={mecu.document_id})";
+							else if (nextEntity is MessageEntityFormattedDate mefd)
+								closing.md = $"](tg://time?unix={((DateTimeOffset)mefd.date).ToUnixTimeSeconds()}{(mefd.flags == 0 ? null : $"&format={mefd.flags.ToDateFormat()}")})";
 						}
 						else if (nextEntity is MessageEntityBlockquote mebq)
 						{ inBlockQuote = true; if (lastCh is not '\n' and not '\0') md = "\n>";
@@ -343,6 +348,7 @@ namespace TL
 			[typeof(MessageEntitySpoiler)] = "||",
 			[typeof(MessageEntityCustomEmoji)] = "![",
 			[typeof(MessageEntityBlockquote)] = ">",
+			[typeof(MessageEntityFormattedDate)] = "![",
 		};
 
 		/// <summary>Insert backslashes in front of Markdown reserved characters</summary>
@@ -372,10 +378,9 @@ namespace TL
 		/// <summary>Converts an <a href="https://core.telegram.org/bots/api/#html-style">HTML-formatted text</a> into the (plain text + entities) format used by Telegram messages</summary>
 		/// <param name="_">not used anymore, you can pass null</param>
 		/// <param name="text">[in] The HTML-formatted text<br/>[out] The same (plain) text, stripped of all HTML tags</param>
-		/// <param name="premium">Generate premium entities if any</param>
 		/// <param name="users">Dictionary used for <c>tg://user?id=</c> notation</param>
 		/// <returns>The array of formatting entities that you can pass (along with the plain text) to <see cref="Client.SendMessageAsync">SendMessageAsync</see> or  <see cref="Client.SendMediaAsync">SendMediaAsync</see></returns>
-		public static MessageEntity[] HtmlToEntities(this Client _, ref string text, bool premium = false, IReadOnlyDictionary<long, User> users = null)
+		public static MessageEntity[] HtmlToEntities(this Client _, ref string text, IReadOnlyDictionary<long, User> users = null)
 		{
 			var entities = new List<MessageEntity>();
 			var sb = new StringBuilder(text);
@@ -419,6 +424,7 @@ namespace TL
 						case "code": ProcessEntity<MessageEntityCode>(); break;
 						case "pre": ProcessEntity<MessageEntityPre>(); break;
 						case "tg-emoji" when closing: ProcessEntity<MessageEntityCustomEmoji>(); break;
+						case "tg-time" when closing: ProcessEntity<MessageEntityFormattedDate>(); break;
 						case "blockquote": ProcessEntity<MessageEntityBlockquote>(); break;
 						case "blockquote expandable": 
 							entities.Add(new MessageEntityBlockquote { offset = offset, length = -1, flags = MessageEntityBlockquote.Flags.collapsed });
@@ -448,8 +454,15 @@ namespace TL
 								if (entities.LastOrDefault(e => e.length == -1) is MessageEntityPre prevEntity)
 									prevEntity.language = tag[21..^1];
 							}
-							else if (premium && (tag.StartsWith("tg-emoji emoji-id=\"") || tag.StartsWith("tg-emoji emoji-id='")))
-								entities.Add(new MessageEntityCustomEmoji { offset = offset, length = -1, document_id = long.Parse(tag[(tag.IndexOf('=') + 2)..^1]) });
+							else if (tag.StartsWith("tg-emoji emoji-id=\"") || tag.StartsWith("tg-emoji emoji-id='"))
+								entities.Add(new MessageEntityCustomEmoji { offset = offset, length = -1, document_id = long.Parse(tag[19..^1]) });
+							else if ((tag.StartsWith("tg-time unix=\"") || tag.StartsWith("tg-time unix='")) && (end = tag.IndexOf(tag[13], 14)) > 0)
+								entities.Add(new MessageEntityFormattedDate
+								{
+									offset = offset, length = -1,
+									date = new DateTime((long.Parse(tag[14..end]) + 62135596800L) * 10000000, DateTimeKind.Utc),
+									flags = string.Compare(tag, end + 1, " format=", 0, 8) == 0 ? ToDateFlags(tag[(end + 10)..^1]) : 0
+								});
 							break;
 					}
 
@@ -486,9 +499,8 @@ namespace TL
 		/// <param name="client">Client, used only for getting current user ID in case of <c>InputMessageEntityMentionName+InputUserSelf</c></param>
 		/// <param name="message">The plain text, typically obtained from <see cref="Message.message"/></param>
 		/// <param name="entities">The array of formatting entities, typically obtained from <see cref="Message.entities"/></param>
-		/// <param name="premium">Convert premium entities</param>
 		/// <returns>The message text with HTML formatting tags</returns>
-		public static string EntitiesToHtml(this Client client, string message, MessageEntity[] entities, bool premium = false)
+		public static string EntitiesToHtml(this Client client, string message, MessageEntity[] entities)
 		{
 			if (entities == null || entities.Length == 0) return Escape(message);
 			var closings = new List<(int offset, string tag)>();
@@ -519,8 +531,7 @@ namespace TL
 								tag = $"<a href=\"tg://user?id={imemn.user_id.UserId ?? client.UserId}\">";
 						}
 						else if (nextEntity is MessageEntityCustomEmoji mecu)
-							if (premium) tag = $"<tg-emoji emoji-id=\"{mecu.document_id}\">";
-							else continue;
+							tag = $"<tg-emoji emoji-id=\"{mecu.document_id}\">";
 						else if (nextEntity is MessageEntityPre mep && !string.IsNullOrEmpty(mep.language))
 						{
 							closing.Item2 = "</code></pre>";
@@ -528,6 +539,8 @@ namespace TL
 						}
 						else if (nextEntity is MessageEntityBlockquote { flags: MessageEntityBlockquote.Flags.collapsed })
 							tag = "<blockquote expandable>";
+						else if (nextEntity is MessageEntityFormattedDate mefd)
+							tag = $"<tg-time unix=\"{((DateTimeOffset)mefd.date).ToUnixTimeSeconds()}\"{(mefd.flags == 0 ? null : $" format=\"{mefd.flags.ToDateFormat()}\"")}>";
 						else
 							tag = $"<{tag}>";
 						int index = ~closings.BinarySearch(closing, Comparer<(int, string)>.Create((x, y) => x.Item1.CompareTo(y.Item1) | 1));
@@ -559,6 +572,7 @@ namespace TL
 			[typeof(MessageEntitySpoiler)] = "tg-spoiler",
 			[typeof(MessageEntityCustomEmoji)] = "tg-emoji",
 			[typeof(MessageEntityBlockquote)] = "blockquote",
+			[typeof(MessageEntityFormattedDate)] = "tg-time",
 		};
 
 		/// <summary>Replace special HTML characters with their &amp;xx; equivalent</summary>
@@ -566,5 +580,11 @@ namespace TL
 		/// <returns>The HTML-safe text, ready to be used in <see cref="HtmlToEntities">HtmlToEntities</see> without problems</returns>
 		public static string Escape(string text)
 			=> text?.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;");
+
+		public static string ToDateFormat(this MessageEntityFormattedDate.Flags flags)
+			=> string.Concat("rtTdDw".Where((c, i) => ((int)flags & (1 << i)) != 0));
+
+		public static MessageEntityFormattedDate.Flags ToDateFlags(string dateTimeFormat)
+			=> (MessageEntityFormattedDate.Flags)dateTimeFormat.Sum(c => 1 << "rtTdDw".IndexOf(c));
 	}
 }

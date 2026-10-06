@@ -293,10 +293,28 @@ namespace TL
 		public override InputPeer ToInputPeer() => new InputPeerChannel(id, access_hash);
 		public override string ToString() => $"ChannelForbidden {id} \"{title}\"";
 	}
+	partial class CommunityForbidden
+	{
+		public override bool IsActive => false;
+		public override ChatPhoto Photo => null;
+		public override bool IsBanned(ChatBannedRights.Flags flags = 0) => true;
+		public override InputPeer ToInputPeer() => new InputPeerChannel(id, access_hash);
+		public override string ToString() => $"CommunityForbidden {id} \"{title}\"";
+	}
+	partial class Community
+	{
+		public override bool IsActive => (flags & Flags.left) == 0;
+		public override ChatPhoto Photo => photo;
+		public override bool IsBanned(ChatBannedRights.Flags flags = 0) => ((default_banned_rights?.flags ?? 0) & flags) != 0;
+		public override InputPeer ToInputPeer() => new InputPeerChannel(id, access_hash);
+		public static implicit operator InputChannel(Community community) => new(community.id, community.access_hash);
+		public override string ToString() => $"Community \"{title}\"";
+	}
 
 	partial class ChatFullBase				{ public abstract int ParticipantsCount { get; } }
 	partial class ChatFull					{ public override int ParticipantsCount => participants.Participants.Length; }
 	partial class ChannelFull				{ public override int ParticipantsCount => participants_count; }
+	partial class CommunityFull				{ public override int ParticipantsCount => 0; }
 
 	partial class ChatParticipantBase		{ public abstract bool IsAdmin { get; } }
 	partial class ChatParticipant			{ public override bool IsAdmin => false; }
@@ -315,17 +333,20 @@ namespace TL
 	partial class MessageMedia				{ ///<summary>Use this helper method to send a copy of the media without downloading it</summary>
 											  ///<remarks>Quiz poll may need to be voted before obtaining the correct answers. Dice will not replicate same value. TTL ignored<br/>May return <see langword="null"/> for Invoice and other unsupported media types</remarks>
 											  public virtual  InputMedia ToInputMedia() => null; }
-	partial class MessageMediaPhoto			{ public override InputMedia ToInputMedia() => new InputMediaPhoto { id = photo }; }
+	partial class MessageMediaPhoto			{ public override InputMedia ToInputMedia() => new InputMediaPhoto { id = photo, video = video, flags = (flags.HasFlag(Flags.spoiler) ? InputMediaPhoto.Flags.spoiler : 0) | (flags.HasFlag(Flags.live_photo) ? InputMediaPhoto.Flags.live_photo : 0) }; }
 	partial class MessageMediaGeo			{ public override InputMedia ToInputMedia() => new InputMediaGeoPoint { geo_point = geo }; }
 	partial class MessageMediaContact		{ public override InputMedia ToInputMedia() => new InputMediaContact { phone_number = phone_number, first_name = first_name, last_name = last_name, vcard = vcard }; }
-	partial class MessageMediaDocument		{ public override InputMedia ToInputMedia() => new InputMediaDocument { id = document }; }
+	partial class MessageMediaDocument		{ public override InputMedia ToInputMedia() => new InputMediaDocument { id = document, video_cover = video_cover, video_timestamp = video_timestamp }; }
 	partial class MessageMediaVenue			{ public override InputMedia ToInputMedia() => new InputMediaVenue { geo_point = geo, title = title, address = address, provider = provider, venue_id = venue_id, venue_type = venue_type }; }
 	partial class MessageMediaGame			{ public override InputMedia ToInputMedia() => new InputMediaGame { id = game }; }
 	partial class MessageMediaGeoLive		{ public override InputMedia ToInputMedia() => new InputMediaGeoLive { geo_point = geo, heading = heading, period = period, proximity_notification_radius = proximity_notification_radius,
 		flags = (period != 0 ? InputMediaGeoLive.Flags.has_period : 0) | (flags.HasFlag(Flags.has_heading) ? InputMediaGeoLive.Flags.has_heading : 0) | (flags.HasFlag(Flags.has_proximity_notification_radius) ? InputMediaGeoLive.Flags.has_proximity_notification_radius : 0) }; }
-	partial class MessageMediaPoll			{ public override InputMedia ToInputMedia() => new InputMediaPoll { poll = poll, solution = results.solution, solution_entities = results.solution_entities,
-		correct_answers = results.results?.Where(pav => pav.flags.HasFlag(PollAnswerVoters.Flags.correct)).Select(pav => pav.option).ToArray(), 
-		flags = (results.results != null ? InputMediaPoll.Flags.has_correct_answers : 0) | (results.solution != null ? InputMediaPoll.Flags.has_solution : 0) }; }
+	partial class MessageMediaPoll			{ public override InputMedia ToInputMedia() => new InputMediaPoll { poll = poll,
+		solution = results.solution, solution_entities = results.solution_entities,
+		solution_media = results.solution_media?.ToInputMedia(), attached_media = attached_media?.ToInputMedia(),
+		correct_answers = results.results?.Select((pav, i) => pav.flags.HasFlag(PollAnswerVoters.Flags.correct) ? i : -1).Where(i => i >= 0).ToArray(),
+		flags = (results.results != null ? InputMediaPoll.Flags.has_correct_answers : 0) | (results.solution != null ? InputMediaPoll.Flags.has_solution : 0)
+			| (results.solution_media != null ? InputMediaPoll.Flags.has_solution_media : 0) | (attached_media != null ? InputMediaPoll.Flags.has_attached_media : 0) }; }
 	partial class MessageMediaDice			{ public override InputMedia ToInputMedia() => new InputMediaDice { emoticon = emoticon }; }
 	partial class MessageMediaWebPage		{ public override InputMedia ToInputMedia() => new InputMediaWebPage { flags = (InputMediaWebPage.Flags)((int)flags & 3), url = webpage.Url }; }
 
@@ -333,8 +354,8 @@ namespace TL
 	{
 		public abstract long ID { get; }
 		protected abstract InputPhoto ToInputPhoto();
-		public static implicit operator InputPhoto(PhotoBase photo) => photo.ToInputPhoto();
-		public static implicit operator InputMediaPhoto(PhotoBase photo) => photo.ToInputPhoto();
+		public static implicit operator InputPhoto(PhotoBase photo) => photo?.ToInputPhoto();
+		public static implicit operator InputMediaPhoto(PhotoBase photo) => photo?.ToInputPhoto();
 	}
 	partial class PhotoEmpty
 	{
@@ -422,7 +443,7 @@ namespace TL
 		public static implicit operator InputNotifyPeerBase(UserBase user) => new InputNotifyPeer { peer = user };
 	}
 
-	partial class WallPaperBase					{ public static implicit operator InputWallPaperBase(WallPaperBase wp) => wp.ToInputWallPaper();
+	partial class WallPaperBase					{ public static implicit operator InputWallPaperBase(WallPaperBase wp) => wp?.ToInputWallPaper();
 												  protected abstract InputWallPaperBase ToInputWallPaper(); }
 	partial class WallPaper						{ protected override InputWallPaperBase ToInputWallPaper() => new InputWallPaper { id = id, access_hash = access_hash }; }
 	partial class WallPaperNoFile				{ protected override InputWallPaperBase ToInputWallPaper() => new InputWallPaperNoFile { id = id }; }
@@ -514,8 +535,8 @@ namespace TL
 	{
 		public abstract long ID { get; }
 		protected abstract InputDocument ToInputDocument();
-		public static implicit operator InputDocument(DocumentBase document) => document.ToInputDocument();
-		public static implicit operator InputMediaDocument(DocumentBase document) => document.ToInputDocument();
+		public static implicit operator InputDocument(DocumentBase document) => document?.ToInputDocument();
+		public static implicit operator InputMediaDocument(DocumentBase document) => document?.ToInputDocument();
 	}
 	partial class DocumentEmpty
 	{
