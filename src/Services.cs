@@ -221,14 +221,19 @@ namespace TL
 									entities[lastIndex] = new InputMessageEntityMentionName { offset = textUrl.offset, length = textUrl.length, user_id = new InputUser(id, hash) };
 								else if (textUrl.url.StartsWith("tg://emoji?id=") && long.TryParse(textUrl.url[14..], out id))
 									entities[lastIndex] = new MessageEntityCustomEmoji { offset = textUrl.offset, length = textUrl.length, document_id = id };
-								else if (textUrl.url.StartsWith("tg://time?unix=") && textUrl.url.IndexOf("&format=", 15) is { } idxFormat
-									  && HtmlText.TryParseUnixTime(idxFormat < 0 ? textUrl.url[15..] : textUrl.url[15..idxFormat], out var date))
-									entities[lastIndex] = new MessageEntityFormattedDate
-									{
-										offset = textUrl.offset, length = textUrl.length,
-										date = date,
-										flags = idxFormat < 0 ? 0 : HtmlText.ToDateFlags(textUrl.url[(idxFormat + 8)..])
-									};
+								else if (textUrl.url.StartsWith("tg://time?unix="))
+								{
+									int idxFormat = textUrl.url.IndexOf("&format=", 15);
+									if (HtmlText.TryParseUnixTime(idxFormat < 0 ? textUrl.url[15..] : textUrl.url[15..idxFormat], out var date))
+										entities[lastIndex] = new MessageEntityFormattedDate
+										{
+											offset = textUrl.offset, length = textUrl.length,
+											date = date,
+											flags = idxFormat < 0 ? 0 : HtmlText.ToDateFlags(textUrl.url[(idxFormat + 8)..])
+										};
+									else
+										entities.RemoveAt(lastIndex); // a date that cannot be read: its text stays, as plain text
+								}
 								break;
 							}
 						}
@@ -456,7 +461,7 @@ namespace TL
 									prevEntity.language = tag[21..^1];
 							}
 							else if ((tag.StartsWith("tg-emoji emoji-id=\"") || tag.StartsWith("tg-emoji emoji-id='"))
-								  && tag.Length > 19 && long.TryParse(tag[19..^1], out var document_id))
+								  && tag.Length > 19 && tag[^1] == tag[18] && long.TryParse(tag[19..^1], out var document_id))
 								entities.Add(new MessageEntityCustomEmoji { offset = offset, length = -1, document_id = document_id });
 							else if ((tag.StartsWith("tg-time unix=\"") || tag.StartsWith("tg-time unix='")) && (end = tag.IndexOf(tag[13], 14)) > 0
 								  && TryParseUnixTime(tag[14..end], out var date))
@@ -464,7 +469,7 @@ namespace TL
 								{
 									offset = offset, length = -1,
 									date = date,
-									flags = string.Compare(tag, end + 1, " format=", 0, 8) == 0 && tag.Length >= end + 11 ? ToDateFlags(tag[(end + 10)..^1]) : 0
+									flags = string.Compare(tag, end + 1, " format=", 0, 8, StringComparison.Ordinal) == 0 && tag.Length >= end + 11 ? ToDateFlags(tag[(end + 10)..^1]) : 0
 								});
 							break;
 					}
