@@ -221,11 +221,12 @@ namespace TL
 									entities[lastIndex] = new InputMessageEntityMentionName { offset = textUrl.offset, length = textUrl.length, user_id = new InputUser(id, hash) };
 								else if (textUrl.url.StartsWith("tg://emoji?id=") && long.TryParse(textUrl.url[14..], out id))
 									entities[lastIndex] = new MessageEntityCustomEmoji { offset = textUrl.offset, length = textUrl.length, document_id = id };
-								else if (textUrl.url.StartsWith("tg://time?unix=") && textUrl.url.IndexOf("&format=", 15) is { } idxFormat)
+								else if (textUrl.url.StartsWith("tg://time?unix=") && textUrl.url.IndexOf("&format=", 15) is { } idxFormat
+									  && HtmlText.TryParseUnixTime(idxFormat < 0 ? textUrl.url[15..] : textUrl.url[15..idxFormat], out var date))
 									entities[lastIndex] = new MessageEntityFormattedDate
 									{
 										offset = textUrl.offset, length = textUrl.length,
-										date = new DateTime((long.Parse(idxFormat < 0 ? textUrl.url[15..] : textUrl.url[15..idxFormat]) + 62135596800L) * 10000000, DateTimeKind.Utc),
+										date = date,
 										flags = idxFormat < 0 ? 0 : HtmlText.ToDateFlags(textUrl.url[(idxFormat + 8)..])
 									};
 								break;
@@ -454,14 +455,16 @@ namespace TL
 								if (entities.LastOrDefault(e => e.length == -1) is MessageEntityPre prevEntity)
 									prevEntity.language = tag[21..^1];
 							}
-							else if (tag.StartsWith("tg-emoji emoji-id=\"") || tag.StartsWith("tg-emoji emoji-id='"))
-								entities.Add(new MessageEntityCustomEmoji { offset = offset, length = -1, document_id = long.Parse(tag[19..^1]) });
-							else if ((tag.StartsWith("tg-time unix=\"") || tag.StartsWith("tg-time unix='")) && (end = tag.IndexOf(tag[13], 14)) > 0)
+							else if ((tag.StartsWith("tg-emoji emoji-id=\"") || tag.StartsWith("tg-emoji emoji-id='"))
+								  && tag.Length > 19 && long.TryParse(tag[19..^1], out var document_id))
+								entities.Add(new MessageEntityCustomEmoji { offset = offset, length = -1, document_id = document_id });
+							else if ((tag.StartsWith("tg-time unix=\"") || tag.StartsWith("tg-time unix='")) && (end = tag.IndexOf(tag[13], 14)) > 0
+								  && TryParseUnixTime(tag[14..end], out var date))
 								entities.Add(new MessageEntityFormattedDate
 								{
 									offset = offset, length = -1,
-									date = new DateTime((long.Parse(tag[14..end]) + 62135596800L) * 10000000, DateTimeKind.Utc),
-									flags = string.Compare(tag, end + 1, " format=", 0, 8) == 0 ? ToDateFlags(tag[(end + 10)..^1]) : 0
+									date = date,
+									flags = string.Compare(tag, end + 1, " format=", 0, 8) == 0 && tag.Length >= end + 11 ? ToDateFlags(tag[(end + 10)..^1]) : 0
 								});
 							break;
 					}
@@ -584,7 +587,22 @@ namespace TL
 		public static string ToDateFormat(this MessageEntityFormattedDate.Flags flags)
 			=> string.Concat("rtTdDw".Where((c, i) => ((int)flags & (1 << i)) != 0));
 
+		/// <summary>Format letters outside "rtTdDw" are ignored, and a letter given twice counts once</summary>
 		public static MessageEntityFormattedDate.Flags ToDateFlags(string dateTimeFormat)
-			=> (MessageEntityFormattedDate.Flags)dateTimeFormat.Sum(c => 1 << "rtTdDw".IndexOf(c));
+			=> (MessageEntityFormattedDate.Flags)dateTimeFormat
+				.Select(c => "rtTdDw".IndexOf(c))
+				.Where(i => i >= 0)
+				.Aggregate(0, (flags, i) => flags | (1 << i));
+
+		/// <summary>Reads a unix time given as text (a tg-time tag or tg://time link); false when it is not a number
+		/// or not a date (the entity is then left out rather than failing the whole text)</summary>
+		internal static bool TryParseUnixTime(string unixTime, out DateTime date)
+		{
+			date = default;
+			if (!long.TryParse(unixTime, out var seconds) || seconds < -62135596800L || seconds > 253402300799L)
+				return false;
+			date = new DateTime((seconds + 62135596800L) * 10000000, DateTimeKind.Utc);
+			return true;
+		}
 	}
 }
