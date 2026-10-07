@@ -1853,6 +1853,47 @@ namespace WTelegram
 			}
 		}
 
+		/// <summary>After a path of the main DC is lost while another carries on: asks for the updates state on a live
+		/// connection, which makes Telegram send this session's updates there (as after a full reconnect), and hands the
+		/// state to the app, whose update manager fetches what was pushed into the dead connection meanwhile.</summary>
+		private async Task ResubscribeUpdatesAsync(string why, int attempts, int logLevel)
+		{
+			Interlocked.Increment(ref _updatesRechecks);
+			try
+			{
+				for (int attempt = 1; attempt <= attempts && !_disposed; attempt++)
+				{
+					try
+					{
+						var updatesState = await this.Updates_GetState();
+						Helpers.Log(logLevel, $"{_dcSession?.DcID}>{why}: updates re-requested on a live connection (pts {updatesState.pts})");
+						RaiseUpdates(updatesState);
+						return;
+					}
+					catch (Exception ex)
+					{
+						if (_disposed)
+							return;
+						Helpers.Log(3, $"{_dcSession?.DcID}>{why}: re-requesting updates failed (attempt {attempt}): {ex.Message}");
+					}
+					if (attempt < attempts)
+						await Task.Delay(2000 * attempt);
+				}
+			}
+			finally
+			{
+				Interlocked.Decrement(ref _updatesRechecks);
+			}
+		}
+
+		/// <summary>How often (seconds) a multipath main-DC client asks for the updates state without any path event
+		/// (0 = never): a bound on how long updates can go missing when the connection Telegram pushes them to stops
+		/// carrying them in a way no path check notices. The app's update manager fetches whatever the state shows it
+		/// missed.</summary>
+		public int UpdatesRecheckInterval { get; set; } = 30;
+		private int _updatesRechecks;
+		private long _lastUpdatesRecheckTicks = Environment.TickCount64;
+
 		private async Task ReconnectPathAsync(TransportPath path, Exception cause = null)
 		{
 			lock (_pathsLock)
@@ -1869,6 +1910,11 @@ namespace WTelegram
 			// (those also on a live path just wait for their answer). Done here, not in the reactor:
 			// the teardown below cancels the reactor quietly.
 			_ = RescueStrandedRpcsAsync($"P{path.PathIndex} down", cause ?? new IOException($"Path {path.PathIndex} down"));
+			// Telegram pushes a session's updates down one of its connections. If that was this one, and it died
+			// without a FIN (an uplink that went dark), the server keeps pushing into it: every request still works
+			// on the other path and no update ever arrives again.
+			if (IsMainDC)
+				_ = ResubscribeUpdatesAsync($"P{path.PathIndex} down", attempts: 5, logLevel: 2);
 
 			try
 			{
@@ -2056,6 +2102,14 @@ namespace WTelegram
 				TransportPath[] snapshot;
 				lock (_pathsLock)
 					snapshot = _paths.ToArray();
+
+				// The updates state, asked for on a schedule (see UpdatesRecheckInterval). Not while one is in flight.
+				if (IsMainDC && User != null && UpdatesRecheckInterval > 0
+					&& now - _lastUpdatesRecheckTicks >= UpdatesRecheckInterval * 1000L && Volatile.Read(ref _updatesRechecks) == 0)
+				{
+					_lastUpdatesRecheckTicks = now;
+					_ = ResubscribeUpdatesAsync("Scheduled check", attempts: 1, logLevel: 1);
+				}
 
 				// Collect alive paths that have been probed
 				var alivePaths = snapshot.Where(p => p.IsAlive && p.LastRecvTicks > 0).ToArray();
