@@ -1941,11 +1941,23 @@ namespace WTelegram
 					path.FlapCount++;
 				else
 					path.FlapCount = 0;
-				if (path.FlapCount > 0)
+				// Only while another path carries the session: this one is then spare, and its absence costs
+				// nothing but redundancy. With no other path alive it is tried at once, and a wait under way
+				// ends the moment the last other path goes.
+				bool OtherPathAlive()
 				{
-					long flapDelayMs = Math.Min(PathFlapMaxBackoff * 1000L, 5000L << Math.Min(path.FlapCount - 1, 10));
+					lock (_pathsLock)
+						return _paths.Any(p => p != path && p.IsAlive);
+				}
+				if (path.FlapCount > 0 && OtherPathAlive())
+				{
+					long flapDelayMs = Math.Min(Math.Max(0, PathFlapMaxBackoff) * 1000L, 5000L << Math.Min(path.FlapCount - 1, 10));
 					Helpers.Log(2, $"{dcId}>Path {path.PathIndex} went down {livedMs / 1000}s after it came up ({path.FlapCount} in a row): next attempt in {flapDelayMs / 1000}s.");
-					try { await Task.Delay((int)flapDelayMs, _cts?.Token ?? default); }
+					try
+					{
+						for (long waited = 0; waited < flapDelayMs && OtherPathAlive(); waited += 1000)
+							await Task.Delay(1000, _cts?.Token ?? default);
+					}
 					catch (OperationCanceledException) { return; }
 				}
 
