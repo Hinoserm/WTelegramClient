@@ -323,6 +323,11 @@ namespace WTelegram
 		private const int MaxReactorRetries = 50;
 		/// <summary>Maximum backoff delay in seconds between reconnect attempts (both per-path and full reconnect).</summary>
 		public int PathReconnectMaxBackoff { get; set; } = 30;
+		/// <summary>A path that goes down within this many seconds of coming up is flapping: its next reconnect is
+		/// delayed, 5 s doubling with every such death in a row up to <see cref="PathFlapMaxBackoff"/>. 0 disables it.</summary>
+		public int PathFlapWindow { get; set; } = 60;
+		/// <summary>The longest a flapping path waits before it is tried again (seconds).</summary>
+		public int PathFlapMaxBackoff { get; set; } = 300;
 		/// <summary>Seconds before an RPC on a specific path is considered stalled. The path is force-closed to trigger failover.
 		/// Set to 0 to disable stall detection. Only applies when multiple paths exist.</summary>
 		public int PathRpcStallTimeout { get; set; } = 3;
@@ -420,6 +425,8 @@ namespace WTelegram
 			PathDisconnectDelay = cloneOf.PathDisconnectDelay;
 			PathConnectTimeout = cloneOf.PathConnectTimeout;
 			PathReconnectMaxBackoff = cloneOf.PathReconnectMaxBackoff;
+			PathFlapWindow = cloneOf.PathFlapWindow;
+			PathFlapMaxBackoff = cloneOf.PathFlapMaxBackoff;
 			PathRpcStallTimeout = cloneOf.PathRpcStallTimeout;
 			SendMode = cloneOf.SendMode;
 			TransferMode = cloneOf.TransferMode;
@@ -1923,6 +1930,25 @@ namespace WTelegram
 					return;
 				int dcId = _dcSession?.DcID ?? 0;
 
+				// FLAP DAMPING. A path can connect, answer its registration ping and then go silent, over and over
+				// (an uplink that is half dead). Reconnected at once every time, it spends most of its life "up":
+				// Telegram sends the session's updates down the connection that registered last, so each return
+				// takes them away from the path that works, and they sit there until this one fails its probes
+				// again. A path that died soon after it came up therefore waits before its next attempt, twice as
+				// long each time; one that stayed up starts from nothing again.
+				long livedMs = Environment.TickCount64 - Volatile.Read(ref path.ConnectedSinceTicks);
+				if (PathFlapWindow > 0 && livedMs < PathFlapWindow * 1000L)
+					path.FlapCount++;
+				else
+					path.FlapCount = 0;
+				if (path.FlapCount > 0)
+				{
+					long flapDelayMs = Math.Min(PathFlapMaxBackoff * 1000L, 5000L << Math.Min(path.FlapCount - 1, 10));
+					Helpers.Log(2, $"{dcId}>Path {path.PathIndex} went down {livedMs / 1000}s after it came up ({path.FlapCount} in a row): next attempt in {flapDelayMs / 1000}s.");
+					try { await Task.Delay((int)flapDelayMs, _cts?.Token ?? default); }
+					catch (OperationCanceledException) { return; }
+				}
+
 				for (int attempt = 1; ; attempt++)
 				{
 					// Tear down the previous connection (or the previous failed attempt). Cancelling its
@@ -2057,6 +2083,11 @@ namespace WTelegram
 						AddPenalty(path, 500);
 						Helpers.Log(2, $"{_dcSession.DcID}>Path {path.PathIndex} reconnected and registered successfully.");
 						RaisePathChanged(path);
+						// The connection that registered last is where Telegram now sends the updates: asked for
+						// again at once on the path requests prefer (this one starts with no latency figure and a
+						// penalty, so it is the last choice), they stay on a path that has proved itself.
+						if (IsMainDC)
+							_ = ResubscribeUpdatesAsync($"P{path.PathIndex} up", attempts: 2, logLevel: 2);
 						return;
 					}
 					catch (Exception ex)
@@ -2928,6 +2959,7 @@ namespace WTelegram
 			public long BytesSent;
 			public long BytesRecv;
 			public int ReconnectCount;
+			public int FlapCount; // deaths in a row within PathFlapWindow of coming up (only its own reconnect loop touches it)
 			public long ConnectedSinceTicks; // Environment.TickCount64 when this path last became alive
 			public long LastSendTicks; // Environment.TickCount64 of the last frame written on this path
 			public long Generation; // unique per connection (Client._pathGeneration); 0 = never connected
