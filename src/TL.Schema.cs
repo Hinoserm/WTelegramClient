@@ -3,7 +3,7 @@ using System.Collections.Generic;
 
 namespace TL
 {
-	#pragma warning disable IDE1006, CS1574
+	#pragma warning disable IDE1006
 	/// <summary>Boolean type.		<para>See <a href="https://corefork.telegram.org/type/Bool"/></para></summary>
 	public enum Bool : uint
 	{
@@ -2375,7 +2375,7 @@ namespace TL
 		public string description;
 		/// <summary>URL of the product photo for the invoice. Can be a photo of the goods or a marketing image for a service. People like it better when they see what they are paying for.</summary>
 		[IfFlag(0)] public WebDocumentBase photo;
-		/// <summary>Message ID of receipt: if set, clients should change the text of the first <see cref="KeyboardButtonBuy"/> button always attached to the <see cref="Message"/> to a localized version of the word <c>Receipt</c></summary>
+		/// <summary>Message ID of receipt: if set, clients should change the text of the first <see cref="InlineButtonTypeBuy"/> button always attached to the <see cref="Message"/> to a localized version of the word <c>Receipt</c></summary>
 		[IfFlag(2)] public int receipt_msg_id;
 		/// <summary>Three-letter ISO 4217 <a href="https://corefork.telegram.org/bots/payments#supported-currencies">currency</a> code, or <c>XTR</c> for <a href="https://corefork.telegram.org/api/stars">Telegram Stars</a>.</summary>
 		public string currency;
@@ -2911,7 +2911,7 @@ namespace TL
 	[TLDef(0xB4C38CB5)]
 	public partial class MessageActionWebViewDataSent : MessageAction
 	{
-		/// <summary>Text of the <see cref="KeyboardButtonSimpleWebView"/> that was pressed to open the web app.</summary>
+		/// <summary>Text of the <see cref="ButtonTypeSimpleWebView"/> that was pressed to open the web app.</summary>
 		public string text;
 	}
 	/// <summary>Info about a gifted Telegram Premium subscription		<para>See <a href="https://corefork.telegram.org/constructor/messageActionGiftPremium"/></para></summary>
@@ -2996,11 +2996,11 @@ namespace TL
 		/// <summary>The photo that the user suggested we set as profile picture.</summary>
 		public PhotoBase photo;
 	}
-	/// <summary>Contains info about one or more peers that the we (the user) shared with the bot after clicking on a <see cref="KeyboardButtonRequestPeer"/> button (service message sent by the user).		<para>See <a href="https://corefork.telegram.org/constructor/messageActionRequestedPeer"/></para></summary>
+	/// <summary>Contains info about one or more peers that the we (the user) shared with the bot after clicking on a <see cref="ButtonTypeRequestPeer"/> button (service message sent by the user).		<para>See <a href="https://corefork.telegram.org/constructor/messageActionRequestedPeer"/></para></summary>
 	[TLDef(0x31518E9B)]
 	public sealed partial class MessageActionRequestedPeer : MessageAction
 	{
-		/// <summary><c>button_id</c> contained in the <see cref="KeyboardButtonRequestPeer"/></summary>
+		/// <summary><c>button_id</c> contained in the <see cref="ButtonTypeRequestPeer"/></summary>
 		public int button_id;
 		/// <summary>The shared peers</summary>
 		public Peer[] peers;
@@ -3100,11 +3100,11 @@ namespace TL
 		/// <summary>Number of applied <a href="https://corefork.telegram.org/api/boost">boosts</a>.</summary>
 		public int boosts;
 	}
-	/// <summary>Contains info about one or more peers that the a user shared with the me (the bot) after clicking on a <see cref="KeyboardButtonRequestPeer"/> button (service message received by the bot).		<para>See <a href="https://corefork.telegram.org/constructor/messageActionRequestedPeerSentMe"/></para></summary>
+	/// <summary>Contains info about one or more peers that the a user shared with the me (the bot) after clicking on a <see cref="ButtonTypeRequestPeer"/> button (service message received by the bot).		<para>See <a href="https://corefork.telegram.org/constructor/messageActionRequestedPeerSentMe"/></para></summary>
 	[TLDef(0x93B31848)]
 	public sealed partial class MessageActionRequestedPeerSentMe : MessageAction
 	{
-		/// <summary><c>button_id</c> contained in the <see cref="KeyboardButtonRequestPeer"/></summary>
+		/// <summary><c>button_id</c> contained in the <see cref="ButtonTypeRequestPeer"/></summary>
 		public int button_id;
 		/// <summary>Info about the shared peers.</summary>
 		public RequestedPeer[] peers;
@@ -18358,7 +18358,7 @@ namespace TL
 			has_has_username = 0x8,
 		}
 	}
-	/// <summary>Used in a <see cref="KeyboardButtonRequestPeer"/> by a <a href="https://corefork.telegram.org/api/bots/managed-bots">manager bot</a> to ask a user to create a new <a href="https://corefork.telegram.org/api/bots/managed-bots">managed bot »</a>, see <a href="https://corefork.telegram.org/api/bots/buttons#requesting-a-managed-bot">here »</a> for more info.		<para>See <a href="https://corefork.telegram.org/constructor/requestPeerTypeCreateBot"/></para></summary>
+	/// <summary>Used in a <see cref="ButtonTypeRequestPeer"/> by a <a href="https://corefork.telegram.org/api/bots/managed-bots">manager bot</a> to ask a user to create a new <a href="https://corefork.telegram.org/api/bots/managed-bots">managed bot »</a>, see <a href="https://corefork.telegram.org/api/bots/buttons#requesting-a-managed-bot">here »</a> for more info.		<para>See <a href="https://corefork.telegram.org/constructor/requestPeerTypeCreateBot"/></para></summary>
 	[TLDef(0x3E81E078)]
 	public sealed partial class RequestPeerTypeCreateBot : RequestPeerType
 	{
