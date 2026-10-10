@@ -2813,7 +2813,7 @@ namespace TL
 		/// <param name="peer">Where was the inline keyboard sent</param>
 		/// <param name="msg_id">ID of the Message with the inline keyboard</param>
 		/// <param name="data">Callback data</param>
-		/// <param name="password">For buttons <see cref="KeyboardButtonCallback">requiring you to verify your identity with your 2FA password</see>, the SRP payload generated using <a href="https://corefork.telegram.org/api/srp">SRP</a>.</param>
+		/// <param name="password">For buttons <see cref="InlineButtonTypeCallback">requiring you to verify your identity with your 2FA password</see>, the SRP payload generated using <a href="https://corefork.telegram.org/api/srp">SRP</a>.</param>
 		public static Task<Messages_BotCallbackAnswer> Messages_GetBotCallbackAnswer(this Client client, InputPeer peer, int msg_id, byte[] data = null, InputCheckPasswordSRP password = null, bool game = false)
 			=> client.Invoke(new Messages_GetBotCallbackAnswer
 			{
@@ -4118,7 +4118,7 @@ namespace TL
 		/// <summary>Used by the user to relay data from an opened <a href="https://corefork.telegram.org/api/bots/webapps">reply keyboard bot mini app</a> to the bot that owns it.		<para>See <a href="https://corefork.telegram.org/method/messages.sendWebViewData"/></para>		<para>Possible <see cref="RpcException"/> codes: 400 (<a href="https://corefork.telegram.org/method/messages.sendWebViewData#possible-errors">details</a>)</para></summary>
 		/// <param name="bot">Bot that owns the web app</param>
 		/// <param name="random_id">Unique client message ID to prevent duplicate sending of the same event. See <a href="https://corefork.telegram.org/api/updates#updatemessageid-updates">here »</a> for more info on random ID deduplication and updateMessageID mapping. <para>You can use <see cref="WTelegram.Helpers.RandomLong"/></para></param>
-		/// <param name="button_text">Text of the <see cref="KeyboardButtonSimpleWebView"/> that was pressed to open the web app.</param>
+		/// <param name="button_text">Text of the <see cref="ButtonTypeSimpleWebView"/> that was pressed to open the web app.</param>
 		/// <param name="data">Data to relay to the bot, obtained from a <a href="https://corefork.telegram.org/api/web-events#web-app-data-send"><c>web_app_data_send</c> JS event</a>.</param>
 		public static Task<UpdatesBase> Messages_SendWebViewData(this Client client, InputUserBase bot, long random_id, string button_text, string data)
 			=> client.Invoke(new Messages_SendWebViewData
@@ -4242,11 +4242,11 @@ namespace TL
 			{
 			});
 
-		/// <summary>Send one or more chosen peers, as requested by a <see cref="KeyboardButtonRequestPeer"/> button.		<para>See <a href="https://corefork.telegram.org/method/messages.sendBotRequestedPeer"/></para>		<para>Possible <see cref="RpcException"/> codes: 400 (<a href="https://corefork.telegram.org/method/messages.sendBotRequestedPeer#possible-errors">details</a>)</para></summary>
-		/// <param name="peer">The bot that sent the <see cref="KeyboardButtonRequestPeer"/> button.</param>
-		/// <param name="msg_id">ID of the message that contained the reply keyboard with the <see cref="KeyboardButtonRequestPeer"/> button.</param>
+		/// <summary>Send one or more chosen peers, as requested by a <see cref="ButtonTypeRequestPeer"/> button.		<para>See <a href="https://corefork.telegram.org/method/messages.sendBotRequestedPeer"/></para>		<para>Possible <see cref="RpcException"/> codes: 400 (<a href="https://corefork.telegram.org/method/messages.sendBotRequestedPeer#possible-errors">details</a>)</para></summary>
+		/// <param name="peer">The bot that sent the <see cref="ButtonTypeRequestPeer"/> button.</param>
+		/// <param name="msg_id">ID of the message that contained the reply keyboard with the <see cref="ButtonTypeRequestPeer"/> button.</param>
 		/// <param name="webapp_req_id">If the button was prepared for a <a href="https://corefork.telegram.org/api/bots/buttons#requesting-peers-via-mini-apps">Mini App »</a>, the Mini App request ID returned by <see cref="Bots_RequestWebViewButton">Bots_RequestWebViewButton</see>.</param>
-		/// <param name="button_id">The <c>button_id</c> field from the <see cref="KeyboardButtonRequestPeer"/>.</param>
+		/// <param name="button_id">The <c>button_id</c> field from the <see cref="ButtonTypeRequestPeer"/>.</param>
 		/// <param name="requested_peers">The chosen peers.</param>
 		public static Task<UpdatesBase> Messages_SendBotRequestedPeer(this Client client, InputPeer peer, int button_id, InputPeer[] requested_peers, int? msg_id = null, string webapp_req_id = null)
 			=> client.Invoke(new Messages_SendBotRequestedPeer
@@ -6595,7 +6595,7 @@ namespace TL
 
 		/// <summary>Bots may use this method to prepare a peer request button for a <a href="https://corefork.telegram.org/api/bots/webapps">Mini App</a>, see <a href="https://corefork.telegram.org/api/bots/buttons#requesting-peers-via-mini-apps">here »</a> for more info.		<para>See <a href="https://corefork.telegram.org/method/bots.requestWebViewButton"/> [bots: ✓ users: ✗]</para>		<para>Possible <see cref="RpcException"/> codes: 400 (<a href="https://corefork.telegram.org/method/bots.requestWebViewButton#possible-errors">details</a>)</para></summary>
 		/// <param name="user_id">The user that will use the prepared button in the Mini App</param>
-		/// <param name="button">The button to prepare, an <see cref="InputKeyboardButtonRequestPeer"/> of any <see cref="RequestPeerType"/></param>
+		/// <param name="button">The button to prepare, an <see cref="InputButtonTypeRequestPeer"/> of any <see cref="RequestPeerType"/></param>
 		public static Task<Bots_RequestedButton> Bots_RequestWebViewButton(this Client client, InputUserBase user_id, KeyboardButton button)
 			=> client.Invoke(new Bots_RequestWebViewButton
 			{
