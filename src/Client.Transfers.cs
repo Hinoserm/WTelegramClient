@@ -76,6 +76,7 @@ namespace WTelegram
 			internal readonly long[] LastAckTicks = new long[2]; // last answer that gave a sample (queue start)
 			internal readonly long[] LastSampleTicks = new long[2];
 			internal readonly long[] LastProbeTicks = new long[2];
+			internal readonly long[] LastLateCopyTicks = new long[2]; // when a part was last found late by this WAN's own pace
 			internal readonly int[] InFlight = new int[2];
 			// the parts in flight, per direction: the oldest one's progress so far bounds the speed estimate
 			internal readonly System.Collections.Generic.List<TransferLease>[] Active = [new(), new()];
@@ -170,10 +171,12 @@ namespace WTelegram
 								}
 							if (best.Wan.InFlight[dir] < Cap(best.Wan, dir, now))
 							{
-								best.Wan.InFlight[dir]++;
-								long aheadBytes = 0;
+								// what this WAN has ahead of the part: its own parts in flight, and the copies of other WANs'
+								// parts counted on it (in InFlight, not in Active; each taken as a part of this size)
+								long aheadBytes = (long)Math.Max(0, best.Wan.InFlight[dir] - best.Wan.Active[dir].Count) * bytes;
 								foreach (var earlier in best.Wan.Active[dir])
 									aheadBytes += earlier.Bytes;
+								best.Wan.InFlight[dir]++;
 								var lease = new TransferLease { Client = client, PathIndex = best.Path.PathIndex, Dir = dir, Wan = best.Wan,
 									StallExtraMs = (long)Math.Min(2 * bestEta, 120_000), StartTicks = now, Bytes = bytes, AheadBytes = aheadBytes };
 								best.Wan.Active[dir].Add(lease);
@@ -349,8 +352,8 @@ namespace WTelegram
 		/// The other WANs are ranked by <see cref="BestCopyTarget"/> (one not measured yet counts as twice this part's
 		/// WAN, if that one is measured). With another live WAN but nothing measured on either, a part 2 s old is
 		/// copied; with no other WAN, never. Whatever the other WAN's speed, an upload part late by its own WAN's pace
-		/// (three times what it and the bytes ahead of it there should have needed; the WAN's oldest part, on its first
-		/// attempt) is copied too: its WAN is going bad. A last-resort WAN is another WAN only when the part's own is
+		/// (three times what it and the bytes ahead of it there should have needed; one such part a second per WAN) is
+		/// copied too: its WAN is going bad. A last-resort WAN is another WAN only when the part's own is
 		/// the one usable path left, and, never measured, takes a copy only of such a late part.</summary>
 		private bool TransferCopyDue(Rpc rpc, long now)
 		{
@@ -379,16 +382,20 @@ namespace WTelegram
 			// unnoticed), whatever the other WAN's speed: the part is copied without waiting out the stall timeout.
 			// Kept narrow, because it trusts that estimate, which can read too high (see below):
 			// - an upload part only: a download's wait may be Telegram fetching the file, not the WAN;
-			// - on its first attempt: a retry is queued behind parts its lease knows nothing of;
-			// - the WAN's oldest part in flight only, so one part at a time: each such copy lowers an estimate that
-			//   read too high (RecordSlowTransfer), before the parts behind it are judged by it.
+			// - one part a second per WAN: the copy of that WAN's oldest part lowers an estimate that read too high
+			//   (RecordSlowTransfer), and the parts behind are then judged by the lower one. (Any late part may be
+			//   the one, not only the oldest: a part that cannot be judged late, one re-sent elsewhere say, must not
+			//   keep those behind it from being rescued.)
 			bool late = false;
-			if (dir == TransferUp && ownBps > 0 && rpc.transferAttempt <= 1 && rpc.lease is TransferLease lease
-				&& lease.Wan == Wan(WanKey(own))
+			if (dir == TransferUp && ownBps > 0 && rpc.lease is TransferLease lease && lease.Wan == Wan(WanKey(own))
 				&& age > 3 * ((lease.AheadBytes + rpc.transferBytes) * 1000.0 / ownBps))
 			{
 				lock (RootClient._transferLock)
-					late = OldestQueued(lease.Wan, dir, out _) == lease;
+					if (now - lease.Wan.LastLateCopyTicks[dir] >= 1000)
+					{
+						lease.Wan.LastLateCopyTicks[dir] = now;
+						late = true;
+					}
 			}
 			// To a last-resort WAN that was never measured (it is given no parts to be measured by, and an upload
 			// part's copy gives no sample), that is the only reason: no speed is assumed for it. (Assumed twice as fast,
