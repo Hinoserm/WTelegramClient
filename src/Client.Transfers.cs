@@ -409,8 +409,11 @@ namespace WTelegram
 					bool silentRun = w.LateSinceTicks[dir] != 0 && w.LateSinceTicks[dir] >= queued && lastRecv <= w.LateSinceTicks[dir];
 					if (silentRun ? now - w.LateSinceTicks[dir] >= silenceMs : now - w.LastLateCopyTicks[dir] >= 1000)
 					{
-						if (!silentRun)
-							w.LateSinceTicks[dir] = now; // the first late part since the WAN last answered
+						// The first late part since the WAN last answered begins a run. A part queued after a run began
+						// (it comes here, paced) does not begin another while that run goes on, or the older parts'
+						// wait for silence would start over with each such part. A run with no late part for 10 s is over.
+						if (!silentRun && (w.LateSinceTicks[dir] == 0 || lastRecv > w.LateSinceTicks[dir] || now - w.LastLateCopyTicks[dir] > 10_000))
+							w.LateSinceTicks[dir] = now;
 						w.LastLateCopyTicks[dir] = now;
 						late = true;
 					}
