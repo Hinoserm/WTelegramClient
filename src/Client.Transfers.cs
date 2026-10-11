@@ -375,9 +375,11 @@ namespace WTelegram
 			// part of a pipelined upload, and each copy would lower its own WAN's estimate.)
 			if (IsLastResort(best) && MeasuredBps(best, dir) <= 0)
 			{
+				// (at least a full pipeline's worth: a file's last parts were queued behind others that have left by
+				// now, and their age is that wait too, not only what is in flight at this moment)
 				int ownInFlight;
 				lock (RootClient._transferLock)
-					ownInFlight = Math.Max(1, Wan(WanKey(own)).InFlight[dir]);
+					ownInFlight = Math.Max(Math.Max(1, TransferPartsPerPath), Wan(WanKey(own)).InFlight[dir]);
 				return age > 3 * (ownInFlight * rpc.transferBytes * 1000.0 / ownBps);
 			}
 			if (ownBps > 0 && ownBps >= bestOther * RescueRatio)
