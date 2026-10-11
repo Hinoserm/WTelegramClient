@@ -62,6 +62,7 @@ namespace WTelegram
 			internal Rpc CopyOwner; // the attempt (request) whose copy that is
 			internal int Attempts; // attempts (requests) made for this part so far: Rpc.transferAttempt
 			internal long QueuedTicks; // when its part's current attempt was queued on a path (0: not yet); Volatile
+			internal int Ahead; // parts its WAN already had in flight in its direction when it was handed out
 		}
 
 		/// <summary>Per WAN (local address), per direction: measured speed, parts in flight, FLOOD_WAIT state.
@@ -169,9 +170,9 @@ namespace WTelegram
 								}
 							if (best.Wan.InFlight[dir] < Cap(best.Wan, dir, now))
 							{
-								best.Wan.InFlight[dir]++;
+								int ahead = best.Wan.InFlight[dir]++;
 								var lease = new TransferLease { Client = client, PathIndex = best.Path.PathIndex, Dir = dir, Wan = best.Wan,
-									StallExtraMs = (long)Math.Min(2 * bestEta, 120_000), StartTicks = now, Bytes = bytes };
+									StallExtraMs = (long)Math.Min(2 * bestEta, 120_000), StartTicks = now, Bytes = bytes, Ahead = ahead };
 								best.Wan.Active[dir].Add(lease);
 								return lease;
 							}
@@ -344,8 +345,10 @@ namespace WTelegram
 		/// in flight): it gets a copy there (see CopyStalledRpcsAsync), so a slow WAN never holds up the end of a file.
 		/// The other WANs are ranked by <see cref="BestCopyTarget"/> (one not measured yet counts as twice this part's
 		/// WAN, if that one is measured). With another live WAN but nothing measured on either, a part 2 s old is
-		/// copied; with no other WAN, never. A last-resort WAN is another WAN only when the part's own is the one
-		/// usable path left, and, never measured, takes a copy only of a part well behind its own WAN's pace.</summary>
+		/// copied; with no other WAN, never. Whatever the other WAN's speed, a part late by its own WAN's pace (three
+		/// times what it and the parts ahead of it there should have needed) is copied too: its WAN is going bad. A
+		/// last-resort WAN is another WAN only when the part's own is the one usable path left, and, never measured,
+		/// takes a copy only of such a late part.</summary>
 		private bool TransferCopyDue(Rpc rpc, long now)
 		{
 			if (rpc.transferDir < 0 || rpc.transferBytes <= 0)
@@ -368,20 +371,17 @@ namespace WTelegram
 				return false; // no other WAN to copy to
 			if (bestOther <= 0) // nothing measured anywhere (right after a start): a part 2 s old is copied
 				return age > 2000;
+			// Late by its own WAN's pace: three times what that WAN, at its measured speed, should have needed for it
+			// and for the parts that were ahead of it there when it was handed out. That is a WAN going bad (or dying
+			// unnoticed), whatever the other WAN's speed: the part is copied without waiting out the stall timeout.
+			bool late = ownBps > 0 && rpc.lease is TransferLease lease && lease.Wan == Wan(WanKey(own))
+				&& age > 3 * ((lease.Ahead + 1) * rpc.transferBytes * 1000.0 / ownBps);
 			// To a last-resort WAN that was never measured (it is given no parts to be measured by, and an upload
-			// part's copy gives no sample): no speed is assumed for it. The part is copied only when it is well behind
-			// what its own WAN should need for it with what that WAN has in flight, which is a WAN going bad, not one
-			// that could merely be faster. (Assumed twice as fast, with no load, it would take a copy of nearly every
-			// part of a pipelined upload, and each copy would lower its own WAN's estimate.)
-			if (IsLastResort(best) && MeasuredBps(best, dir) <= 0)
-			{
-				// (at least a full pipeline's worth: a file's last parts were queued behind others that have left by
-				// now, and their age is that wait too, not only what is in flight at this moment)
-				int ownInFlight;
-				lock (RootClient._transferLock)
-					ownInFlight = Math.Max(Math.Max(1, TransferPartsPerPath), Wan(WanKey(own)).InFlight[dir]);
-				return age > 3 * (ownInFlight * rpc.transferBytes * 1000.0 / ownBps);
-			}
+			// part's copy gives no sample), that is the only reason: no speed is assumed for it. (Assumed twice as fast,
+			// with no load, it would take a copy of nearly every part of a pipelined upload, and each copy would lower
+			// its own WAN's estimate.)
+			if (late || (IsLastResort(best) && MeasuredBps(best, dir) <= 0))
+				return late;
 			if (ownBps > 0 && ownBps >= bestOther * RescueRatio)
 				return false;
 			// By age alone, against what the fast WAN would need (with what it has in flight). Not against its own WAN's
