@@ -340,7 +340,9 @@ namespace WTelegram
 		/// <summary>Local addresses (each also in <see cref="LocalEndPoints"/>) whose paths are a last resort: connected and
 		/// probed like any other, but given nothing to carry (no request, no copy of one, no file part, no speed
 		/// measurement) while a path on another address is usable (see <see cref="LastResortSlowMs"/>). With none usable
-		/// they are paths like the others, until one is again. Set before connecting.</summary>
+		/// they are paths like the others, until one is again. One exception: the copy of a request (its hedge, or a
+		/// slow file part's copy) goes to a last-resort path when the path carrying the request is the only usable one
+		/// left, so that path dying unnoticed costs no wait for it to be found dead. Set before connecting.</summary>
 		public HashSet<IPAddress> LastResortAddresses { get => _lastResortAddresses; set => _lastResortAddresses = value ?? new(); }
 		private HashSet<IPAddress> _lastResortAddresses = new();
 		/// <summary>True while this client's last-resort paths are open to requests: no other path of it is usable.</summary>
@@ -1078,9 +1080,12 @@ namespace WTelegram
 
 		/// <summary>The alive paths (with a connection) that may be given something to carry now: all of them, less the
 		/// last-resort ones while they are kept out (see <see cref="LastResortBarredLocked"/>).</summary>
-		/// <param name="exceptIndex">A path a request is stuck on: left out of the judging of the last resort, and not
-		/// counted as a path left when passing over those on a WAN that is down (it may still be in the result)</param>
-		private TransportPath[] UsablePaths(int exceptIndex = -1)
+		/// <param name="exceptIndex">The path a request is on, when the paths are wanted for a copy of it: left out of the
+		/// judging of the last resort (the last resort takes the copy when that path is the only usable one left). It
+		/// may still be in the result.</param>
+		/// <param name="exceptIsHealthy">That path has not failed the request (see <see cref="PickOtherAlivePath"/>): it
+		/// counts as a path left when passing over those on a WAN that is down</param>
+		private TransportPath[] UsablePaths(int exceptIndex = -1, bool exceptIsHealthy = false)
 		{
 			var parentScores = ParentScores();
 			TransportPath[] usable;
@@ -1090,7 +1095,7 @@ namespace WTelegram
 				bool barred = LastResortBarredLocked(parentScores, exceptIndex);
 				if (exceptIndex < 0) // (judged with a path left out, it says nothing of the client as a whole)
 					note = NoteLastResortLocked(barred);
-				bool skipDown = SkipDownLocked(barred, parentScores, exceptIndex, needStream: true);
+				bool skipDown = SkipDownLocked(barred, parentScores, exceptIsHealthy ? -1 : exceptIndex, needStream: true);
 				usable = _paths.Where(p => p.NetworkStream != null && OpenPath(p, barred, skipDown, parentScores)).ToArray();
 			}
 			if (note != null)
@@ -1278,14 +1283,16 @@ namespace WTelegram
 
 		/// <summary>Best alive path other than <paramref name="avoidIndex"/>: lowest latency + penalty, unmeasured paths last.</summary>
 		/// <param name="avoidIsHealthy">The avoided path is avoided only because it already carries the request (a hedge, a
-		/// file part on a slower WAN), not because it failed to: it counts when judging whether a last-resort path may be
-		/// used. Otherwise it is left out of that judging, so a request stuck on the only other path does get its copy.</param>
+		/// file part on a slower WAN), not because it failed to: it counts as a path left when passing over paths on a
+		/// WAN that is down. Either way it is left out of the judging of the last resort: with no other usable path the
+		/// copy goes to a last-resort one, whether the request is stuck or only hedged (the avoided path may die
+		/// unnoticed, and the copy is then already on its way).</param>
 		private TransportPath PickOtherAlivePath(int avoidIndex, bool avoidIsHealthy = false)
 		{
 			var parentScores = ParentScores(); // before our own lock (see there)
 			lock (_pathsLock)
 			{
-				bool barred = LastResortBarredLocked(parentScores, avoidIsHealthy ? -1 : avoidIndex);
+				bool barred = LastResortBarredLocked(parentScores, avoidIndex);
 				// (a healthy avoided path is a path left: with it there, nothing goes to a WAN that is down)
 				bool skipDown = SkipDownLocked(barred, parentScores, avoidIsHealthy ? -1 : avoidIndex, needStream: true);
 				TransportPath best = null;
