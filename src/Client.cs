@@ -2050,14 +2050,19 @@ namespace WTelegram
 		{
 			LogTransferStats(); // its own minute, on the main client's counters
 			var now = Environment.TickCount64;
+			// (the remembered deliveries are also swept from here, on a client with several paths: they then go when
+			// their time is up even if no update arrives again. At most once a minute, see there.)
+			if (_parentClient == null)
+				PruneDeliveredUpdates(now, Math.Max(0, UpdateRepeatMemory * 1000L));
 			if (now - _lastCopyStatsTicks < 60_000)
 				return;
 			_lastCopyStatsTicks = now;
 			long hedged = Interlocked.Exchange(ref _statHedged, 0), stalled = Interlocked.Exchange(ref _statStalled, 0);
 			long rescued = Interlocked.Exchange(ref _statRescued, 0), dupAnswers = Interlocked.Exchange(ref _statDupAnswers, 0);
 			long dupFrames = Interlocked.Exchange(ref _statDupFrames, 0), late = Interlocked.Exchange(ref _statLate, 0);
-			if (hedged + stalled + late + rescued + dupAnswers + dupFrames > 0)
-				Helpers.Log(2, $"{_dcSession?.DcID}>Copies in the last minute: {hedged} hedged, {stalled} after a stall, {late} of late file parts, {rescued} re-sent after a path loss; duplicates dropped: {dupAnswers} answers, {dupFrames} frames");
+			long dupUpdates = Interlocked.Exchange(ref _statDupUpdates, 0);
+			if (hedged + stalled + late + rescued + dupAnswers + dupFrames + dupUpdates > 0)
+				Helpers.Log(2, $"{_dcSession?.DcID}>Copies in the last minute: {hedged} hedged, {stalled} after a stall, {late} of late file parts, {rescued} re-sent after a path loss; duplicates dropped: {dupAnswers} answers, {dupFrames} frames, {dupUpdates} updates");
 		}
 
 		private long _lastCopyPruneTicks;
@@ -3599,10 +3604,144 @@ namespace WTelegram
 			}
 		}
 
+		/// <summary>Seconds for which an update that carries an id of its own, and no pts or qts, is remembered, so that
+		/// a second delivery of it is dropped before the app sees it (see <see cref="DropRepeatDeliveries"/>). 0: such
+		/// updates are passed on however often they arrive.</summary>
+		public int UpdateRepeatMemory { get; set; } = 600;
+
+		// (kind of update, its id) → Environment.TickCount64 when it was first delivered. On the main client.
+		private readonly ConcurrentDictionary<(Type Kind, long Id), long> _deliveredUpdates = new();
+		private long _lastDeliveredPruneTicks;
+		private long _statDupUpdates;
+
+		/// <summary>The id by which a second delivery of an update is known for what it is. Only for the updates that
+		/// have such an id and no pts or qts: each is one question put to the app by Telegram under an id of its own
+		/// (a button pressed, an inline query typed, a checkout to approve), to be acted on once. Those with a pts or
+		/// qts are ordered, and their repeats dropped, by the update manager; those with no id of their own (typing, a
+		/// status) may be the same event or a new one, and are passed on.</summary>
+		private static bool TryGetDeliveryId(Update update, out long id)
+		{
+			switch (update)
+			{
+				case UpdateBotCallbackQuery u: id = u.query_id; return true;
+				case UpdateInlineBotCallbackQuery u: id = u.query_id; return true;
+				case UpdateBusinessBotCallbackQuery u: id = u.query_id; return true;
+				case UpdateEphemeralBotCallbackQuery u: id = u.query_id; return true;
+				case UpdateBotInlineQuery u: id = u.query_id; return true;
+				case UpdateBotPrecheckoutQuery u: id = u.query_id; return true;
+				case UpdateBotShippingQuery u: id = u.query_id; return true;
+				case UpdateBotWebhookJSONQuery u: id = u.query_id; return true;
+				case UpdateWebViewResultSent u: id = u.query_id; return true;
+				// (not UpdateJoinChatWebViewDecision: it is not known that one query_id carries one decision only)
+				default: id = 0; return false;
+			}
+		}
+
+		/// <summary>True the first time an update is delivered (or if it is of no kind that is remembered); false for a
+		/// repeat within <see cref="UpdateRepeatMemory"/>. Safe from several reactors at once: of two deliveries of one
+		/// update arriving together, exactly one is the first.</summary>
+		private bool FirstDelivery(Update update)
+		{
+			var root = RootClient;
+			long memoryMs = root.UpdateRepeatMemory * 1000L; // (the main client's: its media-DC clients keep no setting of their own)
+			if (memoryMs <= 0 || update == null)
+				return true;
+			long now = Environment.TickCount64;
+			// (swept with every update that comes, whatever its kind: a client with one connection has no monitor to
+			// sweep from, see LogCopyStats)
+			root.PruneDeliveredUpdates(now, memoryMs);
+			if (!TryGetDeliveryId(update, out long id))
+				return true;
+			var key = (update.GetType(), id);
+			while (true)
+			{
+				if (root._deliveredUpdates.TryAdd(key, now))
+					return true;
+				if (!root._deliveredUpdates.TryGetValue(key, out long firstAt))
+					continue; // pruned between the two: try to add it again
+				if (now - firstAt <= memoryMs)
+				{
+					Interlocked.Increment(ref root._statDupUpdates);
+					Helpers.Log(2, $"{_dcSession?.DcID}>Dropped repeat delivery of {update.GetType().Name} {id} ({now - firstAt} ms after the first)");
+					return false;
+				}
+				// remembered longer than the memory lasts (not pruned yet): this one is a first again
+				if (root._deliveredUpdates.TryUpdate(key, now, firstAt))
+					return true;
+			}
+		}
+
+		/// <summary>Forgets the updates delivered longer ago than the memory lasts. At most once a minute.</summary>
+		private void PruneDeliveredUpdates(long now, long memoryMs)
+		{
+			long last = Volatile.Read(ref _lastDeliveredPruneTicks);
+			if (now - last < 60_000 || Interlocked.CompareExchange(ref _lastDeliveredPruneTicks, now, last) != last)
+				return;
+			foreach (var entry in _deliveredUpdates)
+				if (now - entry.Value > memoryMs)
+					_deliveredUpdates.TryRemove(entry); // (only if it still holds that time: not one made a first again meanwhile)
+		}
+
+		/// <summary>Takes out of what Telegram sent the updates already delivered once (see <see cref="FirstDelivery"/>):
+		/// with several connections in one session, Telegram at times sends the same update down two of them, under two
+		/// message ids, and an update with no pts or qts is then not known for a repeat by anything else.</summary>
+		/// <returns>What is left to hand to the app; null if nothing is (a single update, already delivered). A list of
+		/// updates is handed on even when all of it was taken out: it has its users, chats and seq. (A list with a seq,
+		/// left with nothing to carry that seq forward, costs the update manager one look for a gap that is not there.)</returns>
+		private UpdatesBase DropRepeatDeliveries(UpdatesBase updates)
+		{
+			switch (updates)
+			{
+				case UpdateShort single:
+					return FirstDelivery(single.update) ? updates : null;
+				case Updates list:
+					list.updates = FirstDeliveries(list.updates);
+					return updates;
+				case UpdatesCombined list:
+					list.updates = FirstDeliveries(list.updates);
+					return updates;
+				default:
+					return updates;
+			}
+		}
+
+		private Update[] FirstDeliveries(Update[] updates)
+		{
+			if (updates == null || updates.Length == 0)
+				return updates;
+			List<Update> kept = null; // made only once something is dropped
+			for (int i = 0; i < updates.Length; i++)
+			{
+				if (FirstDelivery(updates[i]))
+					kept?.Add(updates[i]);
+				else
+					kept ??= new List<Update>(updates.AsSpan(0, i).ToArray());
+			}
+			return kept?.ToArray() ?? updates;
+		}
+
 		private async void RaiseUpdates(IObject obj)
 		{
 			try
 			{
+				// Repeat deliveries are taken out only where the updates are about to be handed to someone: on the main
+				// client, with a handler attached. (Marked as delivered with nobody to take them, they would be lost,
+				// and their repeat dropped.)
+				if (obj is UpdatesBase received && _parentClient == null && OnUpdates != null)
+				{
+					try
+					{
+						obj = DropRepeatDeliveries(received);
+					}
+					catch (Exception ex)
+					{
+						// (whatever went wrong in the taking out: the updates are handed on as they came)
+						Helpers.Log(4, $"{_dcSession?.DcID}>Repeat deliveries could not be taken out of {received.GetType().Name}: {ex.Message}");
+						obj = received;
+					}
+					if (obj == null)
+						return;
+				}
 				var task = obj is UpdatesBase updates ? OnUpdates?.Invoke(updates) : OnOther?.Invoke(obj);
 				if (task != null)
 				await task;
