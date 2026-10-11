@@ -360,6 +360,7 @@ namespace WTelegram
 		{
 			if (rpc.transferDir < 0 || rpc.transferBytes <= 0)
 				return false;
+			rpc.lateByPace = rpc.lateSilent = false; // (judged anew on each pass)
 			// what SendCopyAsync would refuse anyway: found due, it would only use up the pace of late copies below
 			if (now - rpc.sentTicks > CopyMaxAgeMs || Volatile.Read(ref rpc.copies) >= MaxCopies)
 				return false;
@@ -381,20 +382,24 @@ namespace WTelegram
 			if (best == null)
 				return false; // no other WAN to copy to
 			if (bestOther <= 0) // nothing measured anywhere (right after a start): a part 2 s old is copied
-				return age > 2000;
+				return !IsLastResort(best) && age > 2000; // (not to a last-resort WAN: that takes late parts only, see below)
 			// Late by its own WAN's pace: three times what that WAN, at its measured speed, should have needed for it
 			// and for the bytes that were ahead of it there when it was handed out. That is a WAN going bad (or dying
 			// unnoticed), whatever the other WAN's speed: the part is copied without waiting out the stall timeout.
 			// Kept narrow, because it trusts that estimate, which can read too high (see below):
 			// - an upload part only: a download's wait may be Telegram fetching the file, not the WAN;
-			// - one part a second per WAN while that WAN still answers: the copy of its oldest part lowers an estimate
-			//   that read too high (RecordSlowTransfer), and the parts behind are then judged by the lower one. (Any
-			//   late part may be the one, not only the oldest: a part that cannot be judged late, one re-sent elsewhere
-			//   say, must not keep those behind it from being rescued.) Once the part's path has brought nothing in
-			//   for a second since the first late part, the WAN is not slow but silent: every late part is then copied
-			//   at once, so a file's parts are not rescued one a second.
+			// - one part a second per WAN while that WAN still answers, and such a copy is a guess that leaves the
+			//   WAN's estimate alone (see AfterStallCopy). (Any late part may be the one, not only the oldest: a part
+			//   that cannot be judged late, one re-sent elsewhere say, must not keep those behind it from being
+			//   rescued.) Once the part's path has brought nothing in for a second since the first late part, the WAN
+			//   is not slow but silent: every late part is then copied at once, so a file's parts are not rescued one
+			//   a second, and those copies do lower the WAN's estimate.
 			bool late = false;
-			if (dir == TransferUp && ownBps > 0 && rpc.lease is TransferLease lease && lease.Wan == Wan(WanKey(own))
+			// - never before a part of its size could well be answered on a connection that had been idle (it opens up
+			//   over several round trips): 750 ms, and 750 ms more for each 512 KB.
+			bool silentWan = false;
+			if (LatePartCopies && dir == TransferUp && ownBps > 0 && rpc.lease is TransferLease lease && lease.Wan == Wan(WanKey(own))
+				&& age >= 750 + rpc.transferBytes * 750L / (512 * 1024)
 				&& age > 3 * ((lease.AheadBytes + rpc.transferBytes) * 1000.0 / ownBps))
 			{
 				long lastRecv = Volatile.Read(ref own.LastRecvTicks);
@@ -416,6 +421,7 @@ namespace WTelegram
 							w.LateSinceTicks[dir] = now;
 						w.LastLateCopyTicks[dir] = now;
 						late = true;
+						silentWan = silentRun;
 					}
 				}
 			}
@@ -424,7 +430,13 @@ namespace WTelegram
 			// with no load, it would take a copy of nearly every part of a pipelined upload, and each copy would lower
 			// its own WAN's estimate.)
 			if (late || (IsLastResort(best) && MeasuredBps(best, dir) <= 0))
+			{
+				// A paced copy is a guess, and no evidence of its WAN's speed (see AfterStallCopy). One made because the
+				// WAN has gone silent is: its estimate is lowered, so the scheduler stops giving that WAN new parts.
+				rpc.lateByPace = late && !silentWan;
+				rpc.lateSilent = late && silentWan;
 				return late;
+			}
 			if (ownBps > 0 && ownBps >= bestOther * RescueRatio)
 				return false;
 			// By age alone, against what the fast WAN would need (with what it has in flight). Not against its own WAN's
@@ -564,17 +576,20 @@ namespace WTelegram
 				var ownWan = own != null ? Wan(WanKey(own)) : null;
 				double ownBps = ownWan?.Bps[dir] ?? 0;
 				(TransportPath Path, double Bps, int InFlight) best = (null, -1, 0);
-				foreach (var p in paths)
-				{
-					var w = Wan(WanKey(p));
-					if (p == own || w == ownWan || w.FloodUntilTicks[dir] > now)
-						continue;
-					bool measured = w.Bps[dir] > 0;
-					double bps = measured ? LiveBps(w, dir, now, w.Bps[dir]) : ownBps * 2;
-					if (best.Path == null || bps > best.Bps || (bps == best.Bps
-						&& Volatile.Read(ref p.LatencyEwmaMs) < Volatile.Read(ref best.Path.LatencyEwmaMs)))
-						best = (p, bps, measured ? w.InFlight[dir] : 0); // an assumed speed has no load to go with it
-				}
+				// A last-resort WAN among them (the others being slow, not gone) is a target only if no other is: never
+				// measured, it would be assumed fast and win over a WAN that works.
+				for (int pass = 0; pass < 2 && best.Path == null; pass++)
+					foreach (var p in paths)
+					{
+						var w = Wan(WanKey(p));
+						if (p == own || w == ownWan || w.FloodUntilTicks[dir] > now || IsLastResort(p) != (pass == 1))
+							continue;
+						bool measured = w.Bps[dir] > 0;
+						double bps = measured ? LiveBps(w, dir, now, w.Bps[dir]) : ownBps * 2;
+						if (best.Path == null || bps > best.Bps || (bps == best.Bps
+							&& Volatile.Read(ref p.LatencyEwmaMs) < Volatile.Read(ref best.Path.LatencyEwmaMs)))
+							best = (p, bps, measured ? w.InFlight[dir] : 0); // an assumed speed has no load to go with it
+					}
 				return (best.Path, Math.Max(0, best.Bps), best.InFlight, ownBps);
 			}
 		}

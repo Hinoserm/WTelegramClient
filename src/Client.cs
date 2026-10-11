@@ -328,6 +328,9 @@ namespace WTelegram
 		/// already has a working path: past this, the path is left to its reconnect loop (which waits
 		/// <see cref="PathConnectTimeout"/>) in the background.</summary>
 		public int PathFirstConnectTimeout { get; set; } = 2;
+		/// <summary>Throughput mode: an upload part late by its own WAN's pace is copied to another WAN without waiting
+		/// out the stall timeout (see TransferCopyDue). False: such a part waits for the stall timeout, as before.</summary>
+		public bool LatePartCopies { get; set; } = true;
 		/// <summary>New-msg_id retries one Invoke makes after its request could not run (ReactorError results) before failing</summary>
 		private const int MaxReactorRetries = 50;
 		/// <summary>Maximum backoff delay in seconds between reconnect attempts (both per-path and full reconnect).</summary>
@@ -392,7 +395,9 @@ namespace WTelegram
 		private static readonly TimeSpan SendLockWait = TimeSpan.FromSeconds(5);
 		private long _lastReactorReconnectTicks = -60_000; // single-path/all-dead reconnect: only repeats back off
 		// counters for the once-a-minute copy summary (LogCopyStats)
-		private long _statHedged, _statStalled, _statRescued, _statDupAnswers, _statDupFrames, _lastCopyStatsTicks;
+		private long _statHedged, _statStalled, _statLate, _statRescued, _statDupAnswers, _statDupFrames, _lastCopyStatsTicks;
+		// why a file part was copied by the late-part rule (the reason given to SendCopyAsync, and counted by it)
+		private const string LatePartReason = "Late part", SilentWanReason = "Silent WAN";
 
 		public Client(int apiID, string apiHash, string sessionPathname = null, IEnumerable<string> localAddresses = null)
 			: this(what => what switch
@@ -449,6 +454,7 @@ namespace WTelegram
 			PathDisconnectDelay = cloneOf.PathDisconnectDelay;
 			PathConnectTimeout = cloneOf.PathConnectTimeout;
 			PathFirstConnectTimeout = cloneOf.PathFirstConnectTimeout;
+			LatePartCopies = cloneOf.LatePartCopies;
 			PathReconnectMaxBackoff = cloneOf.PathReconnectMaxBackoff;
 			PathFlapWindow = cloneOf.PathFlapWindow;
 			PathFlapMaxBackoff = cloneOf.PathFlapMaxBackoff;
@@ -1117,6 +1123,8 @@ namespace WTelegram
 		/// <returns>What to say of a change (to be logged outside the lock); null if nothing changed</returns>
 		private string NoteLastResortLocked(bool barred)
 		{
+			if (LastResortAddresses.Count == 0)
+				return null; // no path is one: nothing to record (and nothing to look through on every send)
 			if (_paths.Count == 0)
 				return null; // between connections: nothing is in use or out of it
 			int inUse = !barred && _paths.Any(p => p.IsAlive && IsLastResort(p)) ? 1 : 0;
@@ -1546,6 +1554,8 @@ namespace WTelegram
 				Interlocked.Increment(ref _statRescued);
 			else if (reason == "Hedge")
 				Interlocked.Increment(ref _statHedged);
+			else if (reason == LatePartReason || reason == SilentWanReason)
+				Interlocked.Increment(ref _statLate);
 			else
 				Interlocked.Increment(ref _statStalled);
 			Helpers.Log(sole ? 2 : 1, $"{_dcSession?.DcID}>{reason}: copied #{(short)rpc.msgId.GetHashCode():X4} {rpc.query?.GetType().Name.TrimEnd('_')} to P{path.PathIndex}{(avoidIndex >= 0 ? $" (was P{avoidIndex})" : "")}");
@@ -1891,14 +1901,21 @@ namespace WTelegram
 			{
 				bool timedOut = rpc.writtenTicks > 0 && now - rpc.writtenTicks > stallMs + Volatile.Read(ref rpc.stallExtraMs);
 				// what a copy says about the original's path counts once the copy is written, not when queued
-				await SendCopyAsync(rpc, rpc.sentPathIndex, timedOut ? $"Stalled >{PathRpcStallTimeout}s" : "Slow WAN", sole: false,
+				string reason = timedOut ? $"Stalled >{PathRpcStallTimeout}s" : rpc.lateByPace ? LatePartReason : rpc.lateSilent ? SilentWanReason : "Slow WAN";
+				await SendCopyAsync(rpc, rpc.sentPathIndex, reason, sole: false,
 					afterWritten: () => AfterStallCopy(rpc, timedOut, probe), onlyIfUnhedged: true, avoidIsHealthy: !timedOut);
 			}
 		}
 
 		private void AfterStallCopy(Rpc rpc, bool timedOut, bool probe)
 		{
-			RecordSlowTransfer(rpc); // a file part: its WAN's speed so far is a sample (no answer will be one)
+			// a file part: its WAN's speed so far is a sample (no answer will be one). Not for a part copied only
+			// because it was late by its WAN's own pace while that WAN still answered: that rule is quick to act and
+			// sometimes wrong about a WAN that is fine (a first part on a cold connection), and its guess must not
+			// lower the WAN's estimate. A WAN that really slowed down shows it in the answers of its other parts; one
+			// that went silent has its late parts copied as such (not lateByPace), and they do count here.
+			if (timedOut || !rpc.lateByPace)
+				RecordSlowTransfer(rpc);
 			if (!timedOut)
 				return; // a slow WAN for file parts: its latency (what the penalty steers) is fine
 			lock (_pathsLock)
@@ -1921,9 +1938,9 @@ namespace WTelegram
 			_lastCopyStatsTicks = now;
 			long hedged = Interlocked.Exchange(ref _statHedged, 0), stalled = Interlocked.Exchange(ref _statStalled, 0);
 			long rescued = Interlocked.Exchange(ref _statRescued, 0), dupAnswers = Interlocked.Exchange(ref _statDupAnswers, 0);
-			long dupFrames = Interlocked.Exchange(ref _statDupFrames, 0);
-			if (hedged + stalled + rescued + dupAnswers + dupFrames > 0)
-				Helpers.Log(2, $"{_dcSession?.DcID}>Copies in the last minute: {hedged} hedged, {stalled} after a stall, {rescued} re-sent after a path loss; duplicates dropped: {dupAnswers} answers, {dupFrames} frames");
+			long dupFrames = Interlocked.Exchange(ref _statDupFrames, 0), late = Interlocked.Exchange(ref _statLate, 0);
+			if (hedged + stalled + late + rescued + dupAnswers + dupFrames > 0)
+				Helpers.Log(2, $"{_dcSession?.DcID}>Copies in the last minute: {hedged} hedged, {stalled} after a stall, {late} of late file parts, {rescued} re-sent after a path loss; duplicates dropped: {dupAnswers} answers, {dupFrames} frames");
 		}
 
 		private long _lastCopyPruneTicks;
@@ -2116,7 +2133,9 @@ namespace WTelegram
 			// Telegram pushes a session's updates down one of its connections. If that was this one, and it died
 			// without a FIN (an uplink that went dark), the server keeps pushing into it: every request still works
 			// on the other path and no update ever arrives again.
-			if (IsMainDC)
+			// (not for a path that never had a connection, only a first attempt that ran out of time while its client
+			// was being connected: Telegram never sent anything down it)
+			if (IsMainDC && Interlocked.Read(ref path.Generation) != 0)
 				_ = ResubscribeUpdatesAsync($"P{path.PathIndex} down", attempts: 5, logLevel: 2);
 
 			try
@@ -3136,6 +3155,9 @@ namespace WTelegram
 			internal TransferLease lease;
 			internal int transferDir = -1; // TransferUp / TransferDown; -1 = not a file part
 			internal int transferBytes; // part size (upload), or the requested limit (download)
+			// its copy was called for by TransferCopyDue's late-part rule: while its WAN still answered (lateByPace), or
+			// because its WAN had gone silent (lateSilent). Set and read by the stall watcher.
+			internal bool lateByPace, lateSilent;
 			internal long stallExtraMs; // added to PathRpcStallTimeout: the time its path is expected to need
 			internal long queuedTicks; // when its frame was queued on a path (it may wait there behind slow writes)
 			internal int hedgeStarted; // 1 once HedgeIfWanted sent (or is sending) its copy
