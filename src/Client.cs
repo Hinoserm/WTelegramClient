@@ -1091,7 +1091,7 @@ namespace WTelegram
 				if (exceptIndex < 0) // (judged with a path left out, it says nothing of the client as a whole)
 					note = NoteLastResortLocked(barred);
 				bool skipDown = SkipDownLocked(barred, parentScores, exceptIndex, needStream: true);
-				usable =_paths.Where(p => p.NetworkStream != null && OpenPath(p, barred, skipDown, parentScores)).ToArray();
+				usable = _paths.Where(p => p.NetworkStream != null && OpenPath(p, barred, skipDown, parentScores)).ToArray();
 			}
 			if (note != null)
 				Helpers.Log(3, note);
