@@ -62,7 +62,7 @@ namespace WTelegram
 			internal Rpc CopyOwner; // the attempt (request) whose copy that is
 			internal int Attempts; // attempts (requests) made for this part so far: Rpc.transferAttempt
 			internal long QueuedTicks; // when its part's current attempt was queued on a path (0: not yet); Volatile
-			internal int Ahead; // parts its WAN already had in flight in its direction when it was handed out
+			internal long AheadBytes; // bytes of the parts its WAN already had in flight in its direction when it was handed out
 		}
 
 		/// <summary>Per WAN (local address), per direction: measured speed, parts in flight, FLOOD_WAIT state.
@@ -170,9 +170,12 @@ namespace WTelegram
 								}
 							if (best.Wan.InFlight[dir] < Cap(best.Wan, dir, now))
 							{
-								int ahead = best.Wan.InFlight[dir]++;
+								best.Wan.InFlight[dir]++;
+								long aheadBytes = 0;
+								foreach (var earlier in best.Wan.Active[dir])
+									aheadBytes += earlier.Bytes;
 								var lease = new TransferLease { Client = client, PathIndex = best.Path.PathIndex, Dir = dir, Wan = best.Wan,
-									StallExtraMs = (long)Math.Min(2 * bestEta, 120_000), StartTicks = now, Bytes = bytes, Ahead = ahead };
+									StallExtraMs = (long)Math.Min(2 * bestEta, 120_000), StartTicks = now, Bytes = bytes, AheadBytes = aheadBytes };
 								best.Wan.Active[dir].Add(lease);
 								return lease;
 							}
@@ -345,10 +348,10 @@ namespace WTelegram
 		/// in flight): it gets a copy there (see CopyStalledRpcsAsync), so a slow WAN never holds up the end of a file.
 		/// The other WANs are ranked by <see cref="BestCopyTarget"/> (one not measured yet counts as twice this part's
 		/// WAN, if that one is measured). With another live WAN but nothing measured on either, a part 2 s old is
-		/// copied; with no other WAN, never. Whatever the other WAN's speed, a part late by its own WAN's pace (three
-		/// times what it and the parts ahead of it there should have needed) is copied too: its WAN is going bad. A
-		/// last-resort WAN is another WAN only when the part's own is the one usable path left, and, never measured,
-		/// takes a copy only of such a late part.</summary>
+		/// copied; with no other WAN, never. Whatever the other WAN's speed, an upload part late by its own WAN's pace
+		/// (three times what it and the bytes ahead of it there should have needed; the WAN's oldest part, on its first
+		/// attempt) is copied too: its WAN is going bad. A last-resort WAN is another WAN only when the part's own is
+		/// the one usable path left, and, never measured, takes a copy only of such a late part.</summary>
 		private bool TransferCopyDue(Rpc rpc, long now)
 		{
 			if (rpc.transferDir < 0 || rpc.transferBytes <= 0)
@@ -372,10 +375,21 @@ namespace WTelegram
 			if (bestOther <= 0) // nothing measured anywhere (right after a start): a part 2 s old is copied
 				return age > 2000;
 			// Late by its own WAN's pace: three times what that WAN, at its measured speed, should have needed for it
-			// and for the parts that were ahead of it there when it was handed out. That is a WAN going bad (or dying
+			// and for the bytes that were ahead of it there when it was handed out. That is a WAN going bad (or dying
 			// unnoticed), whatever the other WAN's speed: the part is copied without waiting out the stall timeout.
-			bool late = ownBps > 0 && rpc.lease is TransferLease lease && lease.Wan == Wan(WanKey(own))
-				&& age > 3 * ((lease.Ahead + 1) * rpc.transferBytes * 1000.0 / ownBps);
+			// Kept narrow, because it trusts that estimate, which can read too high (see below):
+			// - an upload part only: a download's wait may be Telegram fetching the file, not the WAN;
+			// - on its first attempt: a retry is queued behind parts its lease knows nothing of;
+			// - the WAN's oldest part in flight only, so one part at a time: each such copy lowers an estimate that
+			//   read too high (RecordSlowTransfer), before the parts behind it are judged by it.
+			bool late = false;
+			if (dir == TransferUp && ownBps > 0 && rpc.transferAttempt <= 1 && rpc.lease is TransferLease lease
+				&& lease.Wan == Wan(WanKey(own))
+				&& age > 3 * ((lease.AheadBytes + rpc.transferBytes) * 1000.0 / ownBps))
+			{
+				lock (RootClient._transferLock)
+					late = OldestQueued(lease.Wan, dir, out _) == lease;
+			}
 			// To a last-resort WAN that was never measured (it is given no parts to be measured by, and an upload
 			// part's copy gives no sample), that is the only reason: no speed is assumed for it. (Assumed twice as fast,
 			// with no load, it would take a copy of nearly every part of a pipelined upload, and each copy would lower
