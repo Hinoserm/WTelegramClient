@@ -1078,9 +1078,9 @@ namespace WTelegram
 
 		/// <summary>The alive paths (with a connection) that may be given something to carry now: all of them, less the
 		/// last-resort ones while they are kept out (see <see cref="LastResortBarredLocked"/>).</summary>
-		/// <param name="exceptIndex">A path left out of the judging of the last resort (a request is stuck on it)</param>
-		/// <param name="avoidIndex">A path the caller will not choose (it may still be in the result)</param>
-		private TransportPath[] UsablePaths(int exceptIndex = -1, int avoidIndex = -1)
+		/// <param name="exceptIndex">A path a request is stuck on: left out of the judging of the last resort, and not
+		/// counted as a path left when passing over those on a WAN that is down (it may still be in the result)</param>
+		private TransportPath[] UsablePaths(int exceptIndex = -1)
 		{
 			var parentScores = ParentScores();
 			TransportPath[] usable;
@@ -1090,8 +1090,8 @@ namespace WTelegram
 				bool barred = LastResortBarredLocked(parentScores, exceptIndex);
 				if (exceptIndex < 0) // (judged with a path left out, it says nothing of the client as a whole)
 					note = NoteLastResortLocked(barred);
-				bool skipDown = SkipDownLocked(barred, parentScores, avoidIndex, needStream: true);
-				usable = _paths.Where(p => p.NetworkStream != null && OpenPath(p, barred, skipDown, parentScores)).ToArray();
+				bool skipDown = SkipDownLocked(barred, parentScores, exceptIndex, needStream: true);
+				usable =_paths.Where(p => p.NetworkStream != null && OpenPath(p, barred, skipDown, parentScores)).ToArray();
 			}
 			if (note != null)
 				Helpers.Log(3, note);
@@ -1115,7 +1115,7 @@ namespace WTelegram
 				return $"{_dcSession?.DcID}>No other path is usable: the last-resort path(s) are in use";
 			return barred
 				? $"{_dcSession?.DcID}>A path is usable again: the last-resort path(s) are no longer used"
-				: $"{_dcSession?.DcID}>The last-resort path(s) are down as well: no path is usable";
+				: $"{_dcSession?.DcID}>The last-resort path(s) went down while in use";
 		}
 
 		private TransportPath GetPrimaryAlivePath()
@@ -1286,7 +1286,8 @@ namespace WTelegram
 			lock (_pathsLock)
 			{
 				bool barred = LastResortBarredLocked(parentScores, avoidIsHealthy ? -1 : avoidIndex);
-				bool skipDown = SkipDownLocked(barred, parentScores, avoidIndex, needStream: true);
+				// (a healthy avoided path is a path left: with it there, nothing goes to a WAN that is down)
+				bool skipDown = SkipDownLocked(barred, parentScores, avoidIsHealthy ? -1 : avoidIndex, needStream: true);
 				TransportPath best = null;
 				long bestScore = 0;
 				foreach (var p in _paths)
