@@ -50,6 +50,8 @@ namespace WTelegram
 		public int PathIndex { get; init; }
 		/// <summary>Local endpoint this path is bound to (null for legacy single-path).</summary>
 		public IPEndPoint LocalEndPoint { get; init; }
+		/// <summary>True if this path's local address is one of <see cref="Client.LastResortAddresses"/>.</summary>
+		public bool IsLastResort { get; init; }
 		/// <summary>True if this path currently has an active connection.</summary>
 		public bool IsAlive { get; init; }
 		/// <summary>True if a reconnect is currently in progress for this path.</summary>
@@ -163,6 +165,7 @@ namespace WTelegram
 					IsMediaDc = isMedia,
 					PathIndex = p.PathIndex,
 					LocalEndPoint = p.LocalEndPoint,
+					IsLastResort = IsLastResort(p),
 					IsAlive = p.IsAlive,
 					IsReconnecting = Volatile.Read(ref p._reconnecting) != 0,
 					LatencyEwmaMs = p.LatencyEwmaMs == long.MaxValue ? -1 : Volatile.Read(ref p.LatencyEwmaMs),
@@ -212,6 +215,7 @@ namespace WTelegram
 				IsMediaDc = _dcSession?.DataCenter?.flags.HasFlag(DcOption.Flags.media_only) ?? false,
 				PathIndex = path.PathIndex,
 				LocalEndPoint = path.LocalEndPoint,
+				IsLastResort = IsLastResort(path),
 				IsAlive = path.IsAlive,
 				IsReconnecting = Volatile.Read(ref path._reconnecting) != 0,
 				LatencyEwmaMs = path.LatencyEwmaMs == long.MaxValue ? -1 : Volatile.Read(ref path.LatencyEwmaMs),
@@ -333,6 +337,15 @@ namespace WTelegram
 		public int PathRpcStallTimeout { get; set; } = 3;
 		/// <summary>Controls how send traffic is distributed across alive paths. Default: LowestLatency (use path with lowest measured RTT).</summary>
 		public PathSendMode SendMode { get; set; } = PathSendMode.LowestLatency;
+		/// <summary>Local addresses (each also in <see cref="LocalEndPoints"/>) whose paths are a last resort: connected and
+		/// probed like any other, but given nothing to carry (no request, no copy of one, no file part, no speed
+		/// measurement) while a path on another address is usable (see <see cref="LastResortSlowMs"/>). With none usable
+		/// they are paths like the others, until one is again. Set before connecting.</summary>
+		public HashSet<IPAddress> LastResortAddresses { get; set; } = new();
+		/// <summary>A path that is not a last resort counts as usable while it is alive and its latency plus penalty
+		/// (what <see cref="PathSendMode.LowestLatency"/> ranks by; not measured yet counts as usable) is under this many
+		/// milliseconds. 0: while it is alive, however slow.</summary>
+		public int LastResortSlowMs { get; set; } = 2000;
 		/// <summary>Main client with several paths: send every request on the best path AND a copy on the next
 		/// best one (same msg_id, in a container), so a slow or dead path never makes the caller wait.
 		/// The server executes a msg_id once. File parts are only copied once they stall.</summary>
@@ -429,6 +442,8 @@ namespace WTelegram
 			PathFlapMaxBackoff = cloneOf.PathFlapMaxBackoff;
 			PathRpcStallTimeout = cloneOf.PathRpcStallTimeout;
 			SendMode = cloneOf.SendMode;
+			LastResortAddresses = new HashSet<IPAddress>(cloneOf.LastResortAddresses);
+			LastResortSlowMs = cloneOf.LastResortSlowMs;
 			TransferMode = cloneOf.TransferMode;
 			TransferPartsPerPath = cloneOf.TransferPartsPerPath;
 			TransferProbeInterval = cloneOf.TransferProbeInterval;
@@ -960,26 +975,113 @@ namespace WTelegram
 				return _paths.FirstOrDefault(p => p.PathIndex == pathIndex && p.IsAlive && p.NetworkStream != null);
 		}
 
+		private bool IsLastResort(TransportPath path)
+			=> LastResortAddresses.Count > 0 && path.LocalEndPoint != null && LastResortAddresses.Contains(path.LocalEndPoint.Address);
+
+		/// <summary>A media-DC (child) client's paths are not probed: the main client's latency and penalty, by local
+		/// address, stand in for theirs. Null on the main client, or when nothing here would read them. Call it BEFORE
+		/// taking our own _pathsLock (child._pathsLock → parent._pathsLock would invert the lock order).</summary>
+		private Dictionary<IPAddress, (long Latency, long Penalty)> ParentScores()
+		{
+			if (_parentClient == null)
+				return null;
+			if (SendMode != PathSendMode.LowestLatency && (LastResortAddresses.Count == 0 || LastResortSlowMs <= 0))
+				return null;
+			var scores = new Dictionary<IPAddress, (long Latency, long Penalty)>();
+			lock (_parentClient._pathsLock)
+			{
+				foreach (var p in _parentClient._paths)
+					if (p.IsAlive && p.LocalEndPoint != null)
+						scores[p.LocalEndPoint.Address] = (Volatile.Read(ref p.LatencyEwmaMs), Volatile.Read(ref p.PenaltyMs));
+			}
+			return scores;
+		}
+
+		/// <summary>A path's latency and penalty, the main client's standing in for a child's unmeasured latency (and
+		/// the worse of the two penalties, then).</summary>
+		private static (long Latency, long Penalty) ScoreParts(TransportPath path, Dictionary<IPAddress, (long Latency, long Penalty)> parentScores)
+		{
+			long lat = Volatile.Read(ref path.LatencyEwmaMs);
+			long penalty = Volatile.Read(ref path.PenaltyMs);
+			if (lat == long.MaxValue && parentScores != null && path.LocalEndPoint != null
+				&& parentScores.TryGetValue(path.LocalEndPoint.Address, out var parentData))
+			{
+				lat = parentData.Latency;
+				if (penalty < parentData.Penalty)
+					penalty = parentData.Penalty;
+			}
+			return (lat, penalty);
+		}
+
+		/// <summary>Whether the last-resort paths are kept out of use: true while some path that is not one is usable
+		/// (alive, and under <see cref="LastResortSlowMs"/> if that is set). <paramref name="exceptIndex"/>: a path left
+		/// out of the judging (the one a request is stuck on says nothing for itself). Caller holds _pathsLock.</summary>
+		private bool LastResortBarredLocked(Dictionary<IPAddress, (long Latency, long Penalty)> parentScores, int exceptIndex = -1)
+		{
+			if (LastResortAddresses.Count == 0)
+				return false; // no path is one
+			foreach (var p in _paths)
+			{
+				if (!p.IsAlive || p.PathIndex == exceptIndex || IsLastResort(p))
+					continue;
+				if (LastResortSlowMs <= 0)
+					return true;
+				var (lat, penalty) = ScoreParts(p, parentScores);
+				if (lat == long.MaxValue || lat + penalty < LastResortSlowMs)
+					return true;
+			}
+			return false;
+		}
+
+		/// <summary>The alive paths (with a connection) that may be given something to carry now: all of them, less the
+		/// last-resort ones while they are kept out (see <see cref="LastResortBarredLocked"/>).</summary>
+		private TransportPath[] UsablePaths(int exceptIndex = -1)
+		{
+			var parentScores = ParentScores();
+			lock (_pathsLock)
+			{
+				bool barred = LastResortBarredLocked(parentScores, exceptIndex);
+				return _paths.Where(p => p.IsAlive && p.NetworkStream != null && !(barred && IsLastResort(p))).ToArray();
+			}
+		}
+
+		private int _lastResortInUse; // 1 while the last-resort paths are open to requests (for the log line on a change)
+
+		/// <summary>Says once, on each change, that the last-resort paths came into use or went out of it.</summary>
+		private void NoteLastResort(bool barred)
+		{
+			if (LastResortAddresses.Count == 0)
+				return;
+			int inUse = barred ? 0 : 1;
+			if (Interlocked.Exchange(ref _lastResortInUse, inUse) == inUse)
+				return;
+			Helpers.Log(3, inUse == 1
+				? $"{_dcSession?.DcID}>No other path is usable: the last-resort path(s) are in use"
+				: $"{_dcSession?.DcID}>A path is usable again: the last-resort path(s) are no longer used");
+		}
+
 		private TransportPath GetPrimaryAlivePath()
 		{
-			// Pre-snapshot parent latency AND penalty by local address BEFORE acquiring our
-			// own lock to avoid lock-ordering inversion (child._pathsLock → parent._pathsLock).
-			Dictionary<System.Net.IPAddress, (long Latency, long Penalty)> parentLatencyByAddr = null;
-			if (_parentClient != null && SendMode == PathSendMode.LowestLatency)
-			{
-				parentLatencyByAddr = new();
-				lock (_parentClient._pathsLock)
-				{
-					foreach (var p in _parentClient._paths)
-						if (p.IsAlive && p.LocalEndPoint != null)
-							parentLatencyByAddr[p.LocalEndPoint.Address] = (Volatile.Read(ref p.LatencyEwmaMs), Volatile.Read(ref p.PenaltyMs));
-				}
-			}
-
+			var parentLatencyByAddr = ParentScores(); // before our own lock (see there)
+			bool barred;
+			TransportPath picked;
 			lock (_pathsLock)
 			{
 				if (_paths.Count == 0)
 					return null;
+				barred = LastResortBarredLocked(parentLatencyByAddr);
+				picked = PickPrimaryLocked(parentLatencyByAddr, barred);
+			}
+			NoteLastResort(barred);
+			return picked;
+		}
+
+		/// <summary>The path <see cref="SendMode"/> picks among those open to it (<paramref name="barred"/>: not the
+		/// last-resort ones). Caller holds _pathsLock, with at least one path.</summary>
+		private TransportPath PickPrimaryLocked(Dictionary<IPAddress, (long Latency, long Penalty)> parentLatencyByAddr, bool barred)
+		{
+			bool Open(TransportPath p) => p.IsAlive && !(barred && IsLastResort(p));
+			{
 				int count = _paths.Count;
 
 				switch (SendMode)
@@ -996,7 +1098,7 @@ namespace WTelegram
 								var targetAddr = orderedEPs[ep].Address;
 								for (int i = 0; i < count; i++)
 								{
-									if (_paths[i].LocalEndPoint?.Address?.Equals(targetAddr) == true && _paths[i].IsAlive)
+									if (_paths[i].LocalEndPoint?.Address?.Equals(targetAddr) == true && Open(_paths[i]))
 									{
 										_primaryPathIndex = i;
 										return _paths[i];
@@ -1004,7 +1106,7 @@ namespace WTelegram
 								}
 							}
 						}
-						else if (_paths[0].IsAlive)
+						else if (Open(_paths[0]))
 						{
 							_primaryPathIndex = 0;
 							return _paths[0];
@@ -1012,7 +1114,7 @@ namespace WTelegram
 						// No configured endpoint alive — fallback to any alive path
 						for (int i = 0; i < count; i++)
 						{
-							if (_paths[i].IsAlive)
+							if (Open(_paths[i]))
 							{
 								_primaryPathIndex = i;
 								return _paths[i];
@@ -1022,13 +1124,13 @@ namespace WTelegram
 
 					case PathSendMode.StickyFailover:
 						// Stay on current path if alive
-						if (_primaryPathIndex < count && _paths[_primaryPathIndex].IsAlive)
+						if (_primaryPathIndex < count && Open(_paths[_primaryPathIndex]))
 							return _paths[_primaryPathIndex];
 						// Current path dead — find next alive one
 						for (int i = 1; i < count; i++)
 						{
 							int idx = (_primaryPathIndex + i) % count;
-							if (_paths[idx].IsAlive)
+							if (Open(_paths[idx]))
 							{
 								_primaryPathIndex = idx;
 								return _paths[idx];
@@ -1049,19 +1151,9 @@ namespace WTelegram
 					long bestScore = long.MaxValue;
 					for (int i = 0; i < count; i++)
 					{
-						if (!_paths[i].IsAlive)
-						continue;
-						long lat = Volatile.Read(ref _paths[i].LatencyEwmaMs);
-						long penalty = Volatile.Read(ref _paths[i].PenaltyMs);
-						if (lat == long.MaxValue && parentLatencyByAddr != null
-							&& _paths[i].LocalEndPoint != null
-							&& parentLatencyByAddr.TryGetValue(_paths[i].LocalEndPoint.Address, out var parentData))
-						{
-							lat = parentData.Latency;
-							// Use the worse of local vs parent penalty
-							if (penalty < parentData.Penalty)
-								penalty = parentData.Penalty;
-						}
+						if (!Open(_paths[i]))
+							continue;
+						var (lat, penalty) = ScoreParts(_paths[i], parentLatencyByAddr);
 						long score = (lat == long.MaxValue) ? long.MaxValue : lat + penalty;
 						if (bestPath == null || score < bestScore)
 						{
@@ -1079,7 +1171,7 @@ namespace WTelegram
 						for (int i = 0; i < count; i++)
 						{
 							int idx = (start + i) % count;
-							if (_paths[idx].IsAlive)
+							if (Open(_paths[idx]))
 							{
 								_primaryPathIndex = idx;
 								return _paths[idx];
@@ -1104,15 +1196,20 @@ namespace WTelegram
 		}
 
 		/// <summary>Best alive path other than <paramref name="avoidIndex"/>: lowest latency + penalty, unmeasured paths last.</summary>
-		private TransportPath PickOtherAlivePath(int avoidIndex)
+		/// <param name="avoidIsHealthy">The avoided path is avoided only because it already carries the request (a hedge, a
+		/// file part on a slower WAN), not because it failed to: it counts when judging whether a last-resort path may be
+		/// used. Otherwise it is left out of that judging, so a request stuck on the only other path does get its copy.</param>
+		private TransportPath PickOtherAlivePath(int avoidIndex, bool avoidIsHealthy = false)
 		{
+			var parentScores = ParentScores(); // before our own lock (see there)
 			lock (_pathsLock)
 			{
+				bool barred = LastResortBarredLocked(parentScores, avoidIsHealthy ? -1 : avoidIndex);
 				TransportPath best = null;
 				long bestScore = 0;
 				foreach (var p in _paths)
 				{
-					if (!p.IsAlive || p.PathIndex == avoidIndex || p.NetworkStream == null)
+					if (!p.IsAlive || p.PathIndex == avoidIndex || p.NetworkStream == null || (barred && IsLastResort(p)))
 						continue;
 					long lat = Volatile.Read(ref p.LatencyEwmaMs);
 					long score = lat == long.MaxValue ? long.MaxValue : lat + Volatile.Read(ref p.PenaltyMs);
@@ -1138,13 +1235,15 @@ namespace WTelegram
 		/// <param name="afterWritten">Run once the copy is written (not when queued)</param>
 		/// <param name="onlyIfUnhedged">Not if another copy already carries it (judged again under the send semaphore, so two
 		/// such callers never both send one)</param>
-		private async Task<bool> SendCopyAsync(Rpc rpc, int avoidIndex, string reason, bool sole, Action afterWritten = null, bool onlyIfUnhedged = false)
+		/// <param name="avoidIsHealthy">See <see cref="PickOtherAlivePath"/>: the path of <paramref name="avoidIndex"/> has
+		/// not failed the request (a hedge, a file part copied off a slower WAN)</param>
+		private async Task<bool> SendCopyAsync(Rpc rpc, int avoidIndex, string reason, bool sole, Action afterWritten = null, bool onlyIfUnhedged = false, bool avoidIsHealthy = false)
 		{
 			if (rpc.query == null || rpc.msgId == 0 || rpc == _bareRpc)
 				return false;
 			if (Environment.TickCount64 - rpc.sentTicks > CopyMaxAgeMs || Volatile.Read(ref rpc.copies) >= MaxCopies)
 				return false;
-			var path = rpc.transferDir >= 0 ? PickTransferCopyPath(avoidIndex, rpc.transferDir) : PickOtherAlivePath(avoidIndex);
+			var path = rpc.transferDir >= 0 ? PickTransferCopyPath(avoidIndex, rpc.transferDir, avoidIsHealthy) : PickOtherAlivePath(avoidIndex, avoidIsHealthy);
 			if (path == null)
 				return false;
 			PruneCopyState();
@@ -1696,7 +1795,7 @@ namespace WTelegram
 				bool timedOut = rpc.writtenTicks > 0 && now - rpc.writtenTicks > stallMs + Volatile.Read(ref rpc.stallExtraMs);
 				// what a copy says about the original's path counts once the copy is written, not when queued
 				await SendCopyAsync(rpc, rpc.sentPathIndex, timedOut ? $"Stalled >{PathRpcStallTimeout}s" : "Slow WAN", sole: false,
-					afterWritten: () => AfterStallCopy(rpc, timedOut, probe), onlyIfUnhedged: true);
+					afterWritten: () => AfterStallCopy(rpc, timedOut, probe), onlyIfUnhedged: true, avoidIsHealthy: !timedOut);
 			}
 		}
 
@@ -4691,7 +4790,7 @@ namespace WTelegram
 				return;
 			if (Interlocked.Exchange(ref rpc.hedgeStarted, 1) != 0)
 				return; // once (a request in a container passes here twice)
-			_ = SendCopyAsync(rpc, rpc.sentPathIndex, "Hedge", sole: false, onlyIfUnhedged: true);
+			_ = SendCopyAsync(rpc, rpc.sentPathIndex, "Hedge", sole: false, onlyIfUnhedged: true, avoidIsHealthy: true);
 		}
 
 		private async Task SendReceiveHttp(byte[] buffer, int frameLength)

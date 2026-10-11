@@ -108,9 +108,8 @@ namespace WTelegram
 				Task pulse;
 				lock (root._transferLock)
 					pulse = root._transferPulse.Task; // before evaluating: a release after it wakes us up
-				TransportPath[] paths;
-				lock (client._pathsLock)
-					paths = client._paths.Where(p => p.IsAlive && p.NetworkStream != null).ToArray();
+				// (a last-resort WAN takes no part, and is not measured, while another WAN's path is usable)
+				var paths = client.UsablePaths();
 				long now = Environment.TickCount64, waitMs = 250;
 				lock (root._transferLock)
 				{
@@ -354,10 +353,11 @@ namespace WTelegram
 			long age = now - Volatile.Read(ref rpc.queuedTicks);
 			if (age < 750)
 				return false;
-			TransportPath[] paths;
-			lock (_pathsLock)
-				paths = _paths.Where(p => p.IsAlive && p.NetworkStream != null).ToArray();
-			var own = paths.FirstOrDefault(p => p.PathIndex == rpc.sentPathIndex);
+			// The other WANs it may be copied to: not a last-resort one while a path elsewhere is usable, its own included
+			// (a part that is only slower than it could be is no reason to bring the last resort in). Its own path is
+			// looked up apart: it may itself be a last-resort one, now kept out, and its part is then copied off it.
+			var paths = UsablePaths();
+			var own = AlivePathByIndex(rpc.sentPathIndex);
 			if (own == null)
 				return false; // its path is gone: the rescue on path loss deals with it
 			int dir = rpc.transferDir;
@@ -481,12 +481,11 @@ namespace WTelegram
 		/// <summary>For a stalled file part: the live path on the WAN fastest in its direction right now, other than the one
 		/// of <paramref name="avoidIndex"/> (see <see cref="BestCopyTarget"/>: a WAN whose parts are stuck, gone dark and
 		/// not yet detected, is not picked).</summary>
-		private TransportPath PickTransferCopyPath(int avoidIndex, int dir)
+		/// <param name="avoidIsHealthy">See <see cref="PickOtherAlivePath"/></param>
+		private TransportPath PickTransferCopyPath(int avoidIndex, int dir, bool avoidIsHealthy = false)
 		{
-			TransportPath[] paths;
-			lock (_pathsLock)
-				paths = _paths.Where(p => p.IsAlive && p.NetworkStream != null).ToArray();
-			var own = paths.FirstOrDefault(p => p.PathIndex == avoidIndex);
+			var paths = UsablePaths(avoidIsHealthy ? -1 : avoidIndex);
+			var own = AlivePathByIndex(avoidIndex);
 			var best = BestCopyTarget(paths, own, dir, Environment.TickCount64).Path;
 			// none on another WAN (or not under FLOOD_WAIT): any other live path, lowest latency first
 			return best ?? paths.Where(p => p != own).OrderBy(p => Volatile.Read(ref p.LatencyEwmaMs)).FirstOrDefault();
