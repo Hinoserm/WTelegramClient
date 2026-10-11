@@ -108,7 +108,7 @@ namespace WTelegram
 				Task pulse;
 				lock (root._transferLock)
 					pulse = root._transferPulse.Task; // before evaluating: a release after it wakes us up
-				// (a last-resort WAN takes no part, and is not measured, while another WAN's path is usable)
+				// (a last-resort WAN is given no part, and no probe to be measured by, while another WAN's path is usable)
 				var paths = client.UsablePaths();
 				long now = Environment.TickCount64, waitMs = 250;
 				lock (root._transferLock)
@@ -344,7 +344,8 @@ namespace WTelegram
 		/// in flight): it gets a copy there (see CopyStalledRpcsAsync), so a slow WAN never holds up the end of a file.
 		/// The other WANs are ranked by <see cref="BestCopyTarget"/> (one not measured yet counts as twice this part's
 		/// WAN, if that one is measured). With another live WAN but nothing measured on either, a part 2 s old is
-		/// copied; with no other WAN, never.</summary>
+		/// copied; with no other WAN, never. A last-resort WAN is another WAN only when the part's own is the one
+		/// usable path left, and, never measured, takes a copy only of a part well behind its own WAN's pace.</summary>
 		private bool TransferCopyDue(Rpc rpc, long now)
 		{
 			if (rpc.transferDir < 0 || rpc.transferBytes <= 0)
@@ -367,6 +368,18 @@ namespace WTelegram
 				return false; // no other WAN to copy to
 			if (bestOther <= 0) // nothing measured anywhere (right after a start): a part 2 s old is copied
 				return age > 2000;
+			// To a last-resort WAN that was never measured (it is given no parts to be measured by, and an upload
+			// part's copy gives no sample): no speed is assumed for it. The part is copied only when it is well behind
+			// what its own WAN should need for it with what that WAN has in flight, which is a WAN going bad, not one
+			// that could merely be faster. (Assumed twice as fast, with no load, it would take a copy of nearly every
+			// part of a pipelined upload, and each copy would lower its own WAN's estimate.)
+			if (IsLastResort(best) && MeasuredBps(best, dir) <= 0)
+			{
+				int ownInFlight;
+				lock (RootClient._transferLock)
+					ownInFlight = Math.Max(1, Wan(WanKey(own)).InFlight[dir]);
+				return age > 3 * (ownInFlight * rpc.transferBytes * 1000.0 / ownBps);
+			}
 			if (ownBps > 0 && ownBps >= bestOther * RescueRatio)
 				return false;
 			// By age alone, against what the fast WAN would need (with what it has in flight). Not against its own WAN's

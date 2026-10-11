@@ -339,13 +339,14 @@ namespace WTelegram
 		public PathSendMode SendMode { get; set; } = PathSendMode.LowestLatency;
 		/// <summary>Local addresses (each also in <see cref="LocalEndPoints"/>) whose paths are a last resort: connected and
 		/// probed like any other, but given nothing to carry (no request, no copy of one, no file part, no speed
-		/// measurement) while a path on another address is usable (see <see cref="LastResortSlowMs"/>). With none usable
+		/// probe) while a path on another address is usable (see <see cref="LastResortSlowMs"/>). With none usable
 		/// they are paths like the others, until one is again. One exception: the copy of a request (its hedge, or a
 		/// slow file part's copy) goes to a last-resort path when the path carrying the request is the only usable one
 		/// left, so that path dying unnoticed costs no wait for it to be found dead. Set before connecting.</summary>
 		public HashSet<IPAddress> LastResortAddresses { get => _lastResortAddresses; set => _lastResortAddresses = value ?? new(); }
 		private HashSet<IPAddress> _lastResortAddresses = new();
-		/// <summary>True while this client's last-resort paths are open to requests: no other path of it is usable.</summary>
+		/// <summary>True while this client's last-resort paths are open to new requests: no other path of it is usable.
+		/// (Copies of requests go to them earlier, with one usable path left: that is not what this says.)</summary>
 		public bool LastResortInUse => Volatile.Read(ref _lastResortInUse) == 1;
 		/// <summary>A path that is not a last resort counts as usable while it is alive and its latency plus penalty
 		/// (what <see cref="PathSendMode.LowestLatency"/> ranks by; not measured yet counts as usable) is under this many
