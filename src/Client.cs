@@ -999,7 +999,33 @@ namespace WTelegram
 					if (p.IsAlive && p.LocalEndPoint != null)
 						scores[p.LocalEndPoint.Address] = (Volatile.Read(ref p.LatencyEwmaMs), Volatile.Read(ref p.PenaltyMs));
 			}
-			return scores;
+			// The main client with no live path at all (a full reconnect under way) says nothing about any WAN: this
+			// client then judges its paths by itself, as the main client does.
+			return scores.Count > 0 ? scores : null;
+		}
+
+		/// <summary>On a media-DC client with last-resort addresses: the main client, which probes its paths, has no live
+		/// one on this path's address, so the WAN is taken to be down although this (unprobed) path still looks alive.</summary>
+		private bool ParentSaysDown(TransportPath path, Dictionary<IPAddress, (long Latency, long Penalty)> parentScores)
+			=> parentScores != null && LastResortAddresses.Count > 0
+				&& (path.LocalEndPoint == null || !parentScores.ContainsKey(path.LocalEndPoint.Address));
+
+		/// <summary>Whether a path may be given something now: alive, not a last-resort one while those are kept out
+		/// (<paramref name="barred"/>), and not one on a WAN the main client says is down while
+		/// <paramref name="skipDown"/> (see <see cref="SkipDownLocked"/>).</summary>
+		private bool OpenPath(TransportPath path, bool barred, bool skipDown, Dictionary<IPAddress, (long Latency, long Penalty)> parentScores)
+			=> path.IsAlive && !(barred && IsLastResort(path)) && !(skipDown && ParentSaysDown(path, parentScores));
+
+		/// <summary>True if paths on a WAN the main client says is down are to be passed over: when some other path that
+		/// may be used is left. Caller holds _pathsLock.</summary>
+		private bool SkipDownLocked(bool barred, Dictionary<IPAddress, (long Latency, long Penalty)> parentScores)
+		{
+			if (parentScores == null || LastResortAddresses.Count == 0)
+				return false;
+			foreach (var p in _paths)
+				if (OpenPath(p, barred, false, parentScores) && !ParentSaysDown(p, parentScores))
+					return true;
+			return false;
 		}
 
 		/// <summary>A path's latency and penalty, the main client's standing in for a child's unmeasured latency (and
@@ -1032,7 +1058,7 @@ namespace WTelegram
 				// A media-DC client's paths are not probed, and one on a WAN that died silently stays "alive" until
 				// its socket gives up: the main client, which does probe, having no live path on that address says
 				// the WAN is down, and the path here is not usable.
-				if (parentScores != null && (p.LocalEndPoint == null || !parentScores.ContainsKey(p.LocalEndPoint.Address)))
+				if (ParentSaysDown(p, parentScores))
 					continue;
 				if (LastResortSlowMs <= 0)
 					return true;
@@ -1056,7 +1082,8 @@ namespace WTelegram
 				barred = LastResortBarredLocked(parentScores, exceptIndex);
 				if (exceptIndex < 0) // (judged with a path left out, it says nothing of the client as a whole)
 					changed = NoteLastResortLocked(barred);
-				usable = _paths.Where(p => p.IsAlive && p.NetworkStream != null && !(barred && IsLastResort(p))).ToArray();
+				bool skipDown = SkipDownLocked(barred, parentScores);
+				usable = _paths.Where(p => p.NetworkStream != null && OpenPath(p, barred, skipDown, parentScores)).ToArray();
 			}
 			if (changed)
 				LogLastResort(barred);
@@ -1070,7 +1097,9 @@ namespace WTelegram
 		/// <returns>true if that changed: say so with <see cref="LogLastResort"/>, outside the lock</returns>
 		private bool NoteLastResortLocked(bool barred)
 		{
-			int inUse = barred || !_paths.Any(IsLastResort) ? 0 : 1;
+			if (_paths.Count == 0)
+				return false; // between connections: nothing is in use or out of it
+			int inUse = !barred && _paths.Any(p => p.IsAlive && IsLastResort(p)) ? 1 : 0;
 			if (_lastResortInUse == inUse)
 				return false;
 			Volatile.Write(ref _lastResortInUse, inUse);
@@ -1116,7 +1145,8 @@ namespace WTelegram
 		/// last-resort ones). Caller holds _pathsLock, with at least one path.</summary>
 		private TransportPath PickPrimaryLocked(Dictionary<IPAddress, (long Latency, long Penalty)> parentLatencyByAddr, bool barred)
 		{
-			bool Open(TransportPath p) => p.IsAlive && !(barred && IsLastResort(p));
+			bool skipDown = SkipDownLocked(barred, parentLatencyByAddr);
+			bool Open(TransportPath p) => OpenPath(p, barred, skipDown, parentLatencyByAddr);
 			{
 				int count = _paths.Count;
 
@@ -1241,11 +1271,12 @@ namespace WTelegram
 			lock (_pathsLock)
 			{
 				bool barred = LastResortBarredLocked(parentScores, avoidIsHealthy ? -1 : avoidIndex);
+				bool skipDown = SkipDownLocked(barred, parentScores);
 				TransportPath best = null;
 				long bestScore = 0;
 				foreach (var p in _paths)
 				{
-					if (!p.IsAlive || p.PathIndex == avoidIndex || p.NetworkStream == null || (barred && IsLastResort(p)))
+					if (p.PathIndex == avoidIndex || p.NetworkStream == null || !OpenPath(p, barred, skipDown, parentScores))
 						continue;
 					long lat = Volatile.Read(ref p.LatencyEwmaMs);
 					long score = lat == long.MaxValue ? long.MaxValue : lat + Volatile.Read(ref p.PenaltyMs);
