@@ -1940,10 +1940,20 @@ namespace WTelegram
 					if (_parentClient != null)
 					{
 						answering = [];
+						bool parentHasPath = false;
 						lock (_parentClient._pathsLock) // before our own (see ParentScores)
 							foreach (var p in _parentClient._paths)
-								if (p.IsAlive && p.LocalEndPoint != null && now - Volatile.Read(ref p.LastRecvTicks) <= silenceMs)
+							{
+								if (!p.IsAlive)
+									continue;
+								parentHasPath = true;
+								if (p.LocalEndPoint != null && now - Volatile.Read(ref p.LastRecvTicks) <= silenceMs)
 									answering.Add(p.LocalEndPoint.Address);
+							}
+						// (the main client with no live path at all, a full reconnect under way, says nothing about
+						// any WAN: this client's paths are then judged by themselves, as in ParentScores)
+						if (!parentHasPath)
+							answering = null;
 					}
 					bool silent;
 					lock (_pathsLock)
