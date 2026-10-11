@@ -1018,13 +1018,19 @@ namespace WTelegram
 
 		/// <summary>True if paths on a WAN the main client says is down are to be passed over: when some other path that
 		/// may be used is left. Caller holds _pathsLock.</summary>
-		private bool SkipDownLocked(bool barred, Dictionary<IPAddress, (long Latency, long Penalty)> parentScores)
+		/// <param name="avoidIndex">A path the caller will not choose: it is not one "left"</param>
+		/// <param name="needStream">Nor is, then, a path without a connection</param>
+		private bool SkipDownLocked(bool barred, Dictionary<IPAddress, (long Latency, long Penalty)> parentScores, int avoidIndex = -1, bool needStream = false)
 		{
 			if (parentScores == null || LastResortAddresses.Count == 0)
 				return false;
 			foreach (var p in _paths)
+			{
+				if (p.PathIndex == avoidIndex || (needStream && p.NetworkStream == null))
+					continue;
 				if (OpenPath(p, barred, false, parentScores) && !ParentSaysDown(p, parentScores))
 					return true;
+			}
 			return false;
 		}
 
@@ -1072,21 +1078,23 @@ namespace WTelegram
 
 		/// <summary>The alive paths (with a connection) that may be given something to carry now: all of them, less the
 		/// last-resort ones while they are kept out (see <see cref="LastResortBarredLocked"/>).</summary>
-		private TransportPath[] UsablePaths(int exceptIndex = -1)
+		/// <param name="exceptIndex">A path left out of the judging of the last resort (a request is stuck on it)</param>
+		/// <param name="avoidIndex">A path the caller will not choose (it may still be in the result)</param>
+		private TransportPath[] UsablePaths(int exceptIndex = -1, int avoidIndex = -1)
 		{
 			var parentScores = ParentScores();
 			TransportPath[] usable;
-			bool barred, changed = false;
+			string note = null;
 			lock (_pathsLock)
 			{
-				barred = LastResortBarredLocked(parentScores, exceptIndex);
+				bool barred = LastResortBarredLocked(parentScores, exceptIndex);
 				if (exceptIndex < 0) // (judged with a path left out, it says nothing of the client as a whole)
-					changed = NoteLastResortLocked(barred);
-				bool skipDown = SkipDownLocked(barred, parentScores);
+					note = NoteLastResortLocked(barred);
+				bool skipDown = SkipDownLocked(barred, parentScores, avoidIndex, needStream: true);
 				usable = _paths.Where(p => p.NetworkStream != null && OpenPath(p, barred, skipDown, parentScores)).ToArray();
 			}
-			if (changed)
-				LogLastResort(barred);
+			if (note != null)
+				Helpers.Log(3, note);
 			return usable;
 		}
 
@@ -1094,38 +1102,37 @@ namespace WTelegram
 
 		/// <summary>Records whether the last-resort paths are in use, as just judged for the whole client. Caller holds
 		/// _pathsLock (so the record follows the judgings in their order).</summary>
-		/// <returns>true if that changed: say so with <see cref="LogLastResort"/>, outside the lock</returns>
-		private bool NoteLastResortLocked(bool barred)
+		/// <returns>What to say of a change (to be logged outside the lock); null if nothing changed</returns>
+		private string NoteLastResortLocked(bool barred)
 		{
 			if (_paths.Count == 0)
-				return false; // between connections: nothing is in use or out of it
+				return null; // between connections: nothing is in use or out of it
 			int inUse = !barred && _paths.Any(p => p.IsAlive && IsLastResort(p)) ? 1 : 0;
 			if (_lastResortInUse == inUse)
-				return false;
+				return null;
 			Volatile.Write(ref _lastResortInUse, inUse);
-			return true;
-		}
-
-		private void LogLastResort(bool barred)
-			=> Helpers.Log(3, barred
+			if (inUse == 1)
+				return $"{_dcSession?.DcID}>No other path is usable: the last-resort path(s) are in use";
+			return barred
 				? $"{_dcSession?.DcID}>A path is usable again: the last-resort path(s) are no longer used"
-				: $"{_dcSession?.DcID}>No other path is usable: the last-resort path(s) are in use");
+				: $"{_dcSession?.DcID}>The last-resort path(s) are down as well: no path is usable";
+		}
 
 		private TransportPath GetPrimaryAlivePath()
 		{
 			var parentLatencyByAddr = ParentScores(forSendMode: true); // before our own lock (see there)
-			bool barred, changed;
+			string note;
 			TransportPath picked;
 			lock (_pathsLock)
 			{
 				if (_paths.Count == 0)
 					return null;
-				barred = LastResortBarredLocked(parentLatencyByAddr);
-				changed = NoteLastResortLocked(barred);
+				bool barred = LastResortBarredLocked(parentLatencyByAddr);
+				note = NoteLastResortLocked(barred);
 				picked = PickPrimaryLocked(parentLatencyByAddr, barred);
 			}
-			if (changed)
-				LogLastResort(barred);
+			if (note != null)
+				Helpers.Log(3, note);
 			return picked;
 		}
 
@@ -1134,11 +1141,19 @@ namespace WTelegram
 		private TransportPath LeasedPath(int pathIndex)
 		{
 			var path = AlivePathByIndex(pathIndex);
-			if (path == null || !IsLastResort(path))
+			if (path == null || LastResortAddresses.Count == 0)
 				return path;
 			var parentScores = ParentScores(); // before our own lock (see there)
 			lock (_pathsLock)
-				return LastResortBarredLocked(parentScores) ? null : path;
+			{
+				bool barred = LastResortBarredLocked(parentScores);
+				if (barred && IsLastResort(path))
+					return null;
+				// (nor one on a WAN the main client says is down, while another path is left)
+				if (ParentSaysDown(path, parentScores) && SkipDownLocked(barred, parentScores, pathIndex, needStream: true))
+					return null;
+				return path;
+			}
 		}
 
 		/// <summary>The path <see cref="SendMode"/> picks among those open to it (<paramref name="barred"/>: not the
@@ -1271,7 +1286,7 @@ namespace WTelegram
 			lock (_pathsLock)
 			{
 				bool barred = LastResortBarredLocked(parentScores, avoidIsHealthy ? -1 : avoidIndex);
-				bool skipDown = SkipDownLocked(barred, parentScores);
+				bool skipDown = SkipDownLocked(barred, parentScores, avoidIndex, needStream: true);
 				TransportPath best = null;
 				long bestScore = 0;
 				foreach (var p in _paths)
