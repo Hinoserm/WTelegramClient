@@ -2282,13 +2282,19 @@ namespace WTelegram
 								return;
 							path.IsAlive = true;
 						}
+						// (a path that was never up, only slow to connect when its client was made, has not failed:
+						// this is its first connection, not a reconnect to count or to hold against it)
+						bool firstConnection = Volatile.Read(ref path.ConnectedSinceTicks) == 0;
 						path.ConnectedSinceTicks = Environment.TickCount64;
 						Interlocked.Exchange(ref path.BytesSent, 0);
 						Interlocked.Exchange(ref path.BytesRecv, 0);
-						Interlocked.Increment(ref path.ReconnectCount);
-						// Add reliability penalty: each reconnect adds 500ms effective latency.
-						// This ensures LowestLatency mode steers away from frequently-failing paths.
-						AddPenalty(path, 500);
+						if (!firstConnection)
+						{
+							Interlocked.Increment(ref path.ReconnectCount);
+							// Add reliability penalty: each reconnect adds 500ms effective latency.
+							// This ensures LowestLatency mode steers away from frequently-failing paths.
+							AddPenalty(path, 500);
+						}
 						Helpers.Log(2, $"{_dcSession.DcID}>Path {path.PathIndex} reconnected and registered successfully.");
 						RaisePathChanged(path);
 						// The connection that registered last is where Telegram now sends the updates: asked for
@@ -4026,7 +4032,9 @@ namespace WTelegram
 				TcpClient tcpClient2 = null;
 				try
 				{
-					tcpClient2 = await ConnectPathAsync(endpoint, localEP, firstOfOtherPath: true);
+					// (the short first wait only where the path's reconnect loop can take over: it needs the session's
+					// endpoint, which a session logging in for the first time does not have yet)
+					tcpClient2 = await ConnectPathAsync(endpoint, localEP, firstOfOtherPath: _dcSession?.EndPoint != null);
 					ConfigureKeepalive(tcpClient2);
 					// built with nothing that can throw, then given its parts one by one: once it exists it owns whatever
 					// it holds, so a failure below disposes exactly that (DisposeQuietly in the catch)

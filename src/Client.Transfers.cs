@@ -360,8 +360,12 @@ namespace WTelegram
 		{
 			if (rpc.transferDir < 0 || rpc.transferBytes <= 0)
 				return false;
+			// what SendCopyAsync would refuse anyway: found due, it would only use up the pace of late copies below
+			if (now - rpc.sentTicks > CopyMaxAgeMs || Volatile.Read(ref rpc.copies) >= MaxCopies)
+				return false;
 			// from its queuing: on a slow uplink a part can wait seconds behind the path's earlier writes
-			long age = now - Volatile.Read(ref rpc.queuedTicks);
+			long queued = Volatile.Read(ref rpc.queuedTicks);
+			long age = now - queued;
 			if (age < 750)
 				return false;
 			// The other WANs it may be copied to: not a last-resort one while a path other than its own is usable. With
@@ -394,11 +398,16 @@ namespace WTelegram
 				&& age > 3 * ((lease.AheadBytes + rpc.transferBytes) * 1000.0 / ownBps))
 			{
 				long lastRecv = Volatile.Read(ref own.LastRecvTicks);
+				// (silent for at least what the part should have needed, by that estimate: on a slow uplink more
+				// than a second passes between two answers of a WAN that is fine)
+				long silenceMs = Math.Max(1000, (long)((lease.AheadBytes + rpc.transferBytes) * 1000.0 / ownBps));
 				lock (RootClient._transferLock)
 				{
 					var w = lease.Wan;
-					bool silentRun = w.LateSinceTicks[dir] != 0 && lastRecv <= w.LateSinceTicks[dir];
-					if (silentRun ? now - w.LateSinceTicks[dir] >= 1000 : now - w.LastLateCopyTicks[dir] >= 1000)
+					// (a run this part was in flight for: one that began before it was queued is an old incident's,
+					// left there because the path has had nothing to receive since)
+					bool silentRun = w.LateSinceTicks[dir] != 0 && w.LateSinceTicks[dir] >= queued && lastRecv <= w.LateSinceTicks[dir];
+					if (silentRun ? now - w.LateSinceTicks[dir] >= silenceMs : now - w.LastLateCopyTicks[dir] >= 1000)
 					{
 						if (!silentRun)
 							w.LateSinceTicks[dir] = now; // the first late part since the WAN last answered
