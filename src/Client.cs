@@ -341,7 +341,10 @@ namespace WTelegram
 		/// probed like any other, but given nothing to carry (no request, no copy of one, no file part, no speed
 		/// measurement) while a path on another address is usable (see <see cref="LastResortSlowMs"/>). With none usable
 		/// they are paths like the others, until one is again. Set before connecting.</summary>
-		public HashSet<IPAddress> LastResortAddresses { get; set; } = new();
+		public HashSet<IPAddress> LastResortAddresses { get => _lastResortAddresses; set => _lastResortAddresses = value ?? new(); }
+		private HashSet<IPAddress> _lastResortAddresses = new();
+		/// <summary>True while this client's last-resort paths are open to requests: no other path of it is usable.</summary>
+		public bool LastResortInUse => Volatile.Read(ref _lastResortInUse) == 1;
 		/// <summary>A path that is not a last resort counts as usable while it is alive and its latency plus penalty
 		/// (what <see cref="PathSendMode.LowestLatency"/> ranks by; not measured yet counts as usable) is under this many
 		/// milliseconds. 0: while it is alive, however slow.</summary>
@@ -979,13 +982,15 @@ namespace WTelegram
 			=> LastResortAddresses.Count > 0 && path.LocalEndPoint != null && LastResortAddresses.Contains(path.LocalEndPoint.Address);
 
 		/// <summary>A media-DC (child) client's paths are not probed: the main client's latency and penalty, by local
-		/// address, stand in for theirs. Null on the main client, or when nothing here would read them. Call it BEFORE
-		/// taking our own _pathsLock (child._pathsLock → parent._pathsLock would invert the lock order).</summary>
-		private Dictionary<IPAddress, (long Latency, long Penalty)> ParentScores()
+		/// address, stand in for theirs (alive ones only: an address the main client has no live path on is not in it).
+		/// Null on the main client, or when nothing would read them: they are read to judge the last-resort paths (if
+		/// there are any), and, with <paramref name="forSendMode"/>, to rank paths by latency. Call it BEFORE taking our
+		/// own _pathsLock (child._pathsLock → parent._pathsLock would invert the lock order).</summary>
+		private Dictionary<IPAddress, (long Latency, long Penalty)> ParentScores(bool forSendMode = false)
 		{
 			if (_parentClient == null)
 				return null;
-			if (SendMode != PathSendMode.LowestLatency && (LastResortAddresses.Count == 0 || LastResortSlowMs <= 0))
+			if (LastResortAddresses.Count == 0 && !(forSendMode && SendMode == PathSendMode.LowestLatency))
 				return null;
 			var scores = new Dictionary<IPAddress, (long Latency, long Penalty)>();
 			lock (_parentClient._pathsLock)
@@ -1024,10 +1029,16 @@ namespace WTelegram
 			{
 				if (!p.IsAlive || p.PathIndex == exceptIndex || IsLastResort(p))
 					continue;
+				// A media-DC client's paths are not probed, and one on a WAN that died silently stays "alive" until
+				// its socket gives up: the main client, which does probe, having no live path on that address says
+				// the WAN is down, and the path here is not usable.
+				if (parentScores != null && (p.LocalEndPoint == null || !parentScores.ContainsKey(p.LocalEndPoint.Address)))
+					continue;
 				if (LastResortSlowMs <= 0)
 					return true;
 				var (lat, penalty) = ScoreParts(p, parentScores);
-				if (lat == long.MaxValue || lat + penalty < LastResortSlowMs)
+				// (not measured yet: by its penalty alone, which stalls on it add to)
+				if (lat == long.MaxValue ? penalty < LastResortSlowMs : lat + penalty < LastResortSlowMs)
 					return true;
 			}
 			return false;
@@ -1038,42 +1049,67 @@ namespace WTelegram
 		private TransportPath[] UsablePaths(int exceptIndex = -1)
 		{
 			var parentScores = ParentScores();
+			TransportPath[] usable;
+			bool barred, changed = false;
 			lock (_pathsLock)
 			{
-				bool barred = LastResortBarredLocked(parentScores, exceptIndex);
-				return _paths.Where(p => p.IsAlive && p.NetworkStream != null && !(barred && IsLastResort(p))).ToArray();
+				barred = LastResortBarredLocked(parentScores, exceptIndex);
+				if (exceptIndex < 0) // (judged with a path left out, it says nothing of the client as a whole)
+					changed = NoteLastResortLocked(barred);
+				usable = _paths.Where(p => p.IsAlive && p.NetworkStream != null && !(barred && IsLastResort(p))).ToArray();
 			}
+			if (changed)
+				LogLastResort(barred);
+			return usable;
 		}
 
-		private int _lastResortInUse; // 1 while the last-resort paths are open to requests (for the log line on a change)
+		private int _lastResortInUse; // 1 while the last-resort paths are open to requests; written under _pathsLock
 
-		/// <summary>Says once, on each change, that the last-resort paths came into use or went out of it.</summary>
-		private void NoteLastResort(bool barred)
+		/// <summary>Records whether the last-resort paths are in use, as just judged for the whole client. Caller holds
+		/// _pathsLock (so the record follows the judgings in their order).</summary>
+		/// <returns>true if that changed: say so with <see cref="LogLastResort"/>, outside the lock</returns>
+		private bool NoteLastResortLocked(bool barred)
 		{
-			if (LastResortAddresses.Count == 0)
-				return;
-			int inUse = barred ? 0 : 1;
-			if (Interlocked.Exchange(ref _lastResortInUse, inUse) == inUse)
-				return;
-			Helpers.Log(3, inUse == 1
-				? $"{_dcSession?.DcID}>No other path is usable: the last-resort path(s) are in use"
-				: $"{_dcSession?.DcID}>A path is usable again: the last-resort path(s) are no longer used");
+			int inUse = barred || !_paths.Any(IsLastResort) ? 0 : 1;
+			if (_lastResortInUse == inUse)
+				return false;
+			Volatile.Write(ref _lastResortInUse, inUse);
+			return true;
 		}
+
+		private void LogLastResort(bool barred)
+			=> Helpers.Log(3, barred
+				? $"{_dcSession?.DcID}>A path is usable again: the last-resort path(s) are no longer used"
+				: $"{_dcSession?.DcID}>No other path is usable: the last-resort path(s) are in use");
 
 		private TransportPath GetPrimaryAlivePath()
 		{
-			var parentLatencyByAddr = ParentScores(); // before our own lock (see there)
-			bool barred;
+			var parentLatencyByAddr = ParentScores(forSendMode: true); // before our own lock (see there)
+			bool barred, changed;
 			TransportPath picked;
 			lock (_pathsLock)
 			{
 				if (_paths.Count == 0)
 					return null;
 				barred = LastResortBarredLocked(parentLatencyByAddr);
+				changed = NoteLastResortLocked(barred);
 				picked = PickPrimaryLocked(parentLatencyByAddr, barred);
 			}
-			NoteLastResort(barred);
+			if (changed)
+				LogLastResort(barred);
 			return picked;
+		}
+
+		/// <summary>The path a file part was put on, if it is still up and may still be used: a last-resort path is given
+		/// up once another path is usable again (the part then goes where <see cref="SendMode"/> says).</summary>
+		private TransportPath LeasedPath(int pathIndex)
+		{
+			var path = AlivePathByIndex(pathIndex);
+			if (path == null || !IsLastResort(path))
+				return path;
+			var parentScores = ParentScores(); // before our own lock (see there)
+			lock (_pathsLock)
+				return LastResortBarredLocked(parentScores) ? null : path;
 		}
 
 		/// <summary>The path <see cref="SendMode"/> picks among those open to it (<paramref name="barred"/>: not the
@@ -4543,7 +4579,7 @@ namespace WTelegram
 				// Select transport path for sending: a file part goes where the transfer scheduler put it
 				// (if that path is still up), everything else by SendMode
 				var path = (rpc ?? containedRpc)?.lease is { PathIndex: >= 0 } lease && lease.Client == this
-					? AlivePathByIndex(lease.PathIndex) ?? GetPrimaryAlivePath()
+					? LeasedPath(lease.PathIndex) ?? GetPrimaryAlivePath()
 					: GetPrimaryAlivePath();
 				// The connection's parts, read together (a reconnect swaps them together under _pathsLock): the frame is
 				// built, recorded and written for one and the same connection.
