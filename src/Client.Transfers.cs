@@ -78,6 +78,7 @@ namespace WTelegram
 			internal readonly long[] LastProbeTicks = new long[2];
 			internal readonly long[] LastLateCopyTicks = new long[2]; // when a part was last found late by this WAN's own pace
 			internal readonly long[] LateSinceTicks = new long[2]; // ... and when the first of the current run of them was (0: none)
+			internal readonly int[] LateUnanswered = new int[2]; // late parts copied since this WAN last answered a part that was not copied
 			internal readonly int[] InFlight = new int[2];
 			// the parts in flight, per direction: the oldest one's progress so far bounds the speed estimate
 			internal readonly System.Collections.Generic.List<TransferLease>[] Active = [new(), new()];
@@ -360,7 +361,7 @@ namespace WTelegram
 		{
 			if (rpc.transferDir < 0 || rpc.transferBytes <= 0)
 				return false;
-			rpc.lateByPace = rpc.lateSilent = false; // (judged anew on each pass)
+			rpc.lateByPace = rpc.lateSilent = rpc.lateCeiling = false; // (judged anew on each pass)
 			// what SendCopyAsync would refuse anyway: found due, it would only use up the pace of late copies below
 			if (now - rpc.sentTicks > CopyMaxAgeMs || Volatile.Read(ref rpc.copies) >= MaxCopies)
 				return false;
@@ -397,7 +398,7 @@ namespace WTelegram
 			bool late = false;
 			// - never before a part of its size could well be answered on a connection that had been idle (it opens up
 			//   over several round trips): 750 ms, and 750 ms more for each 512 KB.
-			bool silentWan = false;
+			bool silentWan = false, lateIsEvidence = false;
 			if (LatePartCopies && dir == TransferUp && ownBps > 0 && rpc.lease is TransferLease lease && lease.Wan == Wan(WanKey(own))
 				&& age >= 750 + rpc.transferBytes * 750L / (512 * 1024)
 				&& age > 3 * ((lease.AheadBytes + rpc.transferBytes) * 1000.0 / ownBps))
@@ -422,6 +423,9 @@ namespace WTelegram
 						w.LastLateCopyTicks[dir] = now;
 						late = true;
 						silentWan = silentRun;
+						// One late part while the WAN goes on answering others is a guess (a cold connection). A
+						// second one with no part answered in between, or a WAN gone silent, is the WAN itself.
+						lateIsEvidence = silentRun || ++w.LateUnanswered[dir] >= 2;
 					}
 				}
 			}
@@ -431,9 +435,11 @@ namespace WTelegram
 			// its own WAN's estimate.)
 			if (late || (IsLastResort(best) && MeasuredBps(best, dir) <= 0))
 			{
-				// A paced copy is a guess, and no evidence of its WAN's speed (see AfterStallCopy). One made because the
-				// WAN has gone silent is: its estimate is lowered, so the scheduler stops giving that WAN new parts.
-				rpc.lateByPace = late && !silentWan;
+				// A first late copy is a guess, and no evidence of its WAN's speed (see AfterStallCopy). One that is
+				// evidence (the WAN silent, or late again with nothing answered between) lowers the WAN's estimate
+				// by what the part shows (RecordLateCeiling), so the scheduler stops giving that WAN new parts.
+				rpc.lateByPace = late && !lateIsEvidence;
+				rpc.lateCeiling = late && lateIsEvidence;
 				rpc.lateSilent = late && silentWan;
 				return late;
 			}
@@ -507,6 +513,36 @@ namespace WTelegram
 			AddTransferSample(rpc.sentPathIndex, rpc.transferDir, rpc.transferBytes, Volatile.Read(ref rpc.queuedTicks), done: false);
 		}
 
+		/// <summary>A late upload part copied as evidence against its WAN (see TransferCopyDue): the bytes that were ahead of
+		/// it there and its own, over the time since it was queued, are a ceiling of that WAN's speed, which only ever
+		/// lowers the estimate. Unlike <see cref="RecordSlowTransfer"/> it need not be the WAN's oldest part: what was
+		/// ahead of it is counted, and the oldest may be a part already copied that waits for its copy's answer.</summary>
+		private void RecordLateCeiling(Rpc rpc)
+		{
+			long queued = Volatile.Read(ref rpc.queuedTicks);
+			if (rpc.transferDir < 0 || rpc.transferBytes <= 0 || queued <= 0 || rpc.lease is not TransferLease lease)
+				return;
+			TransportPath sent;
+			lock (_pathsLock)
+				sent = _paths.FirstOrDefault(p => p.PathIndex == rpc.sentPathIndex);
+			if (sent == null)
+				return;
+			int dir = rpc.transferDir;
+			long now = Environment.TickCount64;
+			double sample = (lease.AheadBytes + rpc.transferBytes) * 1000.0 / Math.Max(1, now - queued);
+			var w = lease.Wan;
+			lock (RootClient._transferLock)
+			{
+				// (only on the WAN its lease counts it on: it may have gone out elsewhere if that path died)
+				if (Wan(WanKey(sent)) != w || (w.Samples[dir] > 0 && sample >= w.Bps[dir]))
+					return;
+				w.Bps[dir] = w.Samples[dir] == 0 ? sample : w.Bps[dir] * (1 - SlowSampleWeight) + sample * SlowSampleWeight;
+				w.Samples[dir]++;
+				w.LastSampleTicks[dir] = now;
+			}
+			Helpers.Log(1, $"{_dcSession?.DcID}>Up via {w.Address} [P{rpc.sentPathIndex}] (late, copied): at most {sample / 1e6 * 8:F1} Mbit/s (EWMA {w.Bps[dir] / 1e6 * 8:F1})");
+		}
+
 		/// <param name="done">An answered part: its time runs from <paramref name="start"/> (its queuing), or from the WAN's
 		/// previous answer if that came later (parts queue behind each other on one connection). Otherwise a ceiling taken
 		/// mid-way, which only ever lowers the estimate.</param>
@@ -527,7 +563,10 @@ namespace WTelegram
 			{
 				long from = done ? Math.Max(start, w.LastAckTicks[dir]) : start;
 				if (done)
+				{
 					w.LastAckTicks[dir] = now;
+					w.LateUnanswered[dir] = 0; // it answers parts in its own time: a late one before this was a one-off
+				}
 				sample = bytes * 1000.0 / Math.Max(1, now - from);
 				// a bound taken mid-way is a ceiling: it can only lower an estimate, never raise one. It may be the first:
 				// a WAN whose parts are always rescued gives no other sample (copied parts are ambiguous), and unmeasured
@@ -553,9 +592,10 @@ namespace WTelegram
 		/// of <paramref name="avoidIndex"/> (see <see cref="BestCopyTarget"/>: a WAN whose parts are stuck, gone dark and
 		/// not yet detected, is not picked).</summary>
 		/// <param name="avoidIsHealthy">See <see cref="PickOtherAlivePath"/></param>
-		private TransportPath PickTransferCopyPath(int avoidIndex, int dir, bool avoidIsHealthy = false)
+		/// <param name="stuckOn">More paths the part is stuck on (its copies'): never chosen</param>
+		private TransportPath PickTransferCopyPath(int avoidIndex, int dir, bool avoidIsHealthy = false, System.Collections.Generic.HashSet<int> stuckOn = null)
 		{
-			var paths = UsablePaths(avoidIndex, avoidIsHealthy);
+			var paths = UsablePaths(avoidIndex, avoidIsHealthy, stuckOn);
 			var own = AlivePathByIndex(avoidIndex);
 			var best = BestCopyTarget(paths, own, dir, Environment.TickCount64).Path;
 			// none on another WAN (or not under FLOOD_WAIT): any other live path, lowest latency first

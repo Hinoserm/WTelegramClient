@@ -398,6 +398,7 @@ namespace WTelegram
 		private long _statHedged, _statStalled, _statLate, _statRescued, _statDupAnswers, _statDupFrames, _lastCopyStatsTicks;
 		// why a file part was copied by the late-part rule (the reason given to SendCopyAsync, and counted by it)
 		private const string LatePartReason = "Late part", SilentWanReason = "Silent WAN";
+		private const string StuckEverywhereReason = "Stalled on every path";
 
 		public Client(int apiID, string apiHash, string sessionPathname = null, IEnumerable<string> localAddresses = null)
 			: this(what => what switch
@@ -1035,13 +1036,14 @@ namespace WTelegram
 		/// may be used is left. Caller holds _pathsLock.</summary>
 		/// <param name="avoidIndex">A path the caller will not choose: it is not one "left"</param>
 		/// <param name="needStream">Nor is, then, a path without a connection</param>
-		private bool SkipDownLocked(bool barred, Dictionary<IPAddress, (long Latency, long Penalty)> parentScores, int avoidIndex = -1, bool needStream = false)
+		/// <param name="alsoAvoid">More paths the caller will not choose</param>
+		private bool SkipDownLocked(bool barred, Dictionary<IPAddress, (long Latency, long Penalty)> parentScores, int avoidIndex = -1, bool needStream = false, HashSet<int> alsoAvoid = null)
 		{
 			if (parentScores == null || LastResortAddresses.Count == 0)
 				return false;
 			foreach (var p in _paths)
 			{
-				if (p.PathIndex == avoidIndex || (needStream && p.NetworkStream == null))
+				if (p.PathIndex == avoidIndex || alsoAvoid?.Contains(p.PathIndex) == true || (needStream && p.NetworkStream == null))
 					continue;
 				if (OpenPath(p, barred, false, parentScores) && !ParentSaysDown(p, parentScores))
 					return true;
@@ -1068,13 +1070,14 @@ namespace WTelegram
 		/// <summary>Whether the last-resort paths are kept out of use: true while some path that is not one is usable
 		/// (alive, and under <see cref="LastResortSlowMs"/> if that is set). <paramref name="exceptIndex"/>: a path left
 		/// out of the judging (the one a request is stuck on says nothing for itself). Caller holds _pathsLock.</summary>
-		private bool LastResortBarredLocked(Dictionary<IPAddress, (long Latency, long Penalty)> parentScores, int exceptIndex = -1)
+		/// <param name="alsoExcept">More paths left out of the judging: the request is stuck on them too</param>
+		private bool LastResortBarredLocked(Dictionary<IPAddress, (long Latency, long Penalty)> parentScores, int exceptIndex = -1, HashSet<int> alsoExcept = null)
 		{
 			if (LastResortAddresses.Count == 0)
 				return false; // no path is one
 			foreach (var p in _paths)
 			{
-				if (!p.IsAlive || p.PathIndex == exceptIndex || IsLastResort(p))
+				if (!p.IsAlive || p.PathIndex == exceptIndex || alsoExcept?.Contains(p.PathIndex) == true || IsLastResort(p))
 					continue;
 				// A media-DC client's paths are not probed, and one on a WAN that died silently stays "alive" until
 				// its socket gives up: the main client, which does probe, having no live path on that address says
@@ -1098,18 +1101,20 @@ namespace WTelegram
 		/// may still be in the result.</param>
 		/// <param name="exceptIsHealthy">That path has not failed the request (see <see cref="PickOtherAlivePath"/>): it
 		/// counts as a path left when passing over those on a WAN that is down</param>
-		private TransportPath[] UsablePaths(int exceptIndex = -1, bool exceptIsHealthy = false)
+		/// <param name="stuckOn">More paths the request is stuck on: left out of both judgings, and of the result</param>
+		private TransportPath[] UsablePaths(int exceptIndex = -1, bool exceptIsHealthy = false, HashSet<int> stuckOn = null)
 		{
 			var parentScores = ParentScores();
 			TransportPath[] usable;
 			string note = null;
 			lock (_pathsLock)
 			{
-				bool barred = LastResortBarredLocked(parentScores, exceptIndex);
+				bool barred = LastResortBarredLocked(parentScores, exceptIndex, stuckOn);
 				if (exceptIndex < 0) // (judged with a path left out, it says nothing of the client as a whole)
 					note = NoteLastResortLocked(barred);
-				bool skipDown = SkipDownLocked(barred, parentScores, exceptIsHealthy ? -1 : exceptIndex, needStream: true);
-				usable = _paths.Where(p => p.NetworkStream != null && OpenPath(p, barred, skipDown, parentScores)).ToArray();
+				bool skipDown = SkipDownLocked(barred, parentScores, exceptIsHealthy ? -1 : exceptIndex, needStream: true, stuckOn);
+				usable = _paths.Where(p => p.NetworkStream != null && OpenPath(p, barred, skipDown, parentScores)
+					&& !(stuckOn?.Contains(p.PathIndex) == true && p.PathIndex != exceptIndex)).ToArray();
 			}
 			if (note != null)
 				Helpers.Log(3, note);
@@ -1302,19 +1307,21 @@ namespace WTelegram
 		/// WAN that is down. Either way it is left out of the judging of the last resort: with no other usable path the
 		/// copy goes to a last-resort one, whether the request is stuck or only hedged (the avoided path may die
 		/// unnoticed, and the copy is then already on its way).</param>
-		private TransportPath PickOtherAlivePath(int avoidIndex, bool avoidIsHealthy = false)
+		/// <param name="stuckOn">More paths to avoid, and to leave out of both judgings: the request is stuck on them too</param>
+		private TransportPath PickOtherAlivePath(int avoidIndex, bool avoidIsHealthy = false, HashSet<int> stuckOn = null)
 		{
 			var parentScores = ParentScores(); // before our own lock (see there)
 			lock (_pathsLock)
 			{
-				bool barred = LastResortBarredLocked(parentScores, avoidIndex);
+				bool barred = LastResortBarredLocked(parentScores, avoidIndex, stuckOn);
 				// (a healthy avoided path is a path left: with it there, nothing goes to a WAN that is down)
-				bool skipDown = SkipDownLocked(barred, parentScores, avoidIsHealthy ? -1 : avoidIndex, needStream: true);
+				bool skipDown = SkipDownLocked(barred, parentScores, avoidIsHealthy ? -1 : avoidIndex, needStream: true, stuckOn);
 				TransportPath best = null;
 				long bestScore = 0;
 				foreach (var p in _paths)
 				{
-					if (p.PathIndex == avoidIndex || p.NetworkStream == null || !OpenPath(p, barred, skipDown, parentScores))
+					if (p.PathIndex == avoidIndex || stuckOn?.Contains(p.PathIndex) == true || p.NetworkStream == null
+						|| !OpenPath(p, barred, skipDown, parentScores))
 						continue;
 					long lat = Volatile.Read(ref p.LatencyEwmaMs);
 					long score = lat == long.MaxValue ? long.MaxValue : lat + Volatile.Read(ref p.PenaltyMs);
@@ -1342,13 +1349,15 @@ namespace WTelegram
 		/// such callers never both send one)</param>
 		/// <param name="avoidIsHealthy">See <see cref="PickOtherAlivePath"/>: the path of <paramref name="avoidIndex"/> has
 		/// not failed the request (a hedge, a file part copied off a slower WAN)</param>
-		private async Task<bool> SendCopyAsync(Rpc rpc, int avoidIndex, string reason, bool sole, Action afterWritten = null, bool onlyIfUnhedged = false, bool avoidIsHealthy = false)
+		/// <param name="stuckOn">The paths the request is stuck on (its own and its copies'), when it is copied because of
+		/// that: none of them is chosen, and none counts when judging whether a last-resort path may be used</param>
+		private async Task<bool> SendCopyAsync(Rpc rpc, int avoidIndex, string reason, bool sole, Action afterWritten = null, bool onlyIfUnhedged = false, bool avoidIsHealthy = false, HashSet<int> stuckOn = null)
 		{
 			if (rpc.query == null || rpc.msgId == 0 || rpc == _bareRpc)
 				return false;
 			if (Environment.TickCount64 - rpc.sentTicks > CopyMaxAgeMs || Volatile.Read(ref rpc.copies) >= MaxCopies)
 				return false;
-			var path = rpc.transferDir >= 0 ? PickTransferCopyPath(avoidIndex, rpc.transferDir, avoidIsHealthy) : PickOtherAlivePath(avoidIndex, avoidIsHealthy);
+			var path = rpc.transferDir >= 0 ? PickTransferCopyPath(avoidIndex, rpc.transferDir, avoidIsHealthy, stuckOn) : PickOtherAlivePath(avoidIndex, avoidIsHealthy, stuckOn);
 			if (path == null)
 				return false;
 			PruneCopyState();
@@ -1445,6 +1454,7 @@ namespace WTelegram
 					return false;
 				}
 				rpc.liveCopies[containerId] = (queuedOn.Path, queuedOn.Gen, ++rpc.copySeq);
+				Volatile.Write(ref rpc.lastCopyTicks, Environment.TickCount64);
 				rpc.hedged = true;
 				rpc.copySyncVersion++;
 				return true;
@@ -1878,7 +1888,7 @@ namespace WTelegram
 			if (stallMs <= 0)
 				return;
 			var now = Environment.TickCount64;
-			List<Rpc> stalled = null, transfers = null;
+			List<Rpc> stalled = null, transfers = null, everywhere = null;
 			Rpc[] hedgedNow;
 			lock (_pendingRpcs)
 				hedgedNow = [.. _pendingRpcs.Values.Where(r => r.hedged)];
@@ -1886,15 +1896,53 @@ namespace WTelegram
 				DropDeadCopies(rpc);
 			lock (_pendingRpcs)
 				foreach (var rpc in _pendingRpcs.Values)
-					if (!rpc.hedged && rpc.query != null && rpc.sentPathIndex >= 0)
-						if (rpc.writtenTicks > 0 && now - rpc.writtenTicks > stallMs + Volatile.Read(ref rpc.stallExtraMs))
-							(stalled ??= []).Add(rpc); // from the write, not the registration: a part queued behind others is not stalled
-						else if (rpc.transferDir >= 0 && Volatile.Read(ref rpc.queuedTicks) > 0)
-							(transfers ??= []).Add(rpc); // judged from its queuing: it may be stuck behind its path's slow writes
+				{
+					if (rpc.query == null || rpc.sentPathIndex < 0)
+						continue;
+					long wait = stallMs + Volatile.Read(ref rpc.stallExtraMs);
+					if (rpc.hedged)
+					{
+						// Copied already, and neither it nor its newest copy answered within the stall time: every
+						// path that carries it may be dead at once (see below).
+						// (a file part's copy is a late-part one, made a second or so after the part itself: it is given
+						// a second, not the stall time over again; the silence of the paths, below, is what decides)
+						if (rpc.writtenTicks > 0 && now - rpc.writtenTicks > wait
+							&& now - Volatile.Read(ref rpc.lastCopyTicks) > (rpc.transferDir >= 0 ? 1000 : wait))
+							(everywhere ??= []).Add(rpc);
+					}
+					else if (rpc.writtenTicks > 0 && now - rpc.writtenTicks > wait)
+						(stalled ??= []).Add(rpc); // from the write, not the registration: a part queued behind others is not stalled
+					else if (rpc.transferDir >= 0 && Volatile.Read(ref rpc.queuedTicks) > 0)
+						(transfers ??= []).Add(rpc); // judged from its queuing: it may be stuck behind its path's slow writes
+				}
 			if (transfers != null) // judged outside the lock: it takes the path and transfer locks
 				foreach (var rpc in transfers)
 					if (TransferCopyDue(rpc, now))
 						(stalled ??= []).Add(rpc);
+			// A request stuck on every path that carries it (its own and its copies'), all of them silent: those paths
+			// went dead together, before any was found dead. One more copy goes out on a path that carries none yet,
+			// a last-resort one if no other is left, and the silent paths are marked down hard, so that new requests
+			// stop being given to them while their deaths are being established.
+			if (everywhere != null)
+				foreach (var rpc in everywhere)
+				{
+					HashSet<int> stuckOn;
+					lock (rpc)
+						stuckOn = [.. rpc.liveCopies.Values.Select(c => c.Path.PathIndex)];
+					stuckOn.Add(rpc.sentPathIndex);
+					// Silent for the stall time; a second more on the main client, whose paths are probed every few
+					// seconds and so are never quiet much longer than that while they live.
+					long silenceMs = stallMs + (_parentClient == null ? 1000 : 0);
+					bool silent;
+					lock (_pathsLock)
+						silent = _paths.Where(p => stuckOn.Contains(p.PathIndex))
+							.All(p => !p.IsAlive || now - Volatile.Read(ref p.LastRecvTicks) > silenceMs);
+					// (a path that still brings something in is alive: the request is slow at Telegram, not stuck here)
+					if (!silent)
+						continue;
+					await SendCopyAsync(rpc, rpc.sentPathIndex, StuckEverywhereReason, sole: false,
+						afterWritten: () => AfterStuckEverywhere(stuckOn, probe), stuckOn: stuckOn);
+				}
 			if (stalled == null)
 				return;
 			foreach (var rpc in stalled)
@@ -1907,14 +1955,31 @@ namespace WTelegram
 			}
 		}
 
+		/// <summary>After a request stuck on every path carrying it was copied elsewhere: those paths, silent for more than
+		/// the stall time, are given a penalty that takes them out of the usable ones at once (it decays if they answer
+		/// again), and on the main client a probe now.</summary>
+		private void AfterStuckEverywhere(HashSet<int> stuckOn, bool probe)
+		{
+			lock (_pathsLock)
+				foreach (var path in _paths)
+					if (stuckOn.Contains(path.PathIndex) && path.IsAlive)
+					{
+						AddPenalty(path, 3000);
+						if (probe)
+							path.LastProbeTicks = 0; // probe it on the next monitor pass
+					}
+		}
+
 		private void AfterStallCopy(Rpc rpc, bool timedOut, bool probe)
 		{
 			// a file part: its WAN's speed so far is a sample (no answer will be one). Not for a part copied only
 			// because it was late by its WAN's own pace while that WAN still answered: that rule is quick to act and
 			// sometimes wrong about a WAN that is fine (a first part on a cold connection), and its guess must not
-			// lower the WAN's estimate. A WAN that really slowed down shows it in the answers of its other parts; one
-			// that went silent has its late parts copied as such (not lateByPace), and they do count here.
-			if (timedOut || !rpc.lateByPace)
+			// lower the WAN's estimate. Late again with no part answered in between, or a WAN gone silent, is evidence
+			// (lateCeiling): the estimate is lowered by what that part shows.
+			if (!timedOut && rpc.lateCeiling)
+				RecordLateCeiling(rpc);
+			else if (timedOut || !rpc.lateByPace)
 				RecordSlowTransfer(rpc);
 			if (!timedOut)
 				return; // a slow WAN for file parts: its latency (what the penalty steers) is fine
@@ -3137,6 +3202,7 @@ namespace WTelegram
 			internal long copySeq; // order the copies went live in (msg_ids can go backwards after a time resync)
 			internal readonly HashSet<long> refusedPending = [];
 			internal volatile bool hedged; // liveCopies is not empty (kept in step with it)
+			internal long lastCopyTicks; // Environment.TickCount64 when its newest copy went live (0: none yet); Volatile
 			internal int copies; // copies counted against the budget: live ones and ones still being queued
 			internal int copySyncVersion; // SyncTransferCopy: bumped under lock(rpc) at each change of liveCopies, and at settling
 			internal int transferAttempt; // which attempt of its file part this request is (TransferLease.Attempts)
@@ -3157,7 +3223,8 @@ namespace WTelegram
 			internal int transferBytes; // part size (upload), or the requested limit (download)
 			// its copy was called for by TransferCopyDue's late-part rule: while its WAN still answered (lateByPace), or
 			// because its WAN had gone silent (lateSilent). Set and read by the stall watcher.
-			internal bool lateByPace, lateSilent;
+			// lateCeiling: that copy is evidence of its WAN's speed (RecordLateCeiling); lateByPace copies are not.
+			internal bool lateByPace, lateSilent, lateCeiling;
 			internal long stallExtraMs; // added to PathRpcStallTimeout: the time its path is expected to need
 			internal long queuedTicks; // when its frame was queued on a path (it may wait there behind slow writes)
 			internal int hedgeStarted; // 1 once HedgeIfWanted sent (or is sending) its copy
