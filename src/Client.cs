@@ -323,6 +323,11 @@ namespace WTelegram
 		public int PathDisconnectDelay { get; set; } = 15;
 		/// <summary>Seconds to wait for a single endpoint connection attempt before timing out.</summary>
 		public int PathConnectTimeout { get; set; } = 10;
+		/// <summary>Seconds a client being connected waits for each of its other paths' first connection attempt. Connecting
+		/// waits for these (one after another), so a WAN that swallows the attempt must not hold up the client that
+		/// already has a working path: past this, the path is left to its reconnect loop (which waits
+		/// <see cref="PathConnectTimeout"/>) in the background.</summary>
+		public int PathFirstConnectTimeout { get; set; } = 2;
 		/// <summary>New-msg_id retries one Invoke makes after its request could not run (ReactorError results) before failing</summary>
 		private const int MaxReactorRetries = 50;
 		/// <summary>Maximum backoff delay in seconds between reconnect attempts (both per-path and full reconnect).</summary>
@@ -443,6 +448,7 @@ namespace WTelegram
 			PathDeadTimeout = cloneOf.PathDeadTimeout;
 			PathDisconnectDelay = cloneOf.PathDisconnectDelay;
 			PathConnectTimeout = cloneOf.PathConnectTimeout;
+			PathFirstConnectTimeout = cloneOf.PathFirstConnectTimeout;
 			PathReconnectMaxBackoff = cloneOf.PathReconnectMaxBackoff;
 			PathFlapWindow = cloneOf.PathFlapWindow;
 			PathFlapMaxBackoff = cloneOf.PathFlapMaxBackoff;
@@ -3502,9 +3508,14 @@ namespace WTelegram
 		/// <summary>A path's TCP connect, bounded by PathConnectTimeout (1..300 s), failing with a TimeoutException. The
 		/// default handler's connect is aborted at the timeout (nothing left half-open); a custom handler's goes on, and
 		/// a client it still produces is nobody's, disposed when it arrives (DisposeWhenDone)</summary>
-		private async Task<TcpClient> ConnectPathAsync(IPEndPoint endpoint, IPEndPoint localEP, CancellationToken ct = default)
+		/// <param name="firstOfOtherPath">The first attempt of a path other than the one the client connected by: bounded
+		/// by <see cref="PathFirstConnectTimeout"/> if that is shorter</param>
+		private async Task<TcpClient> ConnectPathAsync(IPEndPoint endpoint, IPEndPoint localEP, CancellationToken ct = default, bool firstOfOtherPath = false)
 		{
-			var timeout = TimeSpan.FromSeconds(Math.Clamp(PathConnectTimeout, 1, 300));
+			int seconds = Math.Clamp(PathConnectTimeout, 1, 300);
+			if (firstOfOtherPath)
+				seconds = Math.Min(seconds, Math.Max(1, PathFirstConnectTimeout));
+			var timeout = TimeSpan.FromSeconds(seconds);
 			if (TcpHandler == (TcpFactory)DefaultTcpHandler)
 			{
 				using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -4015,7 +4026,7 @@ namespace WTelegram
 				TcpClient tcpClient2 = null;
 				try
 				{
-					tcpClient2 = await ConnectPathAsync(endpoint, localEP);
+					tcpClient2 = await ConnectPathAsync(endpoint, localEP, firstOfOtherPath: true);
 					ConfigureKeepalive(tcpClient2);
 					// built with nothing that can throw, then given its parts one by one: once it exists it owns whatever
 					// it holds, so a failure below disposes exactly that (DisposeQuietly in the catch)

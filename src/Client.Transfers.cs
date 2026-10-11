@@ -77,6 +77,7 @@ namespace WTelegram
 			internal readonly long[] LastSampleTicks = new long[2];
 			internal readonly long[] LastProbeTicks = new long[2];
 			internal readonly long[] LastLateCopyTicks = new long[2]; // when a part was last found late by this WAN's own pace
+			internal readonly long[] LateSinceTicks = new long[2]; // ... and when the first of the current run of them was (0: none)
 			internal readonly int[] InFlight = new int[2];
 			// the parts in flight, per direction: the oldest one's progress so far bounds the speed estimate
 			internal readonly System.Collections.Generic.List<TransferLease>[] Active = [new(), new()];
@@ -382,20 +383,29 @@ namespace WTelegram
 			// unnoticed), whatever the other WAN's speed: the part is copied without waiting out the stall timeout.
 			// Kept narrow, because it trusts that estimate, which can read too high (see below):
 			// - an upload part only: a download's wait may be Telegram fetching the file, not the WAN;
-			// - one part a second per WAN: the copy of that WAN's oldest part lowers an estimate that read too high
-			//   (RecordSlowTransfer), and the parts behind are then judged by the lower one. (Any late part may be
-			//   the one, not only the oldest: a part that cannot be judged late, one re-sent elsewhere say, must not
-			//   keep those behind it from being rescued.)
+			// - one part a second per WAN while that WAN still answers: the copy of its oldest part lowers an estimate
+			//   that read too high (RecordSlowTransfer), and the parts behind are then judged by the lower one. (Any
+			//   late part may be the one, not only the oldest: a part that cannot be judged late, one re-sent elsewhere
+			//   say, must not keep those behind it from being rescued.) Once the part's path has brought nothing in
+			//   for a second since the first late part, the WAN is not slow but silent: every late part is then copied
+			//   at once, so a file's parts are not rescued one a second.
 			bool late = false;
 			if (dir == TransferUp && ownBps > 0 && rpc.lease is TransferLease lease && lease.Wan == Wan(WanKey(own))
 				&& age > 3 * ((lease.AheadBytes + rpc.transferBytes) * 1000.0 / ownBps))
 			{
+				long lastRecv = Volatile.Read(ref own.LastRecvTicks);
 				lock (RootClient._transferLock)
-					if (now - lease.Wan.LastLateCopyTicks[dir] >= 1000)
+				{
+					var w = lease.Wan;
+					bool silentRun = w.LateSinceTicks[dir] != 0 && lastRecv <= w.LateSinceTicks[dir];
+					if (silentRun ? now - w.LateSinceTicks[dir] >= 1000 : now - w.LastLateCopyTicks[dir] >= 1000)
 					{
-						lease.Wan.LastLateCopyTicks[dir] = now;
+						if (!silentRun)
+							w.LateSinceTicks[dir] = now; // the first late part since the WAN last answered
+						w.LastLateCopyTicks[dir] = now;
 						late = true;
 					}
+				}
 			}
 			// To a last-resort WAN that was never measured (it is given no parts to be measured by, and an upload
 			// part's copy gives no sample), that is the only reason: no speed is assumed for it. (Assumed twice as fast,
