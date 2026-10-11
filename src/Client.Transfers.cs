@@ -78,7 +78,10 @@ namespace WTelegram
 			internal readonly long[] LastProbeTicks = new long[2];
 			internal readonly long[] LastLateCopyTicks = new long[2]; // when a part was last found late by this WAN's own pace
 			internal readonly long[] LateSinceTicks = new long[2]; // ... and when the first of the current run of them was (0: none)
-			internal readonly int[] LateUnanswered = new int[2]; // late parts copied since this WAN last answered a part that was not copied
+			// late parts copied as a guess (the copy written) since this WAN last answered a part that was not copied,
+			// and when the last of them was: a guess older than 10 s no longer counts
+			internal readonly int[] LateUnanswered = new int[2];
+			internal readonly long[] LastLateGuessTicks = new long[2];
 			internal readonly int[] InFlight = new int[2];
 			// the parts in flight, per direction: the oldest one's progress so far bounds the speed estimate
 			internal readonly System.Collections.Generic.List<TransferLease>[] Active = [new(), new()];
@@ -423,9 +426,12 @@ namespace WTelegram
 						w.LastLateCopyTicks[dir] = now;
 						late = true;
 						silentWan = silentRun;
-						// One late part while the WAN goes on answering others is a guess (a cold connection). A
-						// second one with no part answered in between, or a WAN gone silent, is the WAN itself.
-						lateIsEvidence = silentRun || ++w.LateUnanswered[dir] >= 2;
+						// One late part while the WAN goes on answering others is a guess (a cold connection). Another
+						// within 10 s of a guess whose copy went out, with no part answered in between, or a WAN
+						// gone silent, is the WAN itself. (The guess is counted when its copy is written:
+						// NoteLateGuess.)
+						lateIsEvidence = silentRun
+							|| (w.LateUnanswered[dir] > 0 && now - w.LastLateGuessTicks[dir] <= 10_000);
 					}
 				}
 			}
@@ -522,6 +528,8 @@ namespace WTelegram
 			long queued = Volatile.Read(ref rpc.queuedTicks);
 			if (rpc.transferDir < 0 || rpc.transferBytes <= 0 || queued <= 0 || rpc.lease is not TransferLease lease)
 				return;
+			if (lease.AheadBytes + rpc.transferBytes < MinSampleBytes)
+				return; // too little to time a WAN by: mostly latency
 			TransportPath sent;
 			lock (_pathsLock)
 				sent = _paths.FirstOrDefault(p => p.PathIndex == rpc.sentPathIndex);

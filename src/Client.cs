@@ -1930,13 +1930,26 @@ namespace WTelegram
 					lock (rpc)
 						stuckOn = [.. rpc.liveCopies.Values.Select(c => c.Path.PathIndex)];
 					stuckOn.Add(rpc.sentPathIndex);
-					// Silent for the stall time; a second more on the main client, whose paths are probed every few
-					// seconds and so are never quiet much longer than that while they live.
-					long silenceMs = stallMs + (_parentClient == null ? 1000 : 0);
+					// Silent for the stall time and a second more. That is judged on the main client's paths, which are
+					// probed every few seconds and so are never quiet that long while they live. A media-DC client's
+					// paths are not probed, and are quiet whenever Telegram is slow to answer the one thing they
+					// carry: such a path counts as silent when the main client's path on the same address is (or
+					// when the main client has none alive there).
+					long silenceMs = stallMs + 1000;
+					HashSet<IPAddress> answering = null;
+					if (_parentClient != null)
+					{
+						answering = [];
+						lock (_parentClient._pathsLock) // before our own (see ParentScores)
+							foreach (var p in _parentClient._paths)
+								if (p.IsAlive && p.LocalEndPoint != null && now - Volatile.Read(ref p.LastRecvTicks) <= silenceMs)
+									answering.Add(p.LocalEndPoint.Address);
+					}
 					bool silent;
 					lock (_pathsLock)
-						silent = _paths.Where(p => stuckOn.Contains(p.PathIndex))
-							.All(p => !p.IsAlive || now - Volatile.Read(ref p.LastRecvTicks) > silenceMs);
+						silent = _paths.Where(p => stuckOn.Contains(p.PathIndex)).All(p => !p.IsAlive
+							|| (answering != null ? p.LocalEndPoint == null || !answering.Contains(p.LocalEndPoint.Address)
+								: now - Volatile.Read(ref p.LastRecvTicks) > silenceMs));
 					// (a path that still brings something in is alive: the request is slow at Telegram, not stuck here)
 					if (!silent)
 						continue;
@@ -1955,6 +1968,31 @@ namespace WTelegram
 			}
 		}
 
+		/// <summary>Raises a path's penalty to <paramref name="penaltyMs"/> if it is lower (<see cref="AddPenalty"/> adds).</summary>
+		private static void RaisePenaltyTo(TransportPath path, long penaltyMs)
+		{
+			long current;
+			do
+			{
+				current = Volatile.Read(ref path.PenaltyMs);
+				if (current >= penaltyMs)
+					return;
+			} while (Interlocked.CompareExchange(ref path.PenaltyMs, penaltyMs, current) != current);
+		}
+
+		/// <summary>A paced late copy (a guess: see TransferCopyDue) was written: it is counted on its WAN, so that a
+		/// second late part there, with no part answered in between, is taken as evidence.</summary>
+		private void NoteLateGuess(Rpc rpc)
+		{
+			if (rpc.transferDir < 0 || rpc.lease is not TransferLease lease)
+				return;
+			lock (RootClient._transferLock)
+			{
+				lease.Wan.LateUnanswered[rpc.transferDir]++;
+				lease.Wan.LastLateGuessTicks[rpc.transferDir] = Environment.TickCount64;
+			}
+		}
+
 		/// <summary>After a request stuck on every path carrying it was copied elsewhere: those paths, silent for more than
 		/// the stall time, are given a penalty that takes them out of the usable ones at once (it decays if they answer
 		/// again), and on the main client a probe now.</summary>
@@ -1964,7 +2002,9 @@ namespace WTelegram
 				foreach (var path in _paths)
 					if (stuckOn.Contains(path.PathIndex) && path.IsAlive)
 					{
-						AddPenalty(path, 3000);
+						// (raised to it, not added: one such moment strands many requests at once, and each of them
+						// comes through here)
+						RaisePenaltyTo(path, 3000);
 						if (probe)
 							path.LastProbeTicks = 0; // probe it on the next monitor pass
 					}
@@ -1979,7 +2019,9 @@ namespace WTelegram
 			// (lateCeiling): the estimate is lowered by what that part shows.
 			if (!timedOut && rpc.lateCeiling)
 				RecordLateCeiling(rpc);
-			else if (timedOut || !rpc.lateByPace)
+			else if (!timedOut && rpc.lateByPace)
+				NoteLateGuess(rpc);
+			else
 				RecordSlowTransfer(rpc);
 			if (!timedOut)
 				return; // a slow WAN for file parts: its latency (what the penalty steers) is fine
